@@ -25,7 +25,11 @@ pub fn convert_pdf_to_markdown(pdf_bytes: &[u8], include_page_breaks: bool) -> R
         .filter(|page| !page.trim().is_empty())
         .collect();
 
-    let joiner = if include_page_breaks { "\n\n---\n\n" } else { "\n\n" };
+    let joiner = if include_page_breaks {
+        "\n\n---\n\n"
+    } else {
+        "\n\n"
+    };
     let mut markdown = pages.join(joiner);
 
     promote_document_title(&mut markdown);

@@ -41,8 +41,9 @@ fn read_input(path: &PathBuf) -> Result<Vec<u8>> {
 
 fn write_output(path: Option<&PathBuf>, markdown: &str) -> Result<()> {
     match path {
-        Some(p) => fs::write(p, markdown)
-            .with_context(|| format!("failed to write {}", p.display())),
+        Some(p) => {
+            fs::write(p, markdown).with_context(|| format!("failed to write {}", p.display()))
+        }
         None => io::stdout()
             .write_all(markdown.as_bytes())
             .context("failed to write to stdout"),

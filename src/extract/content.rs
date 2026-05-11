@@ -48,10 +48,7 @@ impl Matrix {
 
 /// Extract the page's text. Newlines mark new lines; pages are returned as
 /// independent strings so the caller can splice page breaks between them.
-pub fn extract_page_text(
-    content_bytes: &[u8],
-    fonts: &HashMap<Vec<u8>, PdfFont>,
-) -> String {
+pub fn extract_page_text(content_bytes: &[u8], fonts: &HashMap<Vec<u8>, PdfFont>) -> String {
     let Ok(content) = Content::decode(content_bytes) else {
         return String::new();
     };
@@ -201,12 +198,7 @@ fn execute(
     }
 }
 
-fn emit(
-    state: &mut TextState,
-    fonts: &HashMap<Vec<u8>, PdfFont>,
-    bytes: &[u8],
-    out: &mut String,
-) {
+fn emit(state: &mut TextState, fonts: &HashMap<Vec<u8>, PdfFont>, bytes: &[u8], out: &mut String) {
     let Some(name) = &state.font else { return };
     let Some(font) = fonts.get(name) else { return };
     let decoded = font.decode(bytes);

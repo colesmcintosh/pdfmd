@@ -57,7 +57,7 @@ impl PdfFont {
             }
             Some(obj) => {
                 let resolved = resolve(doc, obj);
-                if let Some(dict) = resolved.as_dict().ok() {
+                if let Ok(dict) = resolved.as_dict() {
                     if let Ok(Object::Name(base)) = dict.get(b"BaseEncoding") {
                         font.encoding =
                             BaseEncoding::from_name(std::str::from_utf8(base).unwrap_or(""));

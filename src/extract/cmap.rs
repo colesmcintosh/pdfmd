@@ -40,7 +40,9 @@ pub fn parse(data: &[u8]) -> CMap {
                         i += 1;
                         break;
                     }
-                    let Some((lo, _)) = take_hex_pair(&tokens, &mut i) else { break };
+                    let Some((lo, _)) = take_hex_pair(&tokens, &mut i) else {
+                        break;
+                    };
                     cmap.code_width = cmap.code_width.max(lo.len());
                 }
             }
@@ -51,7 +53,9 @@ pub fn parse(data: &[u8]) -> CMap {
                         i += 1;
                         break;
                     }
-                    let Some((src, dst)) = take_hex_pair(&tokens, &mut i) else { break };
+                    let Some((src, dst)) = take_hex_pair(&tokens, &mut i) else {
+                        break;
+                    };
                     if let (Some(code), Some(text)) = (bytes_to_u32(&src), utf16be_to_string(&dst))
                     {
                         cmap.map.insert(code, text);
@@ -65,8 +69,12 @@ pub fn parse(data: &[u8]) -> CMap {
                         i += 1;
                         break;
                     }
-                    let Some(lo) = take_hex(&tokens, &mut i) else { break };
-                    let Some(hi) = take_hex(&tokens, &mut i) else { break };
+                    let Some(lo) = take_hex(&tokens, &mut i) else {
+                        break;
+                    };
+                    let Some(hi) = take_hex(&tokens, &mut i) else {
+                        break;
+                    };
                     let (Some(lo_code), Some(hi_code)) = (bytes_to_u32(&lo), bytes_to_u32(&hi))
                     else {
                         continue;
@@ -168,7 +176,7 @@ fn utf16be_to_string(bytes: &[u8]) -> Option<String> {
     if bytes.len() == 1 {
         return Some((bytes[0] as char).to_string());
     }
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let units: Vec<u16> = bytes
@@ -178,7 +186,7 @@ fn utf16be_to_string(bytes: &[u8]) -> Option<String> {
     String::from_utf16(&units).ok()
 }
 
-fn add_to_last_u16(bytes: &mut Vec<u8>, offset: u32) {
+fn add_to_last_u16(bytes: &mut [u8], offset: u32) {
     if bytes.len() < 2 {
         return;
     }
@@ -298,7 +306,21 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
 }
 
 fn is_delim(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0C' | b'<' | b'>' | b'[' | b']' | b'(' | b')' | b'/' | b'%')
+    matches!(
+        b,
+        b' ' | b'\t'
+            | b'\r'
+            | b'\n'
+            | b'\x0C'
+            | b'<'
+            | b'>'
+            | b'['
+            | b']'
+            | b'('
+            | b')'
+            | b'/'
+            | b'%'
+    )
 }
 
 fn is_relevant_keyword(s: &str) -> bool {
