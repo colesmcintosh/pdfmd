@@ -94,47 +94,41 @@ fn execute(
         "ET" => {
             state.in_text_object = false;
         }
-        "Tf" => {
-            if op.operands.len() >= 2 {
-                if let Object::Name(name) = &op.operands[0] {
-                    state.font = Some(name.clone());
-                }
-                state.font_size = number(&op.operands[1]);
+        "Tf" if op.operands.len() >= 2 => {
+            if let Object::Name(name) = &op.operands[0] {
+                state.font = Some(name.clone());
             }
+            state.font_size = number(&op.operands[1]);
         }
         "TL" => {
             if let Some(v) = op.operands.first() {
                 state.leading = number(v);
             }
         }
-        "Tm" => {
-            if op.operands.len() == 6 {
-                let m = Matrix {
-                    a: number(&op.operands[0]),
-                    b: number(&op.operands[1]),
-                    c: number(&op.operands[2]),
-                    d: number(&op.operands[3]),
-                    e: number(&op.operands[4]),
-                    f: number(&op.operands[5]),
-                };
-                state.text_matrix = Some(m);
-                state.line_matrix = Some(m);
-                position_changed(state, m.e, m.f, out);
-            }
+        "Tm" if op.operands.len() == 6 => {
+            let m = Matrix {
+                a: number(&op.operands[0]),
+                b: number(&op.operands[1]),
+                c: number(&op.operands[2]),
+                d: number(&op.operands[3]),
+                e: number(&op.operands[4]),
+                f: number(&op.operands[5]),
+            };
+            state.text_matrix = Some(m);
+            state.line_matrix = Some(m);
+            position_changed(state, m.e, m.f, out);
         }
-        "Td" | "TD" => {
-            if op.operands.len() >= 2 {
-                let tx = number(&op.operands[0]);
-                let ty = number(&op.operands[1]);
-                if op.operator == "TD" {
-                    state.leading = -ty;
-                }
-                if let Some(line) = state.line_matrix.as_mut() {
-                    line.translate(tx, ty);
-                    let new_line = *line;
-                    state.text_matrix = Some(new_line);
-                    position_changed(state, new_line.e, new_line.f, out);
-                }
+        "Td" | "TD" if op.operands.len() >= 2 => {
+            let tx = number(&op.operands[0]);
+            let ty = number(&op.operands[1]);
+            if op.operator == "TD" {
+                state.leading = -ty;
+            }
+            if let Some(line) = state.line_matrix.as_mut() {
+                line.translate(tx, ty);
+                let new_line = *line;
+                state.text_matrix = Some(new_line);
+                position_changed(state, new_line.e, new_line.f, out);
             }
         }
         "T*" => {

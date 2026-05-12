@@ -26,7 +26,7 @@ pub fn glyph_to_string(name: &str) -> Option<String> {
 
 fn decode_uni_sequence(rest: &str) -> Option<String> {
     // `uni` glyph names concatenate one or more 4-digit hex codes.
-    if rest.is_empty() || !rest.len().is_multiple_of(4) {
+    if rest.is_empty() || rest.len() % 4 != 0 {
         return None;
     }
     let mut out = String::new();
