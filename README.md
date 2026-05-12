@@ -32,11 +32,18 @@ cargo build --release
 ## Usage
 
 ```sh
-pdfmd input.pdf                   # markdown to stdout
-pdfmd input.pdf -o output.md      # write to a file
-pdfmd input.pdf --page-breaks     # insert `---` between PDF pages
-cat input.pdf | pdfmd -           # read from stdin
+pdfmd input.pdf                     # markdown to stdout
+pdfmd input.pdf -o output.md        # write to a file
+pdfmd input.pdf --page-breaks       # insert `---` between PDF pages
+pdfmd input.pdf --extract-images figs -o out.md
+                                    # save embedded JPEGs into ./figs
+                                    # and link them inline in out.md
+cat input.pdf | pdfmd -             # read from stdin
 ```
+
+Image extraction currently passes through JPEG (`DCTDecode`) and JPEG 2000
+(`JPXDecode`) streams verbatim; PDFs that store figures as `FlateDecode`
+bitmaps or other filters will not yield image files.
 
 ## Performance
 

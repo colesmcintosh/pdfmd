@@ -11,10 +11,16 @@ use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Object, ObjectId};
 
 use super::font::PdfFont;
+use super::image::PageImages;
 
 /// Map from a page's font-resource name (e.g. `b"F1"`) to a borrowed handle
 /// on the parsed font in the document-wide cache.
 pub type PageFonts<'a> = HashMap<Vec<u8>, &'a PdfFont>;
+
+/// Sentinel that wraps image-reference filenames in the extracted text.
+/// The markdown layer rewrites `\u{0001}NAME\u{0001}` into `![](DIR/NAME)`.
+/// Chosen because `\u{0001}` never appears in normal PDF text content.
+pub const IMAGE_MARK: char = '\u{0001}';
 
 /// Threshold below which a positive `TJ` displacement is treated as kerning
 /// rather than a word-break. PDF expresses these values in thousandths of
@@ -52,7 +58,11 @@ impl Matrix {
 
 /// Extract the page's text. Newlines mark new lines; pages are returned as
 /// independent strings so the caller can splice page breaks between them.
-pub fn extract_page_text(content_bytes: &[u8], fonts: &PageFonts<'_>) -> String {
+pub fn extract_page_text(
+    content_bytes: &[u8],
+    fonts: &PageFonts<'_>,
+    images: &PageImages<'_>,
+) -> String {
     let Ok(content) = Content::decode(content_bytes) else {
         return String::new();
     };
@@ -61,7 +71,7 @@ pub fn extract_page_text(content_bytes: &[u8], fonts: &PageFonts<'_>) -> String 
     let mut out = String::new();
 
     for op in &content.operations {
-        execute(op, fonts, &mut state, &mut out);
+        execute(op, fonts, images, &mut state, &mut out);
     }
     out
 }
@@ -83,7 +93,13 @@ struct TextState {
     typical_line_height: Option<f32>,
 }
 
-fn execute(op: &Operation, fonts: &PageFonts<'_>, state: &mut TextState, out: &mut String) {
+fn execute(
+    op: &Operation,
+    fonts: &PageFonts<'_>,
+    images: &PageImages<'_>,
+    state: &mut TextState,
+    out: &mut String,
+) {
     match op.operator.as_str() {
         "BT" => {
             state.in_text_object = true;
@@ -164,6 +180,21 @@ fn execute(op: &Operation, fonts: &PageFonts<'_>, state: &mut TextState, out: &m
             }
             if let Some(Object::String(bytes, _)) = op.operands.get(2) {
                 emit(state, fonts, bytes, out);
+            }
+        }
+        "Do" => {
+            // Paint an XObject by its resource name. We only care about
+            // image XObjects we previously chose to extract; everything
+            // else (Form XObjects, unsupported filters) is invisible here.
+            if let Some(Object::Name(name)) = op.operands.first() {
+                if let Some(filename) = images.get(name) {
+                    state.pending_space = false;
+                    ensure_trailing_breaks(out, 2);
+                    out.push(IMAGE_MARK);
+                    out.push_str(filename);
+                    out.push(IMAGE_MARK);
+                    out.push_str("\n\n");
+                }
             }
         }
         "TJ" => {
