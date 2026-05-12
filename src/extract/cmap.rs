@@ -176,7 +176,7 @@ fn utf16be_to_string(bytes: &[u8]) -> Option<String> {
     if bytes.len() == 1 {
         return Some((bytes[0] as char).to_string());
     }
-    if !bytes.len().is_multiple_of(2) {
+    if bytes.len() % 2 != 0 {
         return None;
     }
     let units: Vec<u16> = bytes
