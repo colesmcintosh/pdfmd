@@ -8,9 +8,13 @@
 use std::collections::HashMap;
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Object, ObjectId};
 
 use super::font::PdfFont;
+
+/// Map from a page's font-resource name (e.g. `b"F1"`) to a borrowed handle
+/// on the parsed font in the document-wide cache.
+pub type PageFonts<'a> = HashMap<Vec<u8>, &'a PdfFont>;
 
 /// Threshold below which a positive `TJ` displacement is treated as kerning
 /// rather than a word-break. PDF expresses these values in thousandths of
@@ -48,7 +52,7 @@ impl Matrix {
 
 /// Extract the page's text. Newlines mark new lines; pages are returned as
 /// independent strings so the caller can splice page breaks between them.
-pub fn extract_page_text(content_bytes: &[u8], fonts: &HashMap<Vec<u8>, PdfFont>) -> String {
+pub fn extract_page_text(content_bytes: &[u8], fonts: &PageFonts<'_>) -> String {
     let Ok(content) = Content::decode(content_bytes) else {
         return String::new();
     };
@@ -79,12 +83,7 @@ struct TextState {
     typical_line_height: Option<f32>,
 }
 
-fn execute(
-    op: &Operation,
-    fonts: &HashMap<Vec<u8>, PdfFont>,
-    state: &mut TextState,
-    out: &mut String,
-) {
+fn execute(op: &Operation, fonts: &PageFonts<'_>, state: &mut TextState, out: &mut String) {
     match op.operator.as_str() {
         "BT" => {
             state.in_text_object = true;
@@ -192,7 +191,7 @@ fn execute(
     }
 }
 
-fn emit(state: &mut TextState, fonts: &HashMap<Vec<u8>, PdfFont>, bytes: &[u8], out: &mut String) {
+fn emit(state: &mut TextState, fonts: &PageFonts<'_>, bytes: &[u8], out: &mut String) {
     let Some(name) = &state.font else { return };
     let Some(font) = fonts.get(name) else { return };
     let decoded = font.decode(bytes);
@@ -278,12 +277,13 @@ fn number(obj: &Object) -> f32 {
     }
 }
 
-/// Resolve the `/Font` entry of a page's `/Resources` dictionary into a map
-/// keyed by the font's name in the dict (e.g. `b"F1"`).
-pub fn collect_page_fonts(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, PdfFont> {
-    let mut fonts = HashMap::new();
+/// Map a page's `/Resources/Font` entries to their font object IDs without
+/// parsing the fonts themselves — the caller looks the parsed fonts up in
+/// a document-wide cache to avoid re-parsing the same font across pages.
+pub fn page_font_refs(doc: &lopdf::Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
+    let mut out = HashMap::new();
     let Ok(font_dict_obj) = resources.get(b"Font") else {
-        return fonts;
+        return out;
     };
     let font_dict = match font_dict_obj {
         Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).ok(),
@@ -291,20 +291,12 @@ pub fn collect_page_fonts(doc: &Document, resources: &Dictionary) -> HashMap<Vec
         _ => None,
     };
     let Some(font_dict) = font_dict else {
-        return fonts;
+        return out;
     };
     for (name, obj) in font_dict.iter() {
-        if let Some(id) = resolve_id(obj) {
-            fonts.insert(name.clone(), PdfFont::from_object(doc, id));
+        if let Object::Reference(id) = obj {
+            out.insert(name.clone(), *id);
         }
     }
-    fonts
-}
-
-fn resolve_id(obj: &Object) -> Option<ObjectId> {
-    if let Object::Reference(id) = obj {
-        Some(*id)
-    } else {
-        None
-    }
+    out
 }
