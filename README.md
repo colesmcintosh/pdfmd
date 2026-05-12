@@ -1,8 +1,8 @@
-# rust-parse
+# pdfmd
 
 A fast, dependency-light PDF → Markdown converter written in Rust.
 
-`rust-parse` extracts text directly from a PDF — walking the object graph,
+`pdfmd` extracts text directly from a PDF — walking the object graph,
 decoding fonts, and interpreting the content-stream operators itself — and
 then runs a small set of heuristics to recover headings, lists, and
 paragraph boundaries.
@@ -11,7 +11,7 @@ paragraph boundaries.
 
 PDFs do not carry semantic structure. Most extraction libraries either
 return one undifferentiated text blob, or stop at the slow, general-purpose
-parsing layer. `rust-parse` skips both: it owns the path from bytes to
+parsing layer. `pdfmd` skips both: it owns the path from bytes to
 Markdown, which keeps the conversion under ~15 ms for a typical
 academic paper and leaves room to tune the heuristics for the documents
 you care about.
@@ -26,16 +26,16 @@ Or build a release binary directly:
 
 ```sh
 cargo build --release
-# binary is at ./target/release/rust-parse
+# binary is at ./target/release/pdfmd
 ```
 
 ## Usage
 
 ```sh
-rust-parse input.pdf                   # markdown to stdout
-rust-parse input.pdf -o output.md      # write to a file
-rust-parse input.pdf --page-breaks     # insert `---` between PDF pages
-cat input.pdf | rust-parse -           # read from stdin
+pdfmd input.pdf                   # markdown to stdout
+pdfmd input.pdf -o output.md      # write to a file
+pdfmd input.pdf --page-breaks     # insert `---` between PDF pages
+cat input.pdf | pdfmd -           # read from stdin
 ```
 
 ## Performance

@@ -1,5 +1,5 @@
 [package]
-name = "rust-parse"
+name = "pdfmd"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
@@ -7,8 +7,8 @@ authors = ["Cole McIntosh <colemcintosh6@gmail.com>"]
 description = "Fast PDF to Markdown converter with a from-scratch text extractor"
 readme = "README.md"
 license = "MIT"
-repository = "https://github.com/colesmcintosh/rust-parse"
-homepage = "https://github.com/colesmcintosh/rust-parse"
+repository = "https://github.com/colesmcintosh/pdfmd"
+homepage = "https://github.com/colesmcintosh/pdfmd"
 keywords = ["pdf", "markdown", "parser", "converter", "text-extraction"]
 categories = ["command-line-utilities", "parser-implementations", "text-processing"]
 

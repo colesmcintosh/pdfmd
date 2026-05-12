@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use rust_parse::convert_pdf_to_markdown;
+use pdfmd::convert_pdf_to_markdown;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rust-parse",
+    name = "pdfmd",
     version,
     about = "Convert PDF documents to Markdown",
     long_about = None,

@@ -9,7 +9,7 @@ use std::fs;
 use std::process;
 use std::time::Instant;
 
-use rust_parse::convert_pdf_to_markdown;
+use pdfmd::convert_pdf_to_markdown;
 
 fn main() {
     let mut args = env::args().skip(1);
