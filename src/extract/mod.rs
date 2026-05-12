@@ -26,7 +26,10 @@ pub use image::ExtractedImage;
 /// (JPEG, JPEG 2000) are collected and the returned text carries inline
 /// markers — `\u{0001}filename\u{0001}` — at the position each image was
 /// painted, for the markdown layer to rewrite into `![]()` references.
-pub fn extract_text(pdf_bytes: &[u8], extract_images: bool) -> Result<(String, Vec<ExtractedImage>)> {
+pub fn extract_text(
+    pdf_bytes: &[u8],
+    extract_images: bool,
+) -> Result<(String, Vec<ExtractedImage>)> {
     let doc = Document::load_mem(pdf_bytes).context("failed to parse PDF")?;
 
     // `get_pages` returns a BTreeMap already sorted by page number, so the
@@ -43,7 +46,11 @@ pub fn extract_text(pdf_bytes: &[u8], extract_images: bool) -> Result<(String, V
     // lets us deduplicate fonts shared across pages.
     let page_font_refs_per_page: Vec<HashMap<Vec<u8>, ObjectId>> = resources
         .iter()
-        .map(|r| r.as_ref().map(|r| page_font_refs(&doc, r)).unwrap_or_default())
+        .map(|r| {
+            r.as_ref()
+                .map(|r| page_font_refs(&doc, r))
+                .unwrap_or_default()
+        })
         .collect();
 
     // Parse each unique font exactly once, in parallel.
