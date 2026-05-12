@@ -12,7 +12,7 @@ paragraph boundaries.
 PDFs do not carry semantic structure. Most extraction libraries either
 return one undifferentiated text blob, or stop at the slow, general-purpose
 parsing layer. `pdfmd` skips both: it owns the path from bytes to
-Markdown, which keeps the conversion under ~15 ms for a typical
+Markdown, which keeps the conversion under ~10 ms for a typical
 academic paper and leaves room to tune the heuristics for the documents
 you care about.
 
@@ -40,16 +40,19 @@ cat input.pdf | pdfmd -           # read from stdin
 
 ## Performance
 
-Benchmark on a 1.05 MB, 17-page arXiv paper (Apple Silicon, release build,
-20 runs, warm cache):
+End-to-end CLI benchmark on a 1.05 MB, 17-page arXiv paper (Apple Silicon,
+release build, `hyperfine --warmup 5 --runs 20`):
 
 | metric     | value                |
 |------------|----------------------|
-| min        | 11.5 ms              |
-| median     | 12.4 ms              |
-| mean       | 12.3 ms ± 0.4 ms     |
-| throughput | ~85 MB/s of PDF      |
-| pages/sec  | ~1,400               |
+| min        | 7.0 ms               |
+| mean       | 7.6 ms ± 0.3 ms      |
+| throughput | ~140 MB/s of PDF     |
+| pages/sec  | ~2,200               |
+
+Per-page font and content-stream work runs in parallel on
+[`rayon`](https://crates.io/crates/rayon), and fonts shared across pages
+are parsed once into a document-wide cache.
 
 ## How it works
 
