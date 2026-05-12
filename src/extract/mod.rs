@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use lopdf::{Document, Object};
+use rayon::prelude::*;
 
 mod cmap;
 mod content;
@@ -15,14 +16,23 @@ use content::collect_page_fonts;
 /// ASCII form-feed character, which the markdown layer splits on.
 pub fn extract_text(pdf_bytes: &[u8]) -> Result<String> {
     let doc = Document::load_mem(pdf_bytes).context("failed to parse PDF")?;
-    let mut out = String::new();
 
-    for (page_num, page_id) in doc.get_pages() {
-        let page_text = extract_one_page(&doc, page_id).unwrap_or_default();
-        if page_num > 1 {
+    // `get_pages` returns a BTreeMap already sorted by page number, so the
+    // collected vector preserves document order.
+    let pages: Vec<(u32, lopdf::ObjectId)> = doc.get_pages().into_iter().collect();
+
+    let page_texts: Vec<String> = pages
+        .par_iter()
+        .map(|&(_, page_id)| extract_one_page(&doc, page_id).unwrap_or_default())
+        .collect();
+
+    let total: usize = page_texts.iter().map(String::len).sum::<usize>() + page_texts.len();
+    let mut out = String::with_capacity(total);
+    for (i, text) in page_texts.iter().enumerate() {
+        if i > 0 {
             out.push('\u{000C}');
         }
-        out.push_str(&page_text);
+        out.push_str(text);
     }
     Ok(out)
 }

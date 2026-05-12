@@ -494,6 +494,7 @@ dependencies = [
  "anyhow",
  "clap",
  "lopdf",
+ "rayon",
  "regex",
 ]
 
