@@ -9,7 +9,7 @@ use std::fs;
 use std::process;
 use std::time::Instant;
 
-use pdfmd::convert_pdf_to_markdown;
+use pdfmd::{convert_pdf_to_markdown, ConvertOptions};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -30,11 +30,12 @@ fn main() {
         bytes.len() / 1024
     );
 
+    let opts = ConvertOptions::default();
     let start = Instant::now();
     let mut total_md_bytes: usize = 0;
     for _ in 0..iterations {
-        let md = convert_pdf_to_markdown(&bytes, false).expect("convert");
-        total_md_bytes += md.len();
+        let result = convert_pdf_to_markdown(&bytes, &opts).expect("convert");
+        total_md_bytes += result.markdown.len();
     }
     let elapsed = start.elapsed();
 
