@@ -18,6 +18,14 @@ pub struct PdfFont {
     pub encoding: BaseEncoding,
     /// Per-byte glyph-name overrides from /Encoding /Differences.
     pub differences: HashMap<u8, String>,
+    /// Width of source codes in bytes (1 for simple fonts without a wide
+    /// ToUnicode CMap, 2 for composite fonts or wide simple fonts).
+    code_width: usize,
+    /// Fast-path decode table for 1-byte simple fonts. When set, `decode_into`
+    /// is a tight `byte -> push_str` loop with no branching or hashing.
+    /// Indexed by byte; `None` entries are silently skipped (matches the
+    /// behaviour of the slow path for unmappable codes).
+    simple_table: Option<Box<[Option<Box<str>>; 256]>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -70,15 +78,32 @@ impl PdfFont {
             None => {}
         }
 
+        font.code_width = match font.kind {
+            FontKind::Composite => font.to_unicode.as_ref().map_or(2, CMap::code_width),
+            FontKind::Simple => font.to_unicode.as_ref().map_or(1, CMap::code_width),
+        };
+
+        if font.kind == FontKind::Simple && font.code_width == 1 {
+            font.simple_table = Some(font.build_simple_table());
+        }
+
         font
     }
 
-    pub fn decode(&self, bytes: &[u8]) -> String {
-        let width = match self.kind {
-            FontKind::Composite => self.to_unicode.as_ref().map_or(2, CMap::code_width),
-            FontKind::Simple => self.to_unicode.as_ref().map_or(1, CMap::code_width),
-        };
-        let mut out = String::with_capacity(bytes.len());
+    /// Append the decoded text for `bytes` to `out`. The common case — a
+    /// 1-byte simple font — runs through a precomputed lookup table, so the
+    /// inner loop is a branchless `push_str` per byte.
+    pub fn decode_into(&self, bytes: &[u8], out: &mut String) {
+        if let Some(table) = self.simple_table.as_deref() {
+            for &b in bytes {
+                if let Some(s) = &table[b as usize] {
+                    out.push_str(s);
+                }
+            }
+            return;
+        }
+
+        let width = self.code_width.max(1);
         let mut i = 0;
         while i < bytes.len() {
             let remaining = bytes.len() - i;
@@ -116,7 +141,38 @@ impl PdfFont {
             }
             // Composite font without a usable ToUnicode entry: skip silently.
         }
-        out
+    }
+
+    /// Populate the 256-entry fast-path table. Called once at construction
+    /// for 1-byte simple fonts; same precedence as the slow path.
+    fn build_simple_table(&self) -> Box<[Option<Box<str>>; 256]> {
+        let mut table: [Option<Box<str>>; 256] = std::array::from_fn(|_| None);
+        for b in 0..=255u8 {
+            table[b as usize] = self.decode_single_byte(b).map(String::into_boxed_str);
+        }
+        Box::new(table)
+    }
+
+    fn decode_single_byte(&self, byte: u8) -> Option<String> {
+        if let Some(cmap) = &self.to_unicode {
+            if let Some(text) = cmap.lookup(byte as u32) {
+                return Some(text.to_string());
+            }
+        }
+        if let Some(name) = self.differences.get(&byte) {
+            if let Some(text) = glyph_to_string(name) {
+                return Some(text);
+            }
+        }
+        if let Some(name) = self.encoding.glyph(byte) {
+            if let Some(text) = glyph_to_string(name) {
+                return Some(text);
+            }
+        }
+        if byte >= 0x20 {
+            return Some((byte as char).to_string());
+        }
+        None
     }
 }
 

@@ -67,8 +67,10 @@ pub fn extract_page_text(
         return String::new();
     };
 
-    let mut state = TextState::default();
-    let mut out = String::new();
+    let mut state: TextState<'_> = TextState::default();
+    // PDFs almost always emit more bytes than the content stream; preallocate
+    // a generous chunk so the inner push loop avoids early growth.
+    let mut out = String::with_capacity(content_bytes.len());
 
     for op in &content.operations {
         execute(op, fonts, images, &mut state, &mut out);
@@ -77,11 +79,13 @@ pub fn extract_page_text(
 }
 
 #[derive(Default)]
-struct TextState {
+struct TextState<'a> {
     in_text_object: bool,
     text_matrix: Option<Matrix>,
     line_matrix: Option<Matrix>,
-    font: Option<Vec<u8>>, // font name in the page's font dict
+    /// Currently selected font; resolved once at each `Tf` so the per-glyph
+    /// hot path avoids hashing the page's font name on every text-show.
+    font: Option<&'a PdfFont>,
     font_size: f32,
     leading: f32,
     last_y: Option<f32>,
@@ -93,11 +97,11 @@ struct TextState {
     typical_line_height: Option<f32>,
 }
 
-fn execute(
+fn execute<'a>(
     op: &Operation,
-    fonts: &PageFonts<'_>,
+    fonts: &PageFonts<'a>,
     images: &PageImages<'_>,
-    state: &mut TextState,
+    state: &mut TextState<'a>,
     out: &mut String,
 ) {
     match op.operator.as_str() {
@@ -111,7 +115,7 @@ fn execute(
         }
         "Tf" if op.operands.len() >= 2 => {
             if let Object::Name(name) = &op.operands[0] {
-                state.font = Some(name.clone());
+                state.font = fonts.get(name.as_slice()).copied();
             }
             state.font_size = number(&op.operands[1]);
         }
@@ -156,7 +160,7 @@ fn execute(
         }
         "Tj" => {
             if let Some(Object::String(bytes, _)) = op.operands.first() {
-                emit(state, fonts, bytes, out);
+                emit(state, bytes, out);
             }
         }
         "'" => {
@@ -168,7 +172,7 @@ fn execute(
                 position_changed(state, new_line.e, new_line.f, out);
             }
             if let Some(Object::String(bytes, _)) = op.operands.first() {
-                emit(state, fonts, bytes, out);
+                emit(state, bytes, out);
             }
         }
         "\"" => {
@@ -179,7 +183,7 @@ fn execute(
                 position_changed(state, new_line.e, new_line.f, out);
             }
             if let Some(Object::String(bytes, _)) = op.operands.get(2) {
-                emit(state, fonts, bytes, out);
+                emit(state, bytes, out);
             }
         }
         "Do" => {
@@ -201,7 +205,7 @@ fn execute(
             if let Some(Object::Array(arr)) = op.operands.first() {
                 for elem in arr {
                     match elem {
-                        Object::String(bytes, _) => emit(state, fonts, bytes, out),
+                        Object::String(bytes, _) => emit(state, bytes, out),
                         Object::Integer(_) | Object::Real(_) => {
                             // PDF spec 9.4.3: positive values move the next
                             // glyph LEFT (kerning that closes a gap),
@@ -222,15 +226,31 @@ fn execute(
     }
 }
 
-fn emit(state: &mut TextState, fonts: &PageFonts<'_>, bytes: &[u8], out: &mut String) {
-    let Some(name) = &state.font else { return };
-    let Some(font) = fonts.get(name) else { return };
-    let decoded = font.decode(bytes);
-    if decoded.is_empty() {
-        return;
+fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
+    let Some(font) = state.font else { return };
+
+    // Optimistically flush a deferred word-break before decoding so the
+    // common case (decode produces ≥1 char) avoids an O(n) string insert.
+    // If the decode produces nothing we pop the space back off below.
+    let added_space =
+        state.pending_space && !ends_with_ascii_whitespace(out) && !out.is_empty() && {
+            out.push(' ');
+            true
+        };
+    let was_pending = state.pending_space;
+    state.pending_space = false;
+    let start = out.len();
+    font.decode_into(bytes, out);
+    if out.len() == start {
+        if added_space {
+            out.pop();
+        }
+        state.pending_space = was_pending;
     }
-    flush_pending_space(state, out);
-    out.push_str(&decoded);
+}
+
+fn ends_with_ascii_whitespace(out: &str) -> bool {
+    matches!(out.as_bytes().last(), Some(b' ' | b'\n' | b'\t' | b'\r'))
 }
 
 /// Called after `Td`, `Tm`, `T*`, `'`, `"` update the text-line matrix.
@@ -238,7 +258,7 @@ fn emit(state: &mut TextState, fonts: &PageFonts<'_>, bytes: &[u8], out: &mut St
 /// `\n\n` for what looks like a paragraph break); a horizontal change
 /// defers a space until the next glyph is drawn so trailing position-only
 /// operators don't dump stray whitespace.
-fn position_changed(state: &mut TextState, new_x: f32, new_y: f32, out: &mut String) {
+fn position_changed(state: &mut TextState<'_>, new_x: f32, new_y: f32, out: &mut String) {
     if !state.in_text_object {
         state.last_x = Some(new_x);
         state.last_y = Some(new_y);
@@ -288,15 +308,6 @@ fn ensure_trailing_breaks(out: &mut String, count: usize) {
     }
     for _ in 0..count {
         out.push('\n');
-    }
-}
-
-fn flush_pending_space(state: &mut TextState, out: &mut String) {
-    if state.pending_space {
-        if !out.is_empty() && !out.ends_with(|c: char| c.is_whitespace()) {
-            out.push(' ');
-        }
-        state.pending_space = false;
     }
 }
 

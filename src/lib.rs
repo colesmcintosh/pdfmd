@@ -12,7 +12,7 @@ mod heuristics;
 
 pub use extract::ExtractedImage;
 
-use heuristics::{format_page, PAGE_BREAK};
+use heuristics::format_page;
 
 /// Options controlling a PDF → Markdown conversion.
 #[derive(Default, Clone, Copy)]
@@ -37,11 +37,11 @@ pub struct ConvertResult {
 
 /// Convert the byte contents of a PDF into a Markdown document.
 pub fn convert_pdf_to_markdown(pdf_bytes: &[u8], opts: &ConvertOptions) -> Result<ConvertResult> {
-    let (raw_text, images) = extract::extract_text(pdf_bytes, opts.image_dir.is_some())?;
+    let (raw_pages, images) = extract::extract_text(pdf_bytes, opts.image_dir.is_some())?;
 
-    let pages: Vec<String> = raw_text
-        .split(PAGE_BREAK)
-        .map(format_page)
+    let pages: Vec<String> = raw_pages
+        .iter()
+        .map(|p| format_page(p))
         .filter(|page| !page.trim().is_empty())
         .collect();
 
