@@ -1,0 +1,496 @@
+//! Streaming parser for PDF content streams.
+//!
+//! Replaces `lopdf::content::Content::decode`. The latter materialises every
+//! operator and its operands into heap-allocated `String` / `Vec<Object>`
+//! values up front, even for operators we ignore (path painting, colour,
+//! graphics state). At ~12 000 operators for a typical paper PDF that
+//! dominates extraction cost.
+//!
+//! This parser walks the byte stream once and yields one `Token` at a time.
+//! Names and clean literal strings are returned as borrowed slices of the
+//! input; only escaped literal strings and hex strings allocate.
+//!
+//! Out of scope: rendering state, graphics paths, encryption, anything not
+//! needed by the text extractor. Tokens for those operators are still
+//! produced — the caller discards them on dispatch.
+
+use std::borrow::Cow;
+
+pub struct Parser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+#[derive(Debug)]
+pub enum Token<'a> {
+    /// Numeric operand (integer or real, collapsed to f32).
+    Num(f32),
+    /// A `/Name`, returned without the leading slash.
+    Name(&'a [u8]),
+    /// A literal `(...)` or hex `<...>` string, decoded into raw bytes. Most
+    /// common-case literals contain no escapes, so they stay borrowed.
+    Str(Cow<'a, [u8]>),
+    ArrayStart,
+    ArrayEnd,
+    /// Any keyword the tokenizer doesn't recognise as a literal — this is
+    /// where the consumer sees `Tj`, `TJ`, `Tf`, etc.
+    Op(&'a [u8]),
+    Eof,
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    pub fn next_token(&mut self) -> Token<'a> {
+        self.skip_ws_and_comments();
+        let Some(&b) = self.bytes.get(self.pos) else {
+            return Token::Eof;
+        };
+        match b {
+            b'(' => {
+                self.pos += 1;
+                self.read_literal_string()
+            }
+            b'<' => {
+                self.pos += 1;
+                if self.bytes.get(self.pos) == Some(&b'<') {
+                    // Dict literal `<<` — defensive: shouldn't appear in
+                    // content streams, but skip to the matching `>>` so we
+                    // don't tokenize its innards as operands.
+                    self.pos += 1;
+                    self.skip_dict();
+                    return self.next_token();
+                }
+                self.read_hex_string()
+            }
+            b'>' => {
+                // Stray `>>` from a stripped dict literal. Skip and resync.
+                self.pos += 1;
+                if self.bytes.get(self.pos) == Some(&b'>') {
+                    self.pos += 1;
+                }
+                self.next_token()
+            }
+            b'[' => {
+                self.pos += 1;
+                Token::ArrayStart
+            }
+            b']' => {
+                self.pos += 1;
+                Token::ArrayEnd
+            }
+            b'/' => {
+                self.pos += 1;
+                self.read_name()
+            }
+            b'+' | b'-' | b'.' | b'0'..=b'9' => self.read_number_or_keyword(),
+            _ => self.read_keyword(),
+        }
+    }
+
+    /// Skip past an inline-image data block. After the caller consumes the
+    /// `BI` and `ID` operators, the raw image bytes follow until a closing
+    /// `EI` operator at a token boundary. Naively tokenizing those bytes
+    /// would emit garbage (and likely misparse parentheses inside the image
+    /// data as strings) so the caller asks us to fast-forward.
+    pub fn skip_inline_image(&mut self) {
+        let bytes = self.bytes;
+        let mut i = self.pos;
+        while i + 2 <= bytes.len() {
+            // Look for ws+"EI"+ws (or EOF) — that's the operator boundary.
+            if is_ws(bytes[i]) && bytes[i + 1] == b'E' && bytes.get(i + 2) == Some(&b'I') {
+                let after = bytes.get(i + 3);
+                if after.is_none() || matches!(after.copied(), Some(c) if is_ws(c) || is_delim(c)) {
+                    self.pos = i + 3;
+                    return;
+                }
+            }
+            i += 1;
+        }
+        // Unterminated — bail to end of stream.
+        self.pos = bytes.len();
+    }
+
+    fn skip_ws_and_comments(&mut self) {
+        loop {
+            while let Some(&b) = self.bytes.get(self.pos) {
+                if is_ws(b) {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if self.bytes.get(self.pos) == Some(&b'%') {
+                while let Some(&b) = self.bytes.get(self.pos) {
+                    if b == b'\n' || b == b'\r' {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn read_name(&mut self) -> Token<'a> {
+        let start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if is_delim_or_ws(b) {
+                break;
+            }
+            self.pos += 1;
+        }
+        Token::Name(&self.bytes[start..self.pos])
+    }
+
+    fn read_keyword(&mut self) -> Token<'a> {
+        let start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if is_delim_or_ws(b) {
+                break;
+            }
+            self.pos += 1;
+        }
+        Token::Op(&self.bytes[start..self.pos])
+    }
+
+    fn read_number_or_keyword(&mut self) -> Token<'a> {
+        let start = self.pos;
+        if matches!(self.bytes[self.pos], b'+' | b'-') {
+            self.pos += 1;
+        }
+        let int_start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if !b.is_ascii_digit() {
+                break;
+            }
+            self.pos += 1;
+        }
+        let mut has_digits = self.pos > int_start;
+        if self.bytes.get(self.pos) == Some(&b'.') {
+            self.pos += 1;
+            let frac_start = self.pos;
+            while let Some(&b) = self.bytes.get(self.pos) {
+                if !b.is_ascii_digit() {
+                    break;
+                }
+                self.pos += 1;
+            }
+            has_digits |= self.pos > frac_start;
+        }
+        // Either the leading char wasn't really a number (e.g. just `+` or
+        // `.`) or the run kept going into letters (e.g. `10x`, which would
+        // make the whole thing a single bizarre keyword). Restart as keyword.
+        let next = self.bytes.get(self.pos).copied();
+        let at_boundary = next.is_none() || matches!(next, Some(b) if is_delim_or_ws(b));
+        if !has_digits || !at_boundary {
+            self.pos = start;
+            return self.read_keyword();
+        }
+        let n = std::str::from_utf8(&self.bytes[start..self.pos])
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        Token::Num(n)
+    }
+
+    fn read_literal_string(&mut self) -> Token<'a> {
+        let start = self.pos;
+        let mut depth: i32 = 1;
+        let mut has_escape = false;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            match b {
+                b'(' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = self.pos;
+                        self.pos += 1;
+                        let raw = &self.bytes[start..end];
+                        return if has_escape {
+                            Token::Str(Cow::Owned(unescape_literal(raw)))
+                        } else {
+                            Token::Str(Cow::Borrowed(raw))
+                        };
+                    }
+                    self.pos += 1;
+                }
+                b'\\' => {
+                    has_escape = true;
+                    self.pos += 1;
+                    if self.pos < self.bytes.len() {
+                        self.pos += 1;
+                    }
+                }
+                _ => self.pos += 1,
+            }
+        }
+        // Unterminated string — keep what we have. Better to return partial
+        // text than to error out and lose the whole page.
+        Token::Str(Cow::Borrowed(&self.bytes[start..self.pos]))
+    }
+
+    fn read_hex_string(&mut self) -> Token<'a> {
+        let start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if b == b'>' {
+                break;
+            }
+            self.pos += 1;
+        }
+        let raw = &self.bytes[start..self.pos];
+        if self.bytes.get(self.pos) == Some(&b'>') {
+            self.pos += 1;
+        }
+        Token::Str(Cow::Owned(decode_hex(raw)))
+    }
+
+    fn skip_dict(&mut self) {
+        let mut depth: i32 = 1;
+        while depth > 0 && self.pos < self.bytes.len() {
+            if self.bytes[self.pos..].starts_with(b"<<") {
+                depth += 1;
+                self.pos += 2;
+            } else if self.bytes[self.pos..].starts_with(b">>") {
+                depth -= 1;
+                self.pos += 2;
+            } else {
+                self.pos += 1;
+            }
+        }
+    }
+}
+
+fn is_ws(b: u8) -> bool {
+    matches!(b, 0x00 | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
+}
+
+fn is_delim(b: u8) -> bool {
+    matches!(
+        b,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
+}
+
+fn is_delim_or_ws(b: u8) -> bool {
+    is_ws(b) || is_delim(b)
+}
+
+fn unescape_literal(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\\' && i + 1 < raw.len() {
+            let c = raw[i + 1];
+            match c {
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'b' => {
+                    out.push(0x08);
+                    i += 2;
+                }
+                b'f' => {
+                    out.push(0x0C);
+                    i += 2;
+                }
+                b'\\' => {
+                    out.push(b'\\');
+                    i += 2;
+                }
+                b'(' => {
+                    out.push(b'(');
+                    i += 2;
+                }
+                b')' => {
+                    out.push(b')');
+                    i += 2;
+                }
+                b'\n' => {
+                    // Backslash-newline is a line continuation.
+                    i += 2;
+                }
+                b'\r' => {
+                    i += 2;
+                    if i < raw.len() && raw[i] == b'\n' {
+                        i += 1;
+                    }
+                }
+                b'0'..=b'7' => {
+                    let mut v: u32 = 0;
+                    let mut n = 0;
+                    i += 1;
+                    while n < 3 && i < raw.len() && matches!(raw[i], b'0'..=b'7') {
+                        v = v * 8 + (raw[i] - b'0') as u32;
+                        i += 1;
+                        n += 1;
+                    }
+                    out.push((v & 0xFF) as u8);
+                }
+                _ => {
+                    out.push(c);
+                    i += 2;
+                }
+            }
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn decode_hex(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let mut nibble: Option<u8> = None;
+    for &b in raw {
+        let v = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => continue,
+        };
+        match nibble {
+            Some(prev) => {
+                out.push((prev << 4) | v);
+                nibble = None;
+            }
+            None => nibble = Some(v),
+        }
+    }
+    if let Some(prev) = nibble {
+        // Per PDF spec a trailing single nibble pads with 0.
+        out.push(prev << 4);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ops(data: &[u8]) -> Vec<String> {
+        let mut p = Parser::new(data);
+        let mut out = Vec::new();
+        loop {
+            match p.next_token() {
+                Token::Eof => break,
+                Token::Op(b) => out.push(format!("op:{}", std::str::from_utf8(b).unwrap())),
+                Token::Num(n) => out.push(format!("num:{n}")),
+                Token::Name(n) => out.push(format!("name:{}", std::str::from_utf8(n).unwrap())),
+                Token::Str(s) => {
+                    out.push(format!("str:{}", std::str::from_utf8(&s).unwrap_or("?")))
+                }
+                Token::ArrayStart => out.push("[".into()),
+                Token::ArrayEnd => out.push("]".into()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tokenizes_a_text_show_sequence() {
+        assert_eq!(
+            ops(b"BT /F1 12 Tf 100 200 Td (Hello) Tj ET"),
+            [
+                "op:BT",
+                "name:F1",
+                "num:12",
+                "op:Tf",
+                "num:100",
+                "num:200",
+                "op:Td",
+                "str:Hello",
+                "op:Tj",
+                "op:ET"
+            ]
+        );
+    }
+
+    #[test]
+    fn handles_kerned_tj_array() {
+        let got = ops(b"[(He) -50 (llo)] TJ");
+        assert_eq!(got, ["[", "str:He", "num:-50", "str:llo", "]", "op:TJ"]);
+    }
+
+    #[test]
+    fn hex_strings_decode_to_bytes() {
+        // <48656C6C6F> is "Hello" in ASCII hex.
+        let mut p = Parser::new(b"<48656C6C6F> Tj");
+        match p.next_token() {
+            Token::Str(s) => assert_eq!(&*s, b"Hello"),
+            t => panic!("expected Str, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn comments_are_ignored() {
+        assert_eq!(ops(b"% header\n42 % trailing\nTj"), ["num:42", "op:Tj"]);
+    }
+
+    #[test]
+    fn escape_sequences_in_literal_string() {
+        let mut p = Parser::new(b"(line1\\nline2) Tj");
+        match p.next_token() {
+            Token::Str(s) => assert_eq!(&*s, b"line1\nline2"),
+            t => panic!("expected Str, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn balanced_parens_inside_literal() {
+        let mut p = Parser::new(b"((nested)) Tj");
+        match p.next_token() {
+            Token::Str(s) => assert_eq!(&*s, b"(nested)"),
+            t => panic!("expected Str, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_and_real_numbers() {
+        assert_eq!(
+            ops(b"-1.5 +2 .25 100 Tm"),
+            ["num:-1.5", "num:2", "num:0.25", "num:100", "op:Tm"]
+        );
+    }
+
+    #[test]
+    fn skip_inline_image_jumps_past_data() {
+        // BI dict ID <raw...> EI body
+        let stream = b"BI /W 1 /H 1 ID \x00\x01\x02\nEI 99 Tj";
+        let mut p = Parser::new(stream);
+        // Walk through BI and its dict tokens until ID.
+        loop {
+            match p.next_token() {
+                Token::Op(op) if op == b"ID" => break,
+                Token::Eof => panic!("hit EOF before ID"),
+                _ => {}
+            }
+        }
+        p.skip_inline_image();
+        // Next two tokens should be the post-EI content.
+        match p.next_token() {
+            Token::Num(n) => assert_eq!(n, 99.0),
+            t => panic!("expected Num, got {t:?}"),
+        }
+        match p.next_token() {
+            Token::Op(op) => assert_eq!(op, b"Tj"),
+            t => panic!("expected Op, got {t:?}"),
+        }
+    }
+}

@@ -12,6 +12,7 @@ mod encoding;
 mod font;
 mod glyphs;
 mod image;
+mod parser;
 
 use content::{page_font_refs, PageFonts};
 use font::PdfFont;
