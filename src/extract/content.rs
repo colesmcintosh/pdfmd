@@ -289,20 +289,18 @@ fn dispatch<'a>(
                 }
             }
         }
-        b"TJ" => {
-            if ops.has_array {
-                for item in &ops.array {
-                    match item {
-                        ArrayItem::Str(s) => emit(state, s, out),
-                        ArrayItem::Num(v) => {
-                            // PDF spec 9.4.3: positive values move the next
-                            // glyph LEFT (kerning that closes a gap),
-                            // negative values move it RIGHT — that is the
-                            // shape of an inter-word break when the PDF
-                            // author omits a literal space character.
-                            if *v <= -TJ_SPACE_THRESHOLD {
-                                state.pending_space = true;
-                            }
+        b"TJ" if ops.has_array => {
+            for item in &ops.array {
+                match item {
+                    ArrayItem::Str(s) => emit(state, s, out),
+                    ArrayItem::Num(v) => {
+                        // PDF spec 9.4.3: positive values move the next
+                        // glyph LEFT (kerning that closes a gap),
+                        // negative values move it RIGHT — that is the
+                        // shape of an inter-word break when the PDF
+                        // author omits a literal space character.
+                        if *v <= -TJ_SPACE_THRESHOLD {
+                            state.pending_space = true;
                         }
                     }
                 }
