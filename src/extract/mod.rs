@@ -12,6 +12,7 @@ mod encoding;
 mod font;
 mod glyphs;
 mod image;
+mod parser;
 
 use content::{page_font_refs, PageFonts};
 use font::PdfFont;
@@ -19,8 +20,8 @@ use image::{extract_image, page_xobject_refs, PageImages};
 
 pub use image::ExtractedImage;
 
-/// Extract the textual content of a PDF document. Pages are separated by an
-/// ASCII form-feed character, which the markdown layer splits on.
+/// Extract the textual content of a PDF document. Pages are returned as
+/// independent strings so callers don't pay for a join/split round trip.
 ///
 /// When `extract_images` is true, image XObjects in pass-through filters
 /// (JPEG, JPEG 2000) are collected and the returned text carries inline
@@ -29,7 +30,7 @@ pub use image::ExtractedImage;
 pub fn extract_text(
     pdf_bytes: &[u8],
     extract_images: bool,
-) -> Result<(String, Vec<ExtractedImage>)> {
+) -> Result<(Vec<String>, Vec<ExtractedImage>)> {
     let doc = Document::load_mem(pdf_bytes).context("failed to parse PDF")?;
 
     // `get_pages` returns a BTreeMap already sorted by page number, so the
@@ -83,15 +84,7 @@ pub fn extract_text(
         })
         .collect();
 
-    let total: usize = page_texts.iter().map(String::len).sum::<usize>() + page_texts.len();
-    let mut out = String::with_capacity(total);
-    for (i, text) in page_texts.iter().enumerate() {
-        if i > 0 {
-            out.push('\u{000C}');
-        }
-        out.push_str(text);
-    }
-    Ok((out, images))
+    Ok((page_texts, images))
 }
 
 /// Walk every page's XObject dict, pull out the images we can pass through,

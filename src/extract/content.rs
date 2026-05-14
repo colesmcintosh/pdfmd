@@ -4,14 +4,19 @@
 //! matrix enough to recover line breaks, and applies a simple width-based
 //! heuristic to recover inter-word spaces that PDF producers express as
 //! horizontal displacements rather than literal ASCII space characters.
+//!
+//! The tokenizer in [`super::parser`] hands us one operator at a time with
+//! its operands borrowed from the input bytes, so this module never sees a
+//! heap-allocated `String` operator name or a `Vec<Object>` operand list.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
-use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Object, ObjectId};
 
 use super::font::PdfFont;
 use super::image::PageImages;
+use super::parser::{Parser, Token};
 
 /// Map from a page's font-resource name (e.g. `b"F1"`) to a borrowed handle
 /// on the parsed font in the document-wide cache.
@@ -56,6 +61,45 @@ impl Matrix {
     }
 }
 
+/// Operand stack for a single content-stream operator. PDF operators take at
+/// most six numeric operands (`Tm`), and at most one name/string/array
+/// operand each, so a fixed-size buffer comfortably holds the worst case
+/// without ever touching the heap on the hot path.
+#[derive(Default)]
+struct Operands<'a> {
+    nums: [f32; 6],
+    num_count: u8,
+    name: Option<&'a [u8]>,
+    string: Option<Cow<'a, [u8]>>,
+    array: Vec<ArrayItem<'a>>,
+    has_array: bool,
+}
+
+impl<'a> Operands<'a> {
+    fn push_num(&mut self, v: f32) {
+        if let Some(slot) = self.nums.get_mut(self.num_count as usize) {
+            *slot = v;
+        }
+        self.num_count = self.num_count.saturating_add(1);
+    }
+    fn nums(&self) -> &[f32] {
+        let n = (self.num_count as usize).min(self.nums.len());
+        &self.nums[..n]
+    }
+    fn reset(&mut self) {
+        self.num_count = 0;
+        self.name = None;
+        self.string = None;
+        self.array.clear();
+        self.has_array = false;
+    }
+}
+
+enum ArrayItem<'a> {
+    Num(f32),
+    Str(Cow<'a, [u8]>),
+}
+
 /// Extract the page's text. Newlines mark new lines; pages are returned as
 /// independent strings so the caller can splice page breaks between them.
 pub fn extract_page_text(
@@ -63,25 +107,70 @@ pub fn extract_page_text(
     fonts: &PageFonts<'_>,
     images: &PageImages<'_>,
 ) -> String {
-    let Ok(content) = Content::decode(content_bytes) else {
-        return String::new();
-    };
+    let mut state: TextState<'_> = TextState::default();
+    // PDFs almost always emit more bytes than the content stream; preallocate
+    // a generous chunk so the inner push loop avoids early growth.
+    let mut out = String::with_capacity(content_bytes.len());
 
-    let mut state = TextState::default();
-    let mut out = String::new();
+    let mut parser = Parser::new(content_bytes);
+    let mut ops: Operands<'_> = Operands::default();
 
-    for op in &content.operations {
-        execute(op, fonts, images, &mut state, &mut out);
+    loop {
+        match parser.next_token() {
+            Token::Eof => break,
+            Token::Num(n) => ops.push_num(n),
+            Token::Name(n) => ops.name = Some(n),
+            Token::Str(s) => ops.string = Some(s),
+            Token::ArrayStart => {
+                ops.array.clear();
+                loop {
+                    match parser.next_token() {
+                        Token::Num(n) => ops.array.push(ArrayItem::Num(n)),
+                        Token::Str(s) => ops.array.push(ArrayItem::Str(s)),
+                        Token::ArrayEnd | Token::Eof => break,
+                        _ => {}
+                    }
+                }
+                ops.has_array = true;
+            }
+            // A stray `]` outside an array isn't meaningful; ignore.
+            Token::ArrayEnd => {}
+            Token::Op(op) => {
+                dispatch(op, &ops, &mut state, fonts, images, &mut out);
+                if op == b"BI" {
+                    // Inline image dictionary follows; consume name/value
+                    // pairs until we see `ID`, then skip the raw bytes.
+                    skip_inline_image(&mut parser);
+                }
+                ops.reset();
+            }
+        }
     }
+
     out
 }
 
+fn skip_inline_image(parser: &mut Parser<'_>) {
+    loop {
+        match parser.next_token() {
+            Token::Op(op) if op == b"ID" => {
+                parser.skip_inline_image();
+                return;
+            }
+            Token::Eof => return,
+            _ => {}
+        }
+    }
+}
+
 #[derive(Default)]
-struct TextState {
+struct TextState<'a> {
     in_text_object: bool,
     text_matrix: Option<Matrix>,
     line_matrix: Option<Matrix>,
-    font: Option<Vec<u8>>, // font name in the page's font dict
+    /// Currently selected font; resolved once at each `Tf` so the per-glyph
+    /// hot path avoids hashing the page's font name on every text-show.
+    font: Option<&'a PdfFont>,
     font_size: f32,
     leading: f32,
     last_y: Option<f32>,
@@ -93,100 +182,103 @@ struct TextState {
     typical_line_height: Option<f32>,
 }
 
-fn execute(
-    op: &Operation,
-    fonts: &PageFonts<'_>,
+fn dispatch<'a>(
+    op: &[u8],
+    ops: &Operands<'a>,
+    state: &mut TextState<'a>,
+    fonts: &PageFonts<'a>,
     images: &PageImages<'_>,
-    state: &mut TextState,
     out: &mut String,
 ) {
-    match op.operator.as_str() {
-        "BT" => {
+    match op {
+        b"BT" => {
             state.in_text_object = true;
             state.text_matrix = Some(Matrix::identity());
             state.line_matrix = Some(Matrix::identity());
         }
-        "ET" => {
+        b"ET" => {
             state.in_text_object = false;
         }
-        "Tf" if op.operands.len() >= 2 => {
-            if let Object::Name(name) = &op.operands[0] {
-                state.font = Some(name.clone());
-            }
-            state.font_size = number(&op.operands[1]);
-        }
-        "TL" => {
-            if let Some(v) = op.operands.first() {
-                state.leading = number(v);
+        b"Tf" => {
+            if let (Some(name), [size, ..]) = (ops.name, ops.nums()) {
+                state.font = fonts.get(name).copied();
+                state.font_size = *size;
             }
         }
-        "Tm" if op.operands.len() == 6 => {
-            let m = Matrix {
-                a: number(&op.operands[0]),
-                b: number(&op.operands[1]),
-                c: number(&op.operands[2]),
-                d: number(&op.operands[3]),
-                e: number(&op.operands[4]),
-                f: number(&op.operands[5]),
-            };
-            state.text_matrix = Some(m);
-            state.line_matrix = Some(m);
-            position_changed(state, m.e, m.f, out);
-        }
-        "Td" | "TD" if op.operands.len() >= 2 => {
-            let tx = number(&op.operands[0]);
-            let ty = number(&op.operands[1]);
-            if op.operator == "TD" {
-                state.leading = -ty;
-            }
-            if let Some(line) = state.line_matrix.as_mut() {
-                line.translate(tx, ty);
-                let new_line = *line;
-                state.text_matrix = Some(new_line);
-                position_changed(state, new_line.e, new_line.f, out);
+        b"TL" => {
+            if let [v, ..] = ops.nums() {
+                state.leading = *v;
             }
         }
-        "T*" => {
-            if let Some(line) = state.line_matrix.as_mut() {
-                line.translate(0.0, -state.leading);
-                let new_line = *line;
-                state.text_matrix = Some(new_line);
-                position_changed(state, new_line.e, new_line.f, out);
+        b"Tm" => {
+            if let [a, b, c, d, e, f, ..] = ops.nums() {
+                let m = Matrix {
+                    a: *a,
+                    b: *b,
+                    c: *c,
+                    d: *d,
+                    e: *e,
+                    f: *f,
+                };
+                state.text_matrix = Some(m);
+                state.line_matrix = Some(m);
+                position_changed(state, m.e, m.f, out);
             }
         }
-        "Tj" => {
-            if let Some(Object::String(bytes, _)) = op.operands.first() {
-                emit(state, fonts, bytes, out);
+        b"Td" | b"TD" => {
+            if let [tx, ty, ..] = ops.nums() {
+                let (tx, ty) = (*tx, *ty);
+                if op == b"TD" {
+                    state.leading = -ty;
+                }
+                if let Some(line) = state.line_matrix.as_mut() {
+                    line.translate(tx, ty);
+                    let new_line = *line;
+                    state.text_matrix = Some(new_line);
+                    position_changed(state, new_line.e, new_line.f, out);
+                }
             }
         }
-        "'" => {
-            // Move to next line, then show string.
+        b"T*" => {
             if let Some(line) = state.line_matrix.as_mut() {
                 line.translate(0.0, -state.leading);
                 let new_line = *line;
                 state.text_matrix = Some(new_line);
                 position_changed(state, new_line.e, new_line.f, out);
             }
-            if let Some(Object::String(bytes, _)) = op.operands.first() {
-                emit(state, fonts, bytes, out);
+        }
+        b"Tj" => {
+            if let Some(s) = ops.string.as_deref() {
+                emit(state, s, out);
             }
         }
-        "\"" => {
+        b"'" => {
             if let Some(line) = state.line_matrix.as_mut() {
                 line.translate(0.0, -state.leading);
                 let new_line = *line;
                 state.text_matrix = Some(new_line);
                 position_changed(state, new_line.e, new_line.f, out);
             }
-            if let Some(Object::String(bytes, _)) = op.operands.get(2) {
-                emit(state, fonts, bytes, out);
+            if let Some(s) = ops.string.as_deref() {
+                emit(state, s, out);
             }
         }
-        "Do" => {
+        b"\"" => {
+            if let Some(line) = state.line_matrix.as_mut() {
+                line.translate(0.0, -state.leading);
+                let new_line = *line;
+                state.text_matrix = Some(new_line);
+                position_changed(state, new_line.e, new_line.f, out);
+            }
+            if let Some(s) = ops.string.as_deref() {
+                emit(state, s, out);
+            }
+        }
+        b"Do" => {
             // Paint an XObject by its resource name. We only care about
             // image XObjects we previously chose to extract; everything
             // else (Form XObjects, unsupported filters) is invisible here.
-            if let Some(Object::Name(name)) = op.operands.first() {
+            if let Some(name) = ops.name {
                 if let Some(filename) = images.get(name) {
                     state.pending_space = false;
                     ensure_trailing_breaks(out, 2);
@@ -197,23 +289,19 @@ fn execute(
                 }
             }
         }
-        "TJ" => {
-            if let Some(Object::Array(arr)) = op.operands.first() {
-                for elem in arr {
-                    match elem {
-                        Object::String(bytes, _) => emit(state, fonts, bytes, out),
-                        Object::Integer(_) | Object::Real(_) => {
-                            // PDF spec 9.4.3: positive values move the next
-                            // glyph LEFT (kerning that closes a gap),
-                            // negative values move it RIGHT — that is the
-                            // shape of an inter-word break when the PDF
-                            // author omits a literal space character.
-                            let v = number(elem);
-                            if v <= -TJ_SPACE_THRESHOLD {
-                                state.pending_space = true;
-                            }
+        b"TJ" if ops.has_array => {
+            for item in &ops.array {
+                match item {
+                    ArrayItem::Str(s) => emit(state, s, out),
+                    ArrayItem::Num(v) => {
+                        // PDF spec 9.4.3: positive values move the next
+                        // glyph LEFT (kerning that closes a gap),
+                        // negative values move it RIGHT — that is the
+                        // shape of an inter-word break when the PDF
+                        // author omits a literal space character.
+                        if *v <= -TJ_SPACE_THRESHOLD {
+                            state.pending_space = true;
                         }
-                        _ => {}
                     }
                 }
             }
@@ -222,15 +310,31 @@ fn execute(
     }
 }
 
-fn emit(state: &mut TextState, fonts: &PageFonts<'_>, bytes: &[u8], out: &mut String) {
-    let Some(name) = &state.font else { return };
-    let Some(font) = fonts.get(name) else { return };
-    let decoded = font.decode(bytes);
-    if decoded.is_empty() {
-        return;
+fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
+    let Some(font) = state.font else { return };
+
+    // Optimistically flush a deferred word-break before decoding so the
+    // common case (decode produces ≥1 char) avoids an O(n) string insert.
+    // If the decode produces nothing we pop the space back off below.
+    let added_space =
+        state.pending_space && !ends_with_ascii_whitespace(out) && !out.is_empty() && {
+            out.push(' ');
+            true
+        };
+    let was_pending = state.pending_space;
+    state.pending_space = false;
+    let start = out.len();
+    font.decode_into(bytes, out);
+    if out.len() == start {
+        if added_space {
+            out.pop();
+        }
+        state.pending_space = was_pending;
     }
-    flush_pending_space(state, out);
-    out.push_str(&decoded);
+}
+
+fn ends_with_ascii_whitespace(out: &str) -> bool {
+    matches!(out.as_bytes().last(), Some(b' ' | b'\n' | b'\t' | b'\r'))
 }
 
 /// Called after `Td`, `Tm`, `T*`, `'`, `"` update the text-line matrix.
@@ -238,7 +342,7 @@ fn emit(state: &mut TextState, fonts: &PageFonts<'_>, bytes: &[u8], out: &mut St
 /// `\n\n` for what looks like a paragraph break); a horizontal change
 /// defers a space until the next glyph is drawn so trailing position-only
 /// operators don't dump stray whitespace.
-fn position_changed(state: &mut TextState, new_x: f32, new_y: f32, out: &mut String) {
+fn position_changed(state: &mut TextState<'_>, new_x: f32, new_y: f32, out: &mut String) {
     if !state.in_text_object {
         state.last_x = Some(new_x);
         state.last_y = Some(new_y);
@@ -288,23 +392,6 @@ fn ensure_trailing_breaks(out: &mut String, count: usize) {
     }
     for _ in 0..count {
         out.push('\n');
-    }
-}
-
-fn flush_pending_space(state: &mut TextState, out: &mut String) {
-    if state.pending_space {
-        if !out.is_empty() && !out.ends_with(|c: char| c.is_whitespace()) {
-            out.push(' ');
-        }
-        state.pending_space = false;
-    }
-}
-
-fn number(obj: &Object) -> f32 {
-    match obj {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
     }
 }
 

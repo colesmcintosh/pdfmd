@@ -9,9 +9,6 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// PDFs delimit pages with the ASCII form feed character.
-pub const PAGE_BREAK: char = '\u{000C}';
-
 /// Format a single page of raw text into a Markdown fragment.
 pub fn format_page(raw: &str) -> String {
     let lines: Vec<&str> = raw.lines().map(str::trim).collect();
