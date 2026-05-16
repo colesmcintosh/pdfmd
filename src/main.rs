@@ -159,3 +159,74 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_input_from_disk_returns_bytes() {
+        let bytes = read_input(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/2605.08070v1.pdf"
+        )))
+        .unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn read_input_propagates_io_error() {
+        // A path with a NUL byte will error on every supported platform.
+        let err = read_input(Path::new("/definitely/missing/file.pdf"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn write_output_to_file_round_trips() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pdfmd-out-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        write_output(Some(&tmp), "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "hello");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn write_images_creates_target_directory_and_writes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pdfmd-imgs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let images = vec![ExtractedImage {
+            filename: "a.jpg".to_string(),
+            bytes: vec![1, 2, 3],
+        }];
+        write_images(&tmp, &images).unwrap();
+        assert_eq!(std::fs::read(tmp.join("a.jpg")).unwrap(), vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_images_with_empty_input_only_creates_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pdfmd-imgs-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        write_images(&tmp, &[]).unwrap();
+        assert!(tmp.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}

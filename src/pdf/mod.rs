@@ -22,7 +22,6 @@ use parser::Parser;
 #[derive(Debug)]
 pub enum PdfError {
     NotPdf,
-    Truncated,
     BadXref(String),
     BadObject(String),
     BadFilter(String),
@@ -33,7 +32,6 @@ impl fmt::Display for PdfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PdfError::NotPdf => f.write_str("input does not look like a PDF"),
-            PdfError::Truncated => f.write_str("PDF truncated"),
             PdfError::BadXref(m) => write!(f, "xref: {m}"),
             PdfError::BadObject(m) => write!(f, "object: {m}"),
             PdfError::BadFilter(m) => write!(f, "filter: {m}"),
@@ -492,7 +490,7 @@ fn parse_object_stream(dict: &Dictionary, decoded: &[u8]) -> Result<Vec<(u32, Ve
     let mut headers: Vec<(u32, usize)> = Vec::with_capacity(n);
     for _ in 0..n {
         p.skip_ws_and_comments();
-        let num = read_uint(decoded, &mut p.pos)? as u32;
+        let num = read_uint(decoded, &mut p.pos)?;
         p.skip_ws_and_comments();
         let off = read_uint(decoded, &mut p.pos)? as usize;
         headers.push((num, off));
@@ -758,5 +756,792 @@ fn skip_eol(bytes: &[u8], pos: &mut usize) {
         }
         Some(&b'\n') => *pos += 1,
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid classic-xref PDF with one `(Hello) Tj`-style
+    /// content stream. Used to exercise the loader end-to-end without
+    /// depending on a real PDF fixture.
+    fn minimal_pdf() -> Vec<u8> {
+        let body = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 612 792]/Contents 4 0 R>> endobj
+4 0 obj <</Length 24>>
+stream
+BT /F1 12 Tf (Hi) Tj ET
+endstream
+endobj
+";
+        let mut out = body.to_vec();
+        // Build a classic xref pointing at each object.
+        let xref_offset = out.len();
+        // Look up each obj's byte offset in the body.
+        let offsets: Vec<usize> = (1..=4)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                find_subslice(&out, needle.as_bytes()).unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 5\n");
+        xref.push_str("0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{:010} 00000 n \n", off));
+        }
+        xref.push_str("trailer <</Size 5/Root 1 0 R>>\nstartxref\n");
+        xref.push_str(&format!("{xref_offset}\n"));
+        xref.push_str("%%EOF\n");
+        out.extend_from_slice(xref.as_bytes());
+        out
+    }
+
+    fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        (0..=hay.len().saturating_sub(needle.len()))
+            .find(|&i| &hay[i..i + needle.len()] == needle)
+    }
+
+    #[test]
+    fn loads_minimal_pdf_and_walks_pages() {
+        let bytes = minimal_pdf();
+        let doc = Document::load(&bytes).expect("load");
+        assert_eq!(doc.pages().len(), 1);
+        let page = doc.pages()[0];
+        let content = doc.get_page_content(page).expect("page content");
+        assert!(content.windows(2).any(|w| w == b"Hi"));
+    }
+
+    #[test]
+    fn rejects_non_pdf_header() {
+        match Document::load(b"\x00not a pdf") {
+            Err(PdfError::NotPdf) => {}
+            Err(e) => panic!("expected NotPdf, got {e:?}"),
+            Ok(_) => panic!("expected NotPdf"),
+        }
+    }
+
+    #[test]
+    fn pdf_error_display_lines() {
+        // Exercise every match arm in the Display impl.
+        let cases: Vec<(PdfError, &str)> = vec![
+            (PdfError::NotPdf, "does not look like a PDF"),
+            (PdfError::BadXref("x".into()), "xref: x"),
+            (PdfError::BadObject("o".into()), "object: o"),
+            (PdfError::BadFilter("f".into()), "filter: f"),
+            (PdfError::Deflate("d".into()), "deflate: d"),
+        ];
+        for (err, expected) in cases {
+            let s = format!("{err}");
+            assert!(s.contains(expected), "{s} did not contain {expected}");
+            // Also touch the Debug impl so it isn't dead-coded.
+            let _ = format!("{err:?}");
+        }
+        // std::error::Error trait should be implemented.
+        let _: Box<dyn std::error::Error> = Box::new(PdfError::NotPdf);
+    }
+
+    #[test]
+    fn find_startxref_locates_offset() {
+        let bytes = b"trash\nstartxref\n1234\n%%EOF";
+        assert_eq!(find_startxref(bytes).unwrap(), 1234);
+    }
+
+    #[test]
+    fn find_startxref_errors_when_missing() {
+        let bytes = b"no marker at all";
+        assert!(find_startxref(bytes).is_err());
+    }
+
+    #[test]
+    fn find_startxref_errors_on_non_numeric_offset() {
+        let bytes = b"startxref\n\n%%EOF";
+        assert!(find_startxref(bytes).is_err());
+    }
+
+    // ---- Filters --------------------------------------------------------
+
+    #[test]
+    fn collect_filters_handles_each_shape() {
+        let mut d = Dictionary::new();
+        assert!(collect_filters(&d).is_empty());
+        d.insert(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+        assert_eq!(collect_filters(&d), vec![b"FlateDecode".to_vec()]);
+
+        let arr = Object::Array(vec![
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+            Object::Integer(0), // ignored — not a name
+        ]);
+        d.insert(b"Filter".to_vec(), arr);
+        assert_eq!(
+            collect_filters(&d),
+            vec![b"ASCIIHexDecode".to_vec(), b"FlateDecode".to_vec()],
+        );
+    }
+
+    #[test]
+    fn collect_parms_handles_each_shape() {
+        let mut d = Dictionary::new();
+        assert!(collect_parms(&d).is_empty());
+        let mut sub = Dictionary::new();
+        sub.insert(b"Predictor".to_vec(), Object::Integer(12));
+        d.insert(b"DecodeParms".to_vec(), Object::Dictionary(sub.clone()));
+        assert_eq!(collect_parms(&d).len(), 1);
+        d.insert(
+            b"DecodeParms".to_vec(),
+            Object::Array(vec![
+                Object::Dictionary(sub.clone()),
+                Object::Integer(0), // becomes an empty dict
+            ]),
+        );
+        assert_eq!(collect_parms(&d).len(), 2);
+    }
+
+    #[test]
+    fn ascii_hex_filter_decodes() {
+        // "Hi" — also exercises whitespace skipping and the early `>` exit.
+        let out = decode_ascii_hex(b"48 6 9> trailing junk");
+        assert_eq!(out, b"Hi");
+        // Trailing single nibble pads with zero.
+        let out = decode_ascii_hex(b"4");
+        assert_eq!(out, vec![0x40]);
+    }
+
+    #[test]
+    fn ascii85_filter_decodes() {
+        // "Hello, world!" encoded with stock Ascii85, plus a trailing `~`
+        // sentinel that the decoder should treat as end-of-data.
+        let encoded = b"87cURD_*#TDfTZ)+T~>";
+        let out = decode_ascii85(encoded);
+        assert_eq!(out, b"Hello, world!");
+        // `z` shortcut: four zero bytes.
+        assert_eq!(decode_ascii85(b"z~>"), vec![0, 0, 0, 0]);
+        // Whitespace within the encoding is ignored.
+        assert_eq!(decode_ascii85(b"87cU\nRD_*#T\nDfTZ)+T~>"), b"Hello, world!");
+        // Bytes outside the Ascii85 alphabet (other than whitespace, `z`,
+        // and the `~` sentinel) are silently skipped. Four bytes of `!`
+        // produce 3 padded output bytes (`n - 1`).
+        assert_eq!(decode_ascii85(b"!\xFF!!!~>"), vec![0u8, 0, 0]);
+    }
+
+    #[test]
+    fn apply_filter_dispatch_covers_each_filter() {
+        let empty = Dictionary::new();
+        // FlateDecode (zlib of "hi")
+        let zlib = [0x78, 0x9C, 0xCB, 0xC8, 0x04, 0x00, 0x01, 0x3D, 0x00, 0xD2];
+        assert_eq!(apply_filter(b"FlateDecode", &zlib, &empty).unwrap(), b"hi");
+        // Short alias `Fl`.
+        assert_eq!(apply_filter(b"Fl", &zlib, &empty).unwrap(), b"hi");
+        // ASCIIHex + short alias.
+        assert_eq!(apply_filter(b"ASCIIHexDecode", b"4869>", &empty).unwrap(), b"Hi");
+        assert_eq!(apply_filter(b"AHx", b"4869>", &empty).unwrap(), b"Hi");
+        // ASCII85 + short alias.
+        let a85 = b"87cURD_*#TDfTZ)+T~>";
+        assert_eq!(apply_filter(b"ASCII85Decode", a85, &empty).unwrap(), b"Hello, world!");
+        assert_eq!(apply_filter(b"A85", a85, &empty).unwrap(), b"Hello, world!");
+        // Pass-through filters return data unchanged.
+        for name in [b"DCTDecode".as_slice(), b"DCT", b"JPXDecode", b"CCITTFaxDecode", b"CCF"] {
+            assert_eq!(apply_filter(name, b"abc", &empty).unwrap(), b"abc");
+        }
+        // Unsupported filter errors.
+        assert!(apply_filter(b"LZWDecode", b"abc", &empty).is_err());
+    }
+
+    // ---- PNG predictor --------------------------------------------------
+
+    #[test]
+    fn predictor_passes_through_when_disabled() {
+        let mut p = Dictionary::new();
+        p.insert(b"Predictor".to_vec(), Object::Integer(1));
+        let raw = b"hello";
+        assert_eq!(apply_predictor(raw, &p).unwrap(), raw);
+    }
+
+    #[test]
+    fn predictor_decodes_each_png_filter() {
+        // 3 columns, 1 colour, 8 bpc → row length 3 → stride 4.
+        // Two rows, each with a different filter tag, decode back to the
+        // same data we'd have if no predictor were in use.
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor".to_vec(), Object::Integer(12));
+        params.insert(b"Columns".to_vec(), Object::Integer(3));
+        params.insert(b"Colors".to_vec(), Object::Integer(1));
+        params.insert(b"BitsPerComponent".to_vec(), Object::Integer(8));
+
+        // Build raw row data, then encode each filter manually.
+        // Plain rows: r0 = [10, 20, 30], r1 = [11, 22, 33]
+        let r0 = [10u8, 20, 30];
+        let r1 = [11u8, 22, 33];
+
+        // tag 0 (None): row bytes pass through.
+        let f0: Vec<u8> = std::iter::once(0).chain(r0.iter().copied()).collect();
+        // tag 1 (Sub): subtract left
+        let f1: Vec<u8> = std::iter::once(1)
+            .chain([r1[0], r1[1].wrapping_sub(r1[0]), r1[2].wrapping_sub(r1[1])])
+            .collect();
+        let input: Vec<u8> = [f0.clone(), f1.clone()].concat();
+        let decoded = apply_predictor(&input, &params).unwrap();
+        assert_eq!(&decoded[..3], &r0);
+        assert_eq!(&decoded[3..6], &r1);
+
+        // tag 2 (Up): up reference is row above.
+        let f0v: Vec<u8> = std::iter::once(2).chain(r0.iter().copied()).collect();
+        let f1v: Vec<u8> = std::iter::once(2)
+            .chain(r1.iter().zip(r0.iter()).map(|(a, b)| a.wrapping_sub(*b)))
+            .collect();
+        let input = [f0v, f1v].concat();
+        let decoded = apply_predictor(&input, &params).unwrap();
+        assert_eq!(&decoded[3..6], &r1);
+
+        // tag 3 (Average) and tag 4 (Paeth) — round-trip a single zero row
+        // with a known previous row so the helpers run end-to-end.
+        let prev = [5u8, 10, 15];
+        let next = [7u8, 12, 22];
+        let f3: Vec<u8> = std::iter::once(3)
+            .chain([
+                next[0].wrapping_sub((prev[0] as u16 / 2) as u8),
+                next[1].wrapping_sub(((next[0] as u16 + prev[1] as u16) / 2) as u8),
+                next[2].wrapping_sub(((next[1] as u16 + prev[2] as u16) / 2) as u8),
+            ])
+            .collect();
+        let prev_row: Vec<u8> = std::iter::once(0).chain(prev.iter().copied()).collect();
+        let decoded = apply_predictor(&[prev_row, f3].concat(), &params).unwrap();
+        assert_eq!(&decoded[3..6], &next);
+
+        let f4: Vec<u8> = std::iter::once(4)
+            .chain([
+                next[0].wrapping_sub(paeth(0, prev[0], 0u8)),
+                next[1].wrapping_sub(paeth(next[0], prev[1], prev[0])),
+                next[2].wrapping_sub(paeth(next[1], prev[2], prev[1])),
+            ])
+            .collect();
+        let prev_row: Vec<u8> = std::iter::once(0).chain(prev.iter().copied()).collect();
+        let decoded = apply_predictor(&[prev_row, f4].concat(), &params).unwrap();
+        assert_eq!(&decoded[3..6], &next);
+    }
+
+    #[test]
+    fn predictor_unknown_tag_passes_raw_bytes_through() {
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor".to_vec(), Object::Integer(12));
+        params.insert(b"Columns".to_vec(), Object::Integer(2));
+        // tag 99 hits the fallback arm.
+        let input = [99u8, 1, 2];
+        let decoded = apply_predictor(&input, &params).unwrap();
+        assert_eq!(decoded, vec![1, 2]);
+    }
+
+    #[test]
+    fn predictor_zero_row_returns_empty() {
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor".to_vec(), Object::Integer(12));
+        params.insert(b"Columns".to_vec(), Object::Integer(0));
+        assert!(apply_predictor(&[1, 2, 3], &params).unwrap().is_empty());
+    }
+
+    #[test]
+    fn paeth_predictor_picks_each_branch() {
+        // Equal distances → picks `a` (first arm).
+        assert_eq!(paeth(10, 10, 10), 10);
+        // pa < pb && pa < pc → picks `a`.
+        assert_eq!(paeth(10, 20, 30), 10);
+        // pa > pb && pb <= pc → picks `b` (middle arm).
+        assert_eq!(paeth(0, 5, 0), 5);
+        // pb > pc → picks `c` (final arm).
+        assert_eq!(paeth(8, 10, 9), 9);
+    }
+
+    // ---- Helpers --------------------------------------------------------
+
+    #[test]
+    fn be_uint_collapses_byte_run() {
+        assert_eq!(be_uint(&[0x12, 0x34, 0x56]), 0x123456);
+        assert_eq!(be_uint(&[]), 0);
+    }
+
+    #[test]
+    fn read_uint_handles_leading_whitespace_and_errors() {
+        let bytes = b"  \t  42 next";
+        let mut pos = 0;
+        assert_eq!(read_uint(bytes, &mut pos).unwrap(), 42);
+        // No digits: error.
+        let bytes = b"   ";
+        let mut pos = 0;
+        assert!(read_uint(bytes, &mut pos).is_err());
+    }
+
+    #[test]
+    fn skip_eol_handles_each_terminator() {
+        // CRLF
+        let bytes = b"  \r\n!";
+        let mut pos = 0;
+        skip_eol(bytes, &mut pos);
+        assert_eq!(pos, 4);
+        // bare CR
+        let bytes = b"\r!";
+        let mut pos = 0;
+        skip_eol(bytes, &mut pos);
+        assert_eq!(pos, 1);
+        // bare LF
+        let bytes = b"\n!";
+        let mut pos = 0;
+        skip_eol(bytes, &mut pos);
+        assert_eq!(pos, 1);
+        // No EOL — pos unchanged after leading-ws skip.
+        let bytes = b"  !";
+        let mut pos = 0;
+        skip_eol(bytes, &mut pos);
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn skip_inline_consumes_tabs_and_spaces_only() {
+        let bytes = b" \t \n";
+        let mut pos = 0;
+        skip_inline(bytes, &mut pos);
+        assert_eq!(pos, 3); // stops at the newline
+    }
+
+    #[test]
+    fn deref_resolves_chains_and_handles_dead_refs() {
+        // Build a tiny doc by hand: id 1 points at id 2 which is an int.
+        let mut objs = HashMap::new();
+        objs.insert(ObjectId(1, 0), Object::Reference(ObjectId(2, 0)));
+        objs.insert(ObjectId(2, 0), Object::Integer(7));
+        let doc = Document {
+            objects: objs,
+            pages: vec![],
+        };
+        let obj = doc.get_object(ObjectId(1, 0)).unwrap();
+        let final_ = doc.deref(obj);
+        assert!(matches!(final_, Object::Integer(7)));
+
+        // Dangling reference: deref returns the unresolved reference itself.
+        let dangling = Object::Reference(ObjectId(999, 0));
+        let same = doc.deref(&dangling);
+        assert!(matches!(same, Object::Reference(_)));
+    }
+
+    #[test]
+    fn page_content_supports_array_of_streams() {
+        // Build a doc where /Contents is an array of two stream refs.
+        let mut objs = HashMap::new();
+        let stream1 = Object::Stream(Stream {
+            dict: Dictionary::new(),
+            content: b"first".to_vec(),
+        });
+        let stream2 = Object::Stream(Stream {
+            dict: Dictionary::new(),
+            content: b"second".to_vec(),
+        });
+        objs.insert(ObjectId(10, 0), stream1);
+        objs.insert(ObjectId(11, 0), stream2);
+        let mut page = Dictionary::new();
+        page.insert(
+            b"Contents".to_vec(),
+            Object::Array(vec![
+                Object::Reference(ObjectId(10, 0)),
+                Object::Reference(ObjectId(11, 0)),
+            ]),
+        );
+        objs.insert(ObjectId(20, 0), Object::Dictionary(page));
+        let doc = Document {
+            objects: objs,
+            pages: vec![ObjectId(20, 0)],
+        };
+        let content = doc.get_page_content(ObjectId(20, 0)).unwrap();
+        // Two stream bodies joined by a newline (since neither ends in
+        // whitespace).
+        assert_eq!(content, b"first\nsecond");
+    }
+
+    #[test]
+    fn page_content_returns_none_when_contents_is_missing_or_unsupported() {
+        let mut objs = HashMap::new();
+        let page = Dictionary::new();
+        objs.insert(ObjectId(1, 0), Object::Dictionary(page));
+        let doc = Document {
+            objects: objs.clone(),
+            pages: vec![],
+        };
+        assert!(doc.get_page_content(ObjectId(1, 0)).is_none());
+
+        let mut page = Dictionary::new();
+        // /Contents → integer is unsupported and yields None.
+        page.insert(b"Contents".to_vec(), Object::Integer(42));
+        objs.insert(ObjectId(1, 0), Object::Dictionary(page));
+        let doc = Document {
+            objects: objs,
+            pages: vec![],
+        };
+        assert!(doc.get_page_content(ObjectId(1, 0)).is_none());
+    }
+
+    // ---- Object streams -------------------------------------------------
+
+    #[test]
+    fn parse_object_stream_returns_each_entry() {
+        // Two objects: "(hi) endobj"-style payloads.
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(2));
+        dict.insert(b"First".to_vec(), Object::Integer(10));
+        // Header: "10 0 11 4" — obj #10 at offset 0, obj #11 at offset 4.
+        // Body: "(hi)" then "(by)".
+        let body = b"10 0 11 4 (hi)(by)";
+        let entries = parse_object_stream(&dict, body).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 10);
+        assert_eq!(entries[0].1, b"(hi)");
+        assert_eq!(entries[1].0, 11);
+        assert_eq!(entries[1].1, b"(by)");
+    }
+
+    #[test]
+    fn parse_object_stream_errors_without_required_keys() {
+        let dict = Dictionary::new();
+        assert!(parse_object_stream(&dict, b"").is_err());
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(0));
+        assert!(parse_object_stream(&dict, b"").is_err());
+    }
+
+    // ---- Xref streams ---------------------------------------------------
+
+    /// Compose a 1-object PDF body whose only indirect object is an xref
+    /// stream with the entries described by `entries`. The body has no
+    /// `/Filter`, so the encoded rows are written raw and live inside the
+    /// stream payload.
+    fn xref_stream_pdf(entries: &[(u8, u64, u32)], extra_dict_entries: &str) -> Vec<u8> {
+        let mut payload: Vec<u8> = Vec::new();
+        for (kind, f1, f2) in entries {
+            payload.push(*kind);
+            payload.extend_from_slice(&(*f1 as u16).to_be_bytes());
+            payload.push(*f2 as u8);
+        }
+        let dict = format!(
+            "<</Type/XRef/Size {}/W [1 2 1]/Length {}{}>>",
+            entries.len(),
+            payload.len(),
+            extra_dict_entries,
+        );
+        let body = format!("1 0 obj {dict}\nstream\n");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(body.as_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes
+    }
+
+    #[test]
+    fn read_xref_stream_recognises_every_entry_kind() {
+        let entries = &[
+            (0u8, 0u64, 0u32),    // free
+            (1u8, 100u64, 0u32),  // uncompressed at offset 100
+            (2u8, 99u64, 3u32),   // compressed: lives in objstm 99, idx 3
+            (5u8, 0u64, 0u32),    // unknown kind — silently skipped
+        ];
+        let bytes = xref_stream_pdf(entries, "");
+        let mut out = BTreeMap::new();
+        let dict = read_xref_stream(&bytes, 0, &mut out).unwrap();
+        assert!(dict.get(b"Type").is_some());
+        assert!(matches!(out.get(&ObjectId(0, 0)).unwrap(), XrefEntry::Free));
+        assert!(matches!(
+            out.get(&ObjectId(1, 0)).unwrap(),
+            XrefEntry::Uncompressed { offset: 100 }
+        ));
+        assert!(matches!(
+            out.get(&ObjectId(2, 0)).unwrap(),
+            XrefEntry::Compressed { stream_obj: 99, index: 3 }
+        ));
+        assert!(!out.contains_key(&ObjectId(3, 0)));
+    }
+
+    #[test]
+    fn read_xref_stream_honours_index_chunks() {
+        // Two-entry stream describing IDs starting at 10.
+        let entries = &[(1u8, 10u64, 0u32), (1u8, 20u64, 0u32)];
+        let bytes = xref_stream_pdf(entries, "/Index [10 2]");
+        let mut out = BTreeMap::new();
+        read_xref_stream(&bytes, 0, &mut out).unwrap();
+        assert!(out.contains_key(&ObjectId(10, 0)));
+        assert!(out.contains_key(&ObjectId(11, 0)));
+    }
+
+    #[test]
+    fn read_xref_stream_existing_entry_wins() {
+        let entries = &[(1u8, 200u64, 0u32)];
+        let bytes = xref_stream_pdf(entries, "");
+        let mut out = BTreeMap::new();
+        out.insert(ObjectId(0, 0), XrefEntry::Uncompressed { offset: 999 });
+        read_xref_stream(&bytes, 0, &mut out).unwrap();
+        // Pre-existing entry isn't overwritten.
+        assert!(matches!(
+            out.get(&ObjectId(0, 0)).unwrap(),
+            XrefEntry::Uncompressed { offset: 999 }
+        ));
+    }
+
+    #[test]
+    fn read_xref_stream_errors_on_bad_w_length() {
+        let body =
+            b"1 0 obj <</Type/XRef/Size 1/W [1 2]/Length 0>>\nstream\n\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        assert!(read_xref_stream(body, 0, &mut out).is_err());
+    }
+
+    #[test]
+    fn read_xref_stream_errors_on_zero_row_width() {
+        let body =
+            b"1 0 obj <</Type/XRef/Size 1/W [0 0 0]/Length 0>>\nstream\n\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        assert!(read_xref_stream(body, 0, &mut out).is_err());
+    }
+
+    #[test]
+    fn read_xref_stream_errors_when_size_missing() {
+        let body = b"1 0 obj <</Type/XRef/W [1 2 1]/Length 4>>\nstream\n\x01\x00\x10\x00\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        assert!(read_xref_stream(body, 0, &mut out).is_err());
+    }
+
+    #[test]
+    fn read_xref_stream_errors_on_truncated_payload() {
+        // /W = 1+2+1 = 4, /Size = 2 → expects 8 bytes. We give 4.
+        let body = b"1 0 obj <</Type/XRef/Size 2/W [1 2 1]/Length 4>>\nstream\n\x01\x00\x10\x00\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        assert!(read_xref_stream(body, 0, &mut out).is_err());
+    }
+
+    #[test]
+    fn read_xref_stream_errors_when_w_missing() {
+        let body = b"1 0 obj <</Type/XRef/Size 1/Length 0>>\nstream\n\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        assert!(read_xref_stream(body, 0, &mut out).is_err());
+    }
+
+    #[test]
+    fn read_xref_stream_errors_when_object_is_not_a_stream() {
+        let body = b"1 0 obj 42 endobj\n";
+        let mut out = BTreeMap::new();
+        assert!(read_xref_stream(body, 0, &mut out).is_err());
+    }
+
+    // ---- End-to-end variants --------------------------------------------
+
+    #[test]
+    fn loads_pdf_with_xref_stream_root() {
+        // Build a minimal PDF whose startxref points at an xref stream.
+        // Layout:
+        //   obj 1: catalog
+        //   obj 2: pages
+        //   obj 3: page
+        //   obj 4: xref stream describing obj 0..4
+        //   startxref → offset of obj 4
+        let mut body = String::from("%PDF-1.5\n");
+        let off1 = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str("3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n");
+        let xref_offset = body.len();
+        // Build the 5-entry payload (free + obj 1..=4). Field widths 1/2/1.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]); // entry 0: free
+        for &off in &[off1, off2, off3, xref_offset] {
+            payload.push(1);
+            payload.extend_from_slice(&(off as u16).to_be_bytes());
+            payload.push(0);
+        }
+        body.push_str(&format!(
+            "4 0 obj <</Type/XRef/Size 5/Root 1 0 R/W [1 2 1]/Length {}>>\nstream\n",
+            payload.len()
+        ));
+        let mut bytes = body.into_bytes();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        let doc = Document::load(&bytes).expect("load");
+        assert_eq!(doc.pages().len(), 1);
+    }
+
+    #[test]
+    fn page_tree_walk_rejects_excessive_depth() {
+        // Construct objects forming a self-referential /Pages cycle that
+        // the recursion guard should bail out of.
+        let mut objects = HashMap::new();
+        let mut pages = Dictionary::new();
+        pages.insert(
+            b"Kids".to_vec(),
+            Object::Array(vec![Object::Reference(ObjectId(1, 0))]),
+        );
+        objects.insert(ObjectId(1, 0), Object::Dictionary(pages));
+        let mut out = Vec::new();
+        let err = walk_pages(&objects, ObjectId(1, 0), &mut out, 65);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn collect_pages_errors_when_trailer_root_missing() {
+        let objects = HashMap::new();
+        let trailer = Dictionary::new();
+        assert!(collect_pages(&objects, &trailer).is_err());
+    }
+
+    #[test]
+    fn collect_pages_errors_when_catalog_missing() {
+        let mut trailer = Dictionary::new();
+        trailer.insert(b"Root".to_vec(), Object::Reference(ObjectId(1, 0)));
+        let objects = HashMap::new();
+        assert!(collect_pages(&objects, &trailer).is_err());
+    }
+
+    #[test]
+    fn collect_pages_errors_when_pages_missing_in_catalog() {
+        let mut catalog = Dictionary::new();
+        catalog.insert(b"Type".to_vec(), Object::Name(b"Catalog".to_vec()));
+        let mut objects = HashMap::new();
+        objects.insert(ObjectId(1, 0), Object::Dictionary(catalog));
+        let mut trailer = Dictionary::new();
+        trailer.insert(b"Root".to_vec(), Object::Reference(ObjectId(1, 0)));
+        assert!(collect_pages(&objects, &trailer).is_err());
+    }
+
+    #[test]
+    fn deref_terminates_on_cycle() {
+        // A cyclic reference (1→2→1) should bottom out rather than loop.
+        let mut objs = HashMap::new();
+        objs.insert(ObjectId(1, 0), Object::Reference(ObjectId(2, 0)));
+        objs.insert(ObjectId(2, 0), Object::Reference(ObjectId(1, 0)));
+        let doc = Document { objects: objs, pages: vec![] };
+        let start = Object::Reference(ObjectId(1, 0));
+        let end = doc.deref(&start);
+        // We don't care which one we land on — just that we terminate.
+        assert!(matches!(end, Object::Reference(_)));
+    }
+
+    #[test]
+    fn load_errors_on_pdf_with_no_root() {
+        // Header is valid, xref is valid, trailer has no /Root.
+        let body = b"\
+%PDF-1.4
+1 0 obj <</Type/Pages/Kids[2 0 R]/Count 1>> endobj
+2 0 obj <</Type/Page/Parent 1 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+";
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        let offsets: Vec<usize> = (1..=2)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                find_subslice(&out, needle.as_bytes()).unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 3\n0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str("trailer <</Size 3>>\nstartxref\n");
+        xref.push_str(&format!("{xref_offset}\n%%EOF\n"));
+        out.extend_from_slice(xref.as_bytes());
+        assert!(Document::load(&out).is_err());
+    }
+
+    #[test]
+    fn loads_pdf_with_object_stream() {
+        // PDF 1.5+ layout: catalog/pages/page packed into an object stream,
+        // referenced from an xref stream with type-2 entries.
+        // We hand-build all of it so we can exercise the cache-miss path
+        // in Document::load that decodes the object stream and pulls
+        // individual objects out of it.
+        let mut body = String::from("%PDF-1.5\n");
+        // Object stream payload — three indirect objects.
+        let obj1 = "<</Type/Catalog/Pages 2 0 R>>";
+        let obj2 = "<</Type/Pages/Kids[3 0 R]/Count 1>>";
+        let obj3 = "<</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>>";
+        // Header: "obj_num offset" pairs, then objects concatenated.
+        let header = format!(
+            "1 0 2 {o2} 3 {o3} ",
+            o2 = obj1.len(),
+            o3 = obj1.len() + obj2.len()
+        );
+        let first = header.len();
+        let mut objstm_payload = header.into_bytes();
+        objstm_payload.extend_from_slice(obj1.as_bytes());
+        objstm_payload.extend_from_slice(obj2.as_bytes());
+        objstm_payload.extend_from_slice(obj3.as_bytes());
+
+        let off4 = body.len();
+        body.push_str(&format!(
+            "4 0 obj <</Type/ObjStm/N 3/First {first}/Length {}>>\nstream\n",
+            objstm_payload.len(),
+        ));
+        let mut bytes = body.into_bytes();
+        bytes.extend_from_slice(&objstm_payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+
+        // Xref stream covers ids 0..=4. Entries:
+        //   0: free
+        //   1,2,3: compressed in object 4 at indices 0,1,2
+        //   4: uncompressed at off4
+        let xref_offset = bytes.len();
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]); // entry 0: free
+        for index in 0u8..3 {
+            payload.push(2);
+            payload.extend_from_slice(&4u16.to_be_bytes()); // stream_obj = 4
+            payload.push(index);
+        }
+        payload.push(1);
+        payload.extend_from_slice(&(off4 as u16).to_be_bytes());
+        payload.push(0);
+
+        bytes.extend_from_slice(
+            format!(
+                "5 0 obj <</Type/XRef/Size 5/Root 1 0 R/W [1 2 1]/Length {}>>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        let doc = Document::load(&bytes).expect("load");
+        assert_eq!(doc.pages().len(), 1);
+    }
+
+    #[test]
+    fn read_xref_chain_breaks_on_repeated_offset() {
+        // Build a PDF whose /Prev points back at itself — the chain walker
+        // must terminate via the visited-set check rather than loop.
+        let body = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+";
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        let offsets: Vec<usize> = (1..=3)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                find_subslice(&out, needle.as_bytes()).unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 4\n0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer <</Size 4/Root 1 0 R/Prev {xref_offset}>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        out.extend_from_slice(xref.as_bytes());
+        let doc = Document::load(&out).unwrap();
+        assert_eq!(doc.pages().len(), 1);
     }
 }

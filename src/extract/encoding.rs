@@ -506,3 +506,91 @@ fn symbol_encoding(byte: u8) -> Option<&'static str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names_for(enc: BaseEncoding) -> Vec<(u8, &'static str)> {
+        (0u8..=255)
+            .filter_map(|b| enc.glyph(b).map(|name| (b, name)))
+            .collect()
+    }
+
+    #[test]
+    fn each_encoding_dispatches_to_its_table() {
+        // Touch the dispatch and bottom-out match arms in every helper.
+        assert_eq!(BaseEncoding::Standard.glyph(b'A'), Some("A"));
+        assert_eq!(BaseEncoding::WinAnsi.glyph(b'A'), Some("A"));
+        assert_eq!(BaseEncoding::MacRoman.glyph(b'A'), Some("A"));
+        assert_eq!(BaseEncoding::Symbol.glyph(0x41), Some("Alpha"));
+        // Bytes that map to nothing under each table.
+        assert!(BaseEncoding::Standard.glyph(0x80).is_none());
+        assert!(BaseEncoding::WinAnsi.glyph(0x7F).is_none());
+        assert!(BaseEncoding::MacRoman.glyph(0xF0).is_none());
+        assert!(BaseEncoding::Symbol.glyph(0xFF).is_none());
+    }
+
+    #[test]
+    fn from_name_dispatch_covers_each_variant() {
+        assert!(matches!(
+            BaseEncoding::from_name("WinAnsiEncoding"),
+            BaseEncoding::WinAnsi
+        ));
+        assert!(matches!(
+            BaseEncoding::from_name("MacRomanEncoding"),
+            BaseEncoding::MacRoman
+        ));
+        assert!(matches!(
+            BaseEncoding::from_name("SymbolEncoding"),
+            BaseEncoding::Symbol
+        ));
+        assert!(matches!(
+            BaseEncoding::from_name("MacExpertEncoding"),
+            BaseEncoding::Standard
+        ));
+    }
+
+    #[test]
+    fn ascii_glyph_covers_each_punctuation_arm() {
+        // Walk every printable ASCII byte through the shared ASCII table.
+        for b in 0x20u8..0x7F {
+            assert!(
+                BaseEncoding::WinAnsi.glyph(b).is_some(),
+                "WinAnsi missing 0x{b:02X}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_encoding_returns_some_for_a_meaningful_byte() {
+        for enc in [
+            BaseEncoding::Standard,
+            BaseEncoding::WinAnsi,
+            BaseEncoding::MacRoman,
+            BaseEncoding::Symbol,
+        ] {
+            // Exhaustive sweep — runs every match arm at least once.
+            for b in 0u8..=255 {
+                let _ = enc.glyph(b);
+            }
+        }
+        // Cross-check a handful of known mappings per table so the sweep
+        // doesn't pass just by going through the motions.
+        assert_eq!(BaseEncoding::Standard.glyph(0xAE), Some("fi"));
+        assert_eq!(BaseEncoding::WinAnsi.glyph(0x80), Some("Euro"));
+        assert_eq!(BaseEncoding::MacRoman.glyph(0xA0), Some("dagger"));
+        assert_eq!(BaseEncoding::Symbol.glyph(0x71), Some("theta"));
+    }
+
+    #[test]
+    fn winansi_and_macroman_have_full_high_range_tables() {
+        // Each of the high-range tables must contribute meaningful entries,
+        // not just delegate to ASCII; otherwise the sweep above wouldn't
+        // exercise the long match arms in the source.
+        let winansi = names_for(BaseEncoding::WinAnsi);
+        let macroman = names_for(BaseEncoding::MacRoman);
+        assert!(winansi.len() > 200, "winansi only has {} entries", winansi.len());
+        assert!(macroman.len() > 200, "macroman only has {} entries", macroman.len());
+    }
+}

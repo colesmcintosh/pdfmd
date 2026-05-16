@@ -563,4 +563,275 @@ mod tests {
         assert_eq!(d.get(b"Type").and_then(|o| o.as_name_str()), Some("Foo"));
         assert_eq!(d.get(b"Count").and_then(Object::as_integer), Some(5));
     }
+
+    // ---- Keywords and bools ---------------------------------------------
+
+    #[test]
+    fn parses_true_false_null() {
+        assert!(matches!(parse(b"true"), Object::Boolean(true)));
+        assert!(matches!(parse(b"false"), Object::Boolean(false)));
+        assert!(matches!(parse(b"null"), Object::Null));
+    }
+
+    #[test]
+    fn rejects_unknown_keyword() {
+        let mut p = Parser::new(b"truth");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn rejects_eof_object() {
+        let mut p = Parser::new(b"   ");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn rejects_unexpected_lead_byte() {
+        let mut p = Parser::new(b"@");
+        assert!(p.parse_object().is_err());
+    }
+
+    // ---- Numbers --------------------------------------------------------
+
+    #[test]
+    fn number_after_sign_is_not_a_reference() {
+        // `+7 0 R` shouldn't be parsed as a reference (signed lookahead path).
+        let mut p = Parser::new(b"+7 0 R");
+        assert!(matches!(p.parse_object().unwrap(), Object::Integer(7)));
+    }
+
+    #[test]
+    fn reference_lookahead_aborts_when_r_is_part_of_keyword() {
+        // `7 0 Rx` should NOT be a reference — the R must end at a delim.
+        let mut p = Parser::new(b"7 0 Rx");
+        assert!(matches!(p.parse_object().unwrap(), Object::Integer(7)));
+    }
+
+    #[test]
+    fn reference_lookahead_aborts_when_gen_missing() {
+        // `7 obj` — second token isn't an integer, so this stays an int.
+        let mut p = Parser::new(b"7 obj");
+        assert!(matches!(p.parse_object().unwrap(), Object::Integer(7)));
+    }
+
+    #[test]
+    fn naked_dot_is_a_number() {
+        let v = parse(b".75");
+        let Object::Real(r) = v else { panic!() };
+        assert!((r - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_pure_sign_with_no_digits() {
+        let mut p = Parser::new(b"+");
+        assert!(p.parse_object().is_err());
+    }
+
+    // ---- Strings --------------------------------------------------------
+
+    #[test]
+    fn literal_string_supports_every_escape() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"(\\n)", b"\n"),
+            (b"(\\r)", b"\r"),
+            (b"(\\t)", b"\t"),
+            (b"(\\b)", b"\x08"),
+            (b"(\\f)", b"\x0C"),
+            (b"(\\\\)", b"\\"),
+            (b"(\\()", b"("),
+            (b"(\\))", b")"),
+            (b"(a\\\nb)", b"ab"),     // line continuation
+            (b"(a\\\r\nb)", b"ab"),   // CRLF continuation
+            (b"(a\\\rb)", b"ab"),     // CR continuation
+            (b"(\\101)", b"A"),       // octal escape
+            (b"(\\7)", b"\x07"),      // single-digit octal
+            (b"(\\z)", b"z"),         // unknown escape echoes the char
+        ];
+        for (input, expected) in cases {
+            match parse(input) {
+                Object::String(s) => assert_eq!(s, *expected, "input {input:?}"),
+                other => panic!("input {input:?} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn literal_string_unterminated_errors() {
+        let mut p = Parser::new(b"(no close");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn literal_string_unterminated_after_escape_errors() {
+        let mut p = Parser::new(b"(escape\\");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn literal_string_with_balanced_nested_parens() {
+        if let Object::String(s) = parse(b"(a(b(c)d)e)") {
+            assert_eq!(s, b"a(b(c)d)e");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn hex_string_with_whitespace_and_odd_nibble() {
+        if let Object::String(s) = parse(b"<4 8 6>") {
+            assert_eq!(s, vec![0x48, 0x60]);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn hex_string_unterminated_errors() {
+        let mut p = Parser::new(b"<48");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn hex_string_ignores_non_hex_bytes() {
+        // Non-hex characters within the body are dropped (not nibbles).
+        if let Object::String(s) = parse(b"<48ZZ69>") {
+            assert_eq!(s, b"Hi");
+        } else {
+            panic!();
+        }
+    }
+
+    // ---- Names ----------------------------------------------------------
+
+    #[test]
+    fn name_without_hash_takes_fast_path() {
+        let v = parse(b"/Foo");
+        let Object::Name(n) = v else { panic!() };
+        assert_eq!(n, b"Foo");
+    }
+
+    #[test]
+    fn name_with_invalid_hash_escape_passes_through() {
+        let v = parse(b"/A#ZZ");
+        let Object::Name(n) = v else { panic!() };
+        assert_eq!(n, b"A#ZZ");
+        let v = parse(b"/B#");
+        let Object::Name(n) = v else { panic!() };
+        assert_eq!(n, b"B#");
+    }
+
+    // ---- Arrays & dicts -------------------------------------------------
+
+    #[test]
+    fn unterminated_array_errors() {
+        let mut p = Parser::new(b"[ 1 2");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn dictionary_expects_name_key() {
+        let mut p = Parser::new(b"<< 1 2 >>");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn comments_inside_array_are_skipped() {
+        let v = parse(b"[ 1 % comment\n 2 ]");
+        let Object::Array(items) = v else { panic!() };
+        assert_eq!(items.len(), 2);
+    }
+
+    // ---- Indirect objects + streams -------------------------------------
+
+    #[test]
+    fn parses_indirect_object_with_inline_stream() {
+        let bytes = b"\
+1 0 obj
+<< /Length 5 >>
+stream
+hello
+endstream
+endobj
+";
+        let mut p = Parser::new(bytes);
+        let (id, obj) = p.parse_indirect_object().unwrap();
+        assert_eq!(id, ObjectId(1, 0));
+        let Object::Stream(s) = obj else { panic!() };
+        assert_eq!(s.content, b"hello");
+    }
+
+    #[test]
+    fn indirect_object_with_indirect_length_scans_for_endstream() {
+        let bytes = b"\
+2 0 obj
+<< /Length 99 0 R >>
+stream
+the body
+endstream
+endobj
+";
+        let mut p = Parser::new(bytes);
+        let (id, obj) = p.parse_indirect_object().unwrap();
+        assert_eq!(id, ObjectId(2, 0));
+        let Object::Stream(s) = obj else { panic!() };
+        assert_eq!(s.content, b"the body");
+    }
+
+    #[test]
+    fn stream_prefix_without_dict_errors() {
+        let bytes = b"1 0 obj\n123\nstream\n...endstream endobj";
+        let mut p = Parser::new(bytes);
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn stream_missing_length_errors() {
+        let bytes = b"1 0 obj\n<< >>\nstream\nbody\nendstream endobj";
+        let mut p = Parser::new(bytes);
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn stream_truncated_by_length_errors() {
+        let bytes = b"1 0 obj\n<< /Length 100 >>\nstream\nbody\nendstream endobj";
+        let mut p = Parser::new(bytes);
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn stream_indirect_length_missing_endstream_errors() {
+        let bytes = b"1 0 obj\n<< /Length 99 0 R >>\nstream\nlost forever endobj";
+        let mut p = Parser::new(bytes);
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn indirect_object_requires_obj_keyword() {
+        let bytes = b"1 0 NOPE\n123\nendobj";
+        let mut p = Parser::new(bytes);
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn find_endstream_handles_each_terminator() {
+        assert_eq!(find_endstream(b"abc\nendstream"), Some(3));
+        assert_eq!(find_endstream(b"abc\r\nendstream"), Some(3));
+        assert_eq!(find_endstream(b"abc\rendstream"), Some(3));
+        assert_eq!(find_endstream(b"endstream"), Some(0));
+        assert_eq!(find_endstream(b"no marker"), None);
+    }
+
+    #[test]
+    fn parse_u32_rejects_empty_and_overflow_and_non_digit() {
+        assert!(parse_u32(b"").is_err());
+        assert!(parse_u32(b"9999999999").is_err());
+        assert!(parse_u32(b"12x3").is_err());
+        assert_eq!(parse_u32(b"42").unwrap(), 42);
+    }
+
+    #[test]
+    fn comments_at_top_level_are_ignored() {
+        let v = parse(b"% header\n42");
+        assert!(matches!(v, Object::Integer(42)));
+    }
 }

@@ -470,6 +470,121 @@ mod tests {
     }
 
     #[test]
+    fn dict_literal_inside_content_stream_is_skipped() {
+        // Real PDFs sometimes embed inline dicts (`<< ... >>`) inside
+        // marked-content operators. Our tokenizer should skip past them
+        // and resume on the next operator.
+        let toks = ops(b"<</K -1>> 42 Tj");
+        assert_eq!(toks, ["num:42", "op:Tj"]);
+    }
+
+    #[test]
+    fn stray_close_dict_does_not_crash() {
+        // `>>` outside of a dict literal — we just resync.
+        let toks = ops(b">> 7 Tj");
+        assert_eq!(toks, ["num:7", "op:Tj"]);
+    }
+
+    #[test]
+    fn arrays_emit_start_end_tokens() {
+        let toks = ops(b"[ 1 2 3 ] TJ");
+        assert_eq!(toks, ["[", "num:1", "num:2", "num:3", "]", "op:TJ"]);
+    }
+
+    #[test]
+    fn unterminated_literal_string_returns_partial_payload() {
+        let toks = ops(b"(unclosed forever");
+        assert_eq!(toks.len(), 1);
+        assert!(toks[0].starts_with("str:"));
+    }
+
+    #[test]
+    fn literal_string_round_trips_every_escape() {
+        // Every match arm in `unescape_literal`.
+        let raw = b"(\\n\\r\\t\\b\\f\\\\\\(\\)\\\n\\\r\n\\\rZ\\101\\q)";
+        let toks = ops(raw);
+        assert_eq!(toks.len(), 1);
+        let s = toks[0].trim_start_matches("str:");
+        assert!(s.starts_with("\n\r\t"));
+    }
+
+    #[test]
+    fn hex_string_handles_odd_nibble() {
+        // Odd hex string padded with zero — also covers the `if get == >` branch.
+        let mut p = Parser::new(b"<4> Tj");
+        if let Token::Str(s) = p.next_token() {
+            assert_eq!(&*s, &[0x40]);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn hex_string_skips_non_hex_bytes() {
+        let mut p = Parser::new(b"<48 6 9>");
+        if let Token::Str(s) = p.next_token() {
+            assert_eq!(&*s, b"Hi");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn hex_string_without_closing_angle() {
+        let mut p = Parser::new(b"<48");
+        // Tokenizer doesn't fail — it returns what it has and EOFs next.
+        if let Token::Str(s) = p.next_token() {
+            assert_eq!(&*s, b"H");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn lone_dot_is_a_keyword_not_a_number() {
+        // `.` alone isn't a valid number per our tokenizer — falls through.
+        let toks = ops(b". Tj");
+        assert_eq!(toks, ["op:.", "op:Tj"]);
+    }
+
+    #[test]
+    fn number_followed_by_letters_is_a_keyword() {
+        let toks = ops(b"10x");
+        assert_eq!(toks, ["op:10x"]);
+    }
+
+    #[test]
+    fn decode_hex_pads_odd_trailing_nibble() {
+        assert_eq!(decode_hex(b"4"), vec![0x40]);
+        assert_eq!(decode_hex(b"48 69"), b"Hi");
+        // Non-hex bytes get skipped.
+        assert_eq!(decode_hex(b"!!"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn unescape_literal_handles_each_escape_arm() {
+        let raw = b"\\n\\r\\t\\b\\f\\\\\\(\\)\\\nA\\\r\nB\\\rC\\101D\\?";
+        let out = unescape_literal(raw);
+        assert!(out.starts_with(b"\n\r\t\x08\x0C\\()"));
+    }
+
+    #[test]
+    fn unescape_literal_octal_at_eof() {
+        // Trailing octal sequence with no following digit must not run past
+        // the buffer.
+        let out = unescape_literal(b"\\7");
+        assert_eq!(out, vec![0x07]);
+    }
+
+    #[test]
+    fn unescape_literal_trailing_backslash_passes_through() {
+        // No following byte to escape — the lone backslash falls into the
+        // catch-all `else` and is emitted literally.
+        let out = unescape_literal(b"a\\");
+        assert_eq!(out, b"a\\");
+    }
+
+    #[test]
     fn skip_inline_image_jumps_past_data() {
         // BI dict ID <raw...> EI body
         let stream = b"BI /W 1 /H 1 ID \x00\x01\x02\nEI 99 Tj";
@@ -492,5 +607,13 @@ mod tests {
             Token::Op(op) => assert_eq!(op, b"Tj"),
             t => panic!("expected Op, got {t:?}"),
         }
+    }
+
+    #[test]
+    fn skip_inline_image_bails_at_eof_when_unterminated() {
+        // No `EI` sequence in the body → skip_inline_image runs off the end.
+        let mut p = Parser::new(b"image-bytes-without-the-end-marker");
+        p.skip_inline_image();
+        assert!(matches!(p.next_token(), Token::Eof));
     }
 }

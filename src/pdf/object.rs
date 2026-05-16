@@ -99,6 +99,84 @@ impl Dictionary {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_objects() -> Vec<Object> {
+        vec![
+            Object::Null,
+            Object::Boolean(true),
+            Object::Integer(7),
+            Object::Real(2.5),
+            Object::String(b"hi".to_vec()),
+            Object::Name(b"Foo".to_vec()),
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+            Object::Dictionary({
+                let mut d = Dictionary::new();
+                d.insert(b"k".to_vec(), Object::Integer(1));
+                d
+            }),
+            Object::Stream(Stream {
+                dict: Dictionary::new(),
+                content: vec![1, 2, 3],
+            }),
+            Object::Reference(ObjectId(9, 0)),
+        ]
+    }
+
+    #[test]
+    fn accessors_return_some_only_for_matching_variants() {
+        for obj in sample_objects() {
+            let expect_dict = matches!(obj, Object::Dictionary(_));
+            let expect_array = matches!(obj, Object::Array(_));
+            let expect_name = matches!(obj, Object::Name(_));
+            let expect_int_or_real = matches!(obj, Object::Integer(_) | Object::Real(_));
+            let expect_stream = matches!(obj, Object::Stream(_));
+            let expect_ref = matches!(obj, Object::Reference(_));
+            assert_eq!(obj.as_dict().is_some(), expect_dict);
+            assert_eq!(obj.as_array().is_some(), expect_array);
+            assert_eq!(obj.as_name().is_some(), expect_name);
+            assert_eq!(obj.as_name_str().is_some(), expect_name);
+            assert_eq!(obj.as_integer().is_some(), expect_int_or_real);
+            assert_eq!(obj.as_stream().is_some(), expect_stream);
+            assert_eq!(obj.as_reference().is_some(), expect_ref);
+        }
+    }
+
+    #[test]
+    fn as_integer_truncates_reals() {
+        assert_eq!(Object::Real(3.9).as_integer(), Some(3));
+        assert_eq!(Object::Real(-1.5).as_integer(), Some(-1));
+    }
+
+    #[test]
+    fn as_name_str_returns_none_for_invalid_utf8() {
+        // Lone 0xFF byte — not valid UTF-8.
+        let obj = Object::Name(vec![0xFFu8]);
+        assert!(obj.as_name_str().is_none());
+        // Valid UTF-8 round-trips.
+        assert_eq!(Object::Name(b"hi".to_vec()).as_name_str(), Some("hi"));
+    }
+
+    #[test]
+    fn dictionary_insert_replaces_existing_value() {
+        let mut d = Dictionary::new();
+        d.insert(b"k".to_vec(), Object::Integer(1));
+        d.insert(b"k".to_vec(), Object::Integer(2));
+        assert_eq!(d.get(b"k").and_then(Object::as_integer), Some(2));
+        // iter yields the single entry.
+        let v: Vec<_> = d.iter().collect();
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn dictionary_get_returns_none_for_missing_key() {
+        let d = Dictionary::new();
+        assert!(d.get(b"missing").is_none());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Stream {
     pub dict: Dictionary,

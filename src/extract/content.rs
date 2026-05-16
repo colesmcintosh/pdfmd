@@ -421,3 +421,200 @@ pub fn page_font_refs(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn font_map(font: &PdfFont) -> HashMap<Vec<u8>, &PdfFont> {
+        let mut m = HashMap::new();
+        m.insert(b"F1".to_vec(), font);
+        m
+    }
+
+    #[test]
+    fn extract_handles_every_text_show_variant() {
+        // Default font decodes ASCII bytes through StandardEncoding so we
+        // can read back the output as the literal characters we wrote.
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"\
+BT
+/F1 12 Tf
+14 TL
+1 0 0 1 50 700 Tm
+(line1) Tj
+T*
+(line2) '
+0 -14 Td
+(line3) \"
+0 -14 TD
+[(He) -200 (llo)] TJ
+ET
+";
+        let out = extract_page_text(stream, &fonts, &images);
+        // Every literal we emitted ought to appear.
+        for needle in ["line1", "line2", "line3", "He", "llo"] {
+            assert!(out.contains(needle), "missing {needle}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn extract_drops_position_change_outside_text_object() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        // `Tm` outside a text object should be a no-op (updates last_x/y
+        // but doesn't emit content).
+        let stream = b"1 0 0 1 0 0 Tm";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn extract_paints_image_xobjects_via_do_op() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let mut images = PageImages::new();
+        images.insert(b"Im1".to_vec(), "img-001.jpg");
+        // `Do` reads the most recent /Name operand and emits an image marker.
+        let stream = b"/Im1 Do";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.contains("img-001.jpg"));
+        // Sentinel character must appear too.
+        assert!(out.contains(IMAGE_MARK));
+    }
+
+    #[test]
+    fn unknown_xobject_names_are_ignored() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"/Unknown Do";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stray_array_end_outside_array_is_ignored() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BT /F1 12 Tf 100 700 Td (ok) Tj ] ET";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.contains("ok"));
+    }
+
+    #[test]
+    fn ensure_trailing_breaks_collapses_existing_newlines() {
+        let mut s = String::from("abc\n\n\n");
+        ensure_trailing_breaks(&mut s, 1);
+        assert_eq!(s, "abc\n");
+        // No prior newlines: append the requested number.
+        let mut s = String::from("abc");
+        ensure_trailing_breaks(&mut s, 2);
+        assert_eq!(s, "abc\n\n");
+    }
+
+    #[test]
+    fn skip_inline_image_exits_on_eof_without_id() {
+        // No `ID` keyword in the stream → skip_inline_image must terminate
+        // when the outer tokenizer hits EOF.
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BI /W 1";
+        // Just exercising the path — should not loop forever.
+        let _ = extract_page_text(stream, &fonts, &images);
+    }
+
+    #[test]
+    fn operands_buffer_caps_at_capacity() {
+        // More than 6 numeric operands shouldn't panic; the extras are
+        // silently dropped by `push_num`.
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"1 2 3 4 5 6 7 8 9 Tm";
+        let _ = extract_page_text(stream, &fonts, &images);
+    }
+
+    #[test]
+    fn position_change_records_paragraph_break_on_big_dy() {
+        // First text-show establishes a baseline; the next text-show is
+        // shifted vertically by a large dy, triggering ensure_trailing_breaks
+        // for a paragraph break.
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"\
+BT
+/F1 12 Tf
+1 0 0 1 0 700 Tm
+(top) Tj
+1 0 0 1 0 100 Tm
+(bottom) Tj
+ET
+";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.contains("top"));
+        assert!(out.contains("bottom"));
+        assert!(out.contains("\n"));
+    }
+
+    #[test]
+    fn page_font_refs_handles_each_dict_shape() {
+        use crate::pdf::Document;
+        // Build a doc with a Font dict referenced indirectly and a direct
+        // font ref inside a resources dict.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources 4 0 R/MediaBox[0 0 1 1]>> endobj
+4 0 obj <</Font 5 0 R>> endobj
+5 0 obj <</F1 6 0 R>> endobj
+6 0 obj <</Type/Font/Subtype/Type1/BaseFont/Helvetica>> endobj
+";
+        let bytes = build_pdf_with_xref(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page_id = doc.pages()[0];
+        let res = super::super::page_resources(&doc, page_id).unwrap();
+        let refs = page_font_refs(&doc, &res);
+        assert!(refs.contains_key(b"F1".as_slice()));
+    }
+
+    /// Helper for in-test PDF construction. Mirrors the minimal_pdf in
+    /// pdf::tests but parameterised on the body bytes.
+    fn build_pdf_with_xref(body: &[u8]) -> Vec<u8> {
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        // Scan for `N 0 obj` headers in document order.
+        let mut offsets = Vec::new();
+        let mut n = 1;
+        loop {
+            let needle = format!("{n} 0 obj");
+            let Some(p) = (0..=out.len().saturating_sub(needle.len()))
+                .find(|&i| &out[i..i + needle.len()] == needle.as_bytes())
+            else {
+                break;
+            };
+            offsets.push(p);
+            n += 1;
+        }
+        let count = offsets.len();
+        let mut xref = String::from("xref\n");
+        xref.push_str(&format!("0 {}\n", count + 1));
+        xref.push_str("0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer <</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
+            count + 1
+        ));
+        out.extend_from_slice(xref.as_bytes());
+        out
+    }
+}

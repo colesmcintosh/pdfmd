@@ -116,3 +116,67 @@ fn promote_document_title(markdown: &mut String) {
     let replacement = format!("# {title}");
     markdown.replace_range(leading_ws..leading_ws + end, &replacement);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_image_marks_is_no_op_without_sentinels() {
+        let mut s = String::from("nothing to rewrite here\n");
+        rewrite_image_marks(&mut s, "figs");
+        assert_eq!(s, "nothing to rewrite here\n");
+    }
+
+    #[test]
+    fn rewrite_image_marks_swaps_each_sentinel_pair() {
+        let mut s = "before\u{0001}img-001.jpg\u{0001}after\u{0001}img-002.jpg\u{0001}.".to_string();
+        rewrite_image_marks(&mut s, "figs/");
+        assert_eq!(s, "before![](figs/img-001.jpg)after![](figs/img-002.jpg).");
+    }
+
+    #[test]
+    fn rewrite_image_marks_tolerates_unterminated_sentinel() {
+        let mut s = "before\u{0001}img-001.jpg and never closed".to_string();
+        rewrite_image_marks(&mut s, "figs");
+        // We keep the partial chunk verbatim rather than crashing.
+        assert!(s.contains("img-001.jpg"));
+    }
+
+    #[test]
+    fn promote_document_title_inserts_h1_for_first_paragraph() {
+        let mut s = String::from("Some Title\n\nFirst paragraph.\n");
+        promote_document_title(&mut s);
+        assert!(s.starts_with("# Some Title"));
+    }
+
+    #[test]
+    fn promote_document_title_skips_when_already_heading_or_image() {
+        let cases = ["# Already a heading\n", "![Img](path)\n", "", "   "];
+        for c in cases {
+            let mut s = String::from(c);
+            promote_document_title(&mut s);
+            assert!(!s.starts_with("# ") || c.starts_with("# "));
+        }
+    }
+
+    #[test]
+    fn promote_document_title_skips_multi_line_first_block() {
+        // The "first paragraph" contains an internal newline — not a title.
+        let mut s = String::from("First line\nSecond line\n\nBody.\n");
+        promote_document_title(&mut s);
+        assert!(s.starts_with("First line"));
+    }
+
+    #[test]
+    fn convert_appends_trailing_newline_when_missing() {
+        // Round-trip via the public API on a real PDF.
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/2605.08070v1.pdf"
+        ))
+        .expect("read fixture");
+        let result = convert_pdf_to_markdown(&bytes, &ConvertOptions::default()).unwrap();
+        assert!(result.markdown.ends_with('\n'));
+    }
+}

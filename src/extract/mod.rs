@@ -210,3 +210,163 @@ where
     });
     out.into_iter().map(Option::unwrap).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_map_handles_empty_input() {
+        let out: Vec<i32> = parallel_map::<i32, i32, _>(&[], |x| *x);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parallel_map_single_worker_path_runs_serially() {
+        // A 1-element input forces the workers.min(len) clamp to 1, which
+        // takes the serial fast path.
+        let out = parallel_map(&[42], |x| x * 2);
+        assert_eq!(out, vec![84]);
+    }
+
+    #[test]
+    fn parallel_map_distributes_work_across_workers() {
+        let input: Vec<i32> = (0..32).collect();
+        let out = parallel_map(&input, |x| x * x);
+        let expected: Vec<i32> = input.iter().map(|x| x * x).collect();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn page_resources_inherits_from_parent_pages_node() {
+        // Page leaf carries no /Resources but its parent /Pages does.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1/Resources<</Font<</F1 4 0 R>>>>>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/MediaBox[0 0 1 1]>> endobj
+4 0 obj <</Type/Font/Subtype/Type1/BaseFont/Helvetica>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        let res = page_resources(&doc, page).expect("inherited resources");
+        assert!(res.get(b"Font").is_some());
+    }
+
+    #[test]
+    fn page_resources_returns_none_when_root_loop_exhausts() {
+        // A self-referential /Parent chain — the 64-iteration cap kicks in.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 3 0 R/MediaBox[0 0 1 1]>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        // No /Resources anywhere along the chain → None (or recursion cap).
+        assert!(page_resources(&doc, page).is_none());
+    }
+
+    #[test]
+    fn page_resources_follows_resources_reference() {
+        // /Resources is itself an indirect reference.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources 4 0 R/MediaBox[0 0 1 1]>> endobj
+4 0 obj <</Font<</F1 5 0 R>>>> endobj
+5 0 obj <</Type/Font/Subtype/Type1/BaseFont/Helvetica>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        let res = page_resources(&doc, page).unwrap();
+        assert!(res.get(b"Font").is_some());
+    }
+
+    #[test]
+    fn collect_images_dedupes_across_pages() {
+        // Two pages reference the same image XObject; only one entry should
+        // end up in the extracted image list and both per-page maps should
+        // point at the same filename.
+        let mut res: Dictionary = Dictionary::new();
+        let mut xobj = Dictionary::new();
+        xobj.insert(b"Im1".to_vec(), Object::Reference(ObjectId(99, 0)));
+        res.insert(b"XObject".to_vec(), Object::Dictionary(xobj));
+        let resources = vec![Some(res.clone()), Some(res)];
+        // We need a doc that has obj 99 as a JPEG image.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+99 0 obj <</Subtype/Image/Filter/DCTDecode/Length 3>>
+stream
+JPG
+endstream
+endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let (images, per_page) = collect_images(&doc, &resources);
+        assert_eq!(images.len(), 1);
+        assert_eq!(per_page.len(), 2);
+        // Both pages map Im1 → the same filename.
+        assert_eq!(per_page[0].get(b"Im1".as_slice()), per_page[1].get(b"Im1".as_slice()));
+    }
+
+    #[test]
+    fn collect_images_handles_none_resources_entries() {
+        // A page with no Resources dict at all (None) must not crash.
+        let resources: Vec<Option<Dictionary>> = vec![None];
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let (images, per_page) = collect_images(&doc, &resources);
+        assert!(images.is_empty());
+        assert_eq!(per_page.len(), 1);
+        assert!(per_page[0].is_empty());
+    }
+
+    /// Builder for in-test PDFs with a classic xref table. Scans the body
+    /// for `N 0 obj` markers and emits offsets for every contiguous id
+    /// it finds, padding the gap with `f` entries.
+    fn build_xref_pdf(body: &[u8]) -> Vec<u8> {
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        let mut found: Vec<(u32, usize)> = Vec::new();
+        for n in 1u32..200 {
+            let needle = format!("{n} 0 obj");
+            if let Some(off) = (0..=out.len().saturating_sub(needle.len()))
+                .find(|&i| out[i..i + needle.len()] == *needle.as_bytes())
+            {
+                found.push((n, off));
+            }
+        }
+        let max = found.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        let mut xref = String::from("xref\n");
+        xref.push_str(&format!("0 {}\n", max + 1));
+        xref.push_str("0000000000 65535 f \n");
+        for n in 1..=max {
+            match found.iter().find(|(m, _)| *m == n) {
+                Some((_, off)) => xref.push_str(&format!("{off:010} 00000 n \n")),
+                None => xref.push_str("0000000000 00000 f \n"),
+            }
+        }
+        xref.push_str(&format!(
+            "trailer <</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
+            max + 1
+        ));
+        out.extend_from_slice(xref.as_bytes());
+        out
+    }
+}
