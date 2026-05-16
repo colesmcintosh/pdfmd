@@ -5,10 +5,11 @@
 //! headings, lists, and paragraph boundaries — PDFs carry no semantic
 //! structure of their own.
 
-use anyhow::Result;
-
 mod extract;
 mod heuristics;
+mod pdf;
+
+use pdf::PdfError;
 
 pub use extract::ExtractedImage;
 
@@ -34,6 +35,12 @@ pub struct ConvertResult {
     /// for writing each one to `image_dir/filename`.
     pub images: Vec<ExtractedImage>,
 }
+
+/// Top-level error returned from [`convert_pdf_to_markdown`]. Wraps the
+/// from-scratch [`PdfError`] for callers that care to distinguish causes.
+pub type Error = PdfError;
+/// Convenience alias used throughout the public API.
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Convert the byte contents of a PDF into a Markdown document.
 pub fn convert_pdf_to_markdown(pdf_bytes: &[u8], opts: &ConvertOptions) -> Result<ConvertResult> {

@@ -1,13 +1,10 @@
 //! Heuristics that turn raw PDF-extracted text into structured Markdown.
 //!
-//! `pdf-extract` emits a flat string with form feeds between pages and best-
+//! The extractor emits a flat string with form feeds between pages and best-
 //! effort line breaks. We can't recover font sizes from that stream, so the
 //! rules below are deliberately conservative: they target patterns that
 //! readers reliably interpret as a heading or list rather than guessing at
 //! anything more ambitious.
-
-use regex::Regex;
-use std::sync::OnceLock;
 
 /// Format a single page of raw text into a Markdown fragment.
 pub fn format_page(raw: &str) -> String {
@@ -74,8 +71,8 @@ fn heading_level(line: &str) -> Option<usize> {
         return None;
     }
 
-    if let Some(caps) = numbered_heading_regex().captures(line) {
-        let dots = caps[1].matches('.').count();
+    if let Some(numbering) = match_numbered_heading(line) {
+        let dots = numbering.capture.matches('.').count();
         // "1." → level 1, "1.1" → level 2, "1.1.1" → level 3, ...
         let level = (dots + 1).min(6);
         return Some(level);
@@ -103,45 +100,137 @@ fn heading_level(line: &str) -> Option<usize> {
 /// Drop a leading "1.2.3" numbering, if present, so the rendered heading
 /// stays readable.
 fn strip_heading_prefix(line: &str) -> String {
-    if let Some(caps) = numbered_heading_regex().captures(line) {
-        let prefix_len = caps.get(0).unwrap().as_str().len();
-        line[prefix_len..].trim_start().to_string()
+    if let Some(m) = match_numbered_heading(line) {
+        line[m.match_len..].trim_start().to_string()
     } else {
         line.to_string()
     }
 }
 
 fn is_list_item(line: &str) -> bool {
-    bullet_regex().is_match(line) || ordered_list_regex().is_match(line)
+    match_bullet(line).is_some() || match_ordered_list(line).is_some()
 }
 
 fn format_list_item(line: &str) -> String {
-    if let Some(caps) = bullet_regex().captures(line) {
-        let rest = line[caps.get(0).unwrap().end()..].trim();
+    if let Some(len) = match_bullet(line) {
+        let rest = line[len..].trim();
         return format!("- {rest}");
     }
-    if let Some(caps) = ordered_list_regex().captures(line) {
-        let number = &caps[1];
-        let rest = line[caps.get(0).unwrap().end()..].trim();
-        return format!("{number}. {rest}");
+    if let Some(m) = match_ordered_list(line) {
+        let rest = line[m.match_len..].trim();
+        return format!("{}. {rest}", m.capture);
     }
     line.to_string()
 }
 
-fn numbered_heading_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(\d+(?:\.\d+)*)\.?\s+").unwrap())
+// ---- Hand-rolled matchers --------------------------------------------------
+//
+// The original implementation used three small regexes. They were cheap, but
+// dragging the entire `regex` crate in for a handful of single-pass patterns
+// was disproportionate. Each helper returns the captured slice (when needed)
+// plus the byte length of the full match, mirroring what `Regex::captures`
+// would have given us.
+
+struct Match<'a> {
+    capture: &'a str,
+    match_len: usize,
 }
 
-fn bullet_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    // Common bullet glyphs plus ASCII dash/asterisk.
-    RE.get_or_init(|| Regex::new(r"^([\u{2022}\u{25E6}\u{25AA}\u{2023}\u{2043}\-*])\s+").unwrap())
+/// Match `^(\d+(?:\.\d+)*)\.?\s+`: a dotted numbering with an optional
+/// trailing period and at least one whitespace character.
+fn match_numbered_heading(line: &str) -> Option<Match<'_>> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    // Optional `.digit+` repetitions: greedy, like the regex.
+    loop {
+        if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let capture_end = i;
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+    }
+    let ws_start = i;
+    i += skip_whitespace(&line[i..]);
+    if i == ws_start {
+        return None;
+    }
+    Some(Match {
+        capture: &line[..capture_end],
+        match_len: i,
+    })
 }
 
-fn ordered_list_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(\d+)[.)]\s+").unwrap())
+/// Match `^([\u{2022}\u{25E6}\u{25AA}\u{2023}\u{2043}\-*])\s+`. ASCII bullet
+/// chars are a single byte; the Unicode bullets are multi-byte but each is a
+/// single `char`, so we peek the first one and bail otherwise.
+fn match_bullet(line: &str) -> Option<usize> {
+    let mut chars = line.chars();
+    let first = chars.next()?;
+    let bullet_len = match first {
+        '-' | '*' | '\u{2022}' | '\u{25E6}' | '\u{25AA}' | '\u{2023}' | '\u{2043}' => {
+            first.len_utf8()
+        }
+        _ => return None,
+    };
+    let rest = &line[bullet_len..];
+    let ws = skip_whitespace(rest);
+    if ws == 0 {
+        return None;
+    }
+    Some(bullet_len + ws)
+}
+
+/// Match `^(\d+)[.)]\s+`.
+fn match_ordered_list(line: &str) -> Option<Match<'_>> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let capture_end = i;
+    if i >= b.len() || (b[i] != b'.' && b[i] != b')') {
+        return None;
+    }
+    i += 1;
+    let ws_start = i;
+    i += skip_whitespace(&line[i..]);
+    if i == ws_start {
+        return None;
+    }
+    Some(Match {
+        capture: &line[..capture_end],
+        match_len: i,
+    })
+}
+
+/// Consume Unicode whitespace from the start of `s`. Matches the behaviour
+/// of regex `\s+` in default (Unicode) mode.
+fn skip_whitespace(s: &str) -> usize {
+    let mut n = 0;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            n += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    n
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use crate::pdf::{Dictionary, Document, Object, ObjectId};
 
 /// An image extracted from the PDF, ready to be written to disk.
 pub struct ExtractedImage {
@@ -24,11 +24,11 @@ pub type PageImages<'a> = HashMap<Vec<u8>, &'a str>;
 /// `name → ObjectId` entries, mirroring `page_font_refs`.
 pub fn page_xobject_refs(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
     let mut out = HashMap::new();
-    let Ok(xobj_obj) = resources.get(b"XObject") else {
+    let Some(xobj_obj) = resources.get(b"XObject") else {
         return out;
     };
     let xobj_dict = match xobj_obj {
-        Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+        Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict),
         Object::Dictionary(d) => Some(d),
         _ => None,
     };
@@ -37,7 +37,7 @@ pub fn page_xobject_refs(doc: &Document, resources: &Dictionary) -> HashMap<Vec<
     };
     for (name, obj) in xobj_dict.iter() {
         if let Object::Reference(id) = obj {
-            out.insert(name.clone(), *id);
+            out.insert(name.to_vec(), *id);
         }
     }
     out
@@ -47,15 +47,15 @@ pub fn page_xobject_refs(doc: &Document, resources: &Dictionary) -> HashMap<Vec<
 /// file extension and the raw stream bytes. Form XObjects, inline-decoded
 /// bitmaps, and unsupported filter chains return `None`.
 pub fn extract_image(doc: &Document, obj_id: ObjectId) -> Option<(&'static str, Vec<u8>)> {
-    let stream = doc.get_object(obj_id).ok()?.as_stream().ok()?;
+    let stream = doc.get_object(obj_id)?.as_stream()?;
     let dict = &stream.dict;
 
-    let subtype = dict.get(b"Subtype").ok()?.as_name_str().ok()?;
+    let subtype = dict.get(b"Subtype")?.as_name_str()?;
     if subtype != "Image" {
         return None;
     }
 
-    let filter = dict.get(b"Filter").ok()?;
+    let filter = dict.get(b"Filter")?;
     let filter_name = match filter {
         Object::Name(n) => std::str::from_utf8(n).ok()?,
         // Multi-filter chains (e.g. /Filter [/ASCII85Decode /DCTDecode])
@@ -63,7 +63,7 @@ pub fn extract_image(doc: &Document, obj_id: ObjectId) -> Option<(&'static str, 
         // writing the bytes. The pass-through case — a single-element
         // array — is common enough to handle, but we leave true chains
         // for a future pass.
-        Object::Array(arr) if arr.len() == 1 => arr.first()?.as_name_str().ok()?,
+        Object::Array(arr) if arr.len() == 1 => arr.first()?.as_name_str()?,
         _ => return None,
     };
 

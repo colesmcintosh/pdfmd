@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use lopdf::{Dictionary, Object, ObjectId};
+use crate::pdf::{Dictionary, Object, ObjectId};
 
 use super::font::PdfFont;
 use super::image::PageImages;
@@ -398,13 +398,16 @@ fn ensure_trailing_breaks(out: &mut String, count: usize) {
 /// Map a page's `/Resources/Font` entries to their font object IDs without
 /// parsing the fonts themselves — the caller looks the parsed fonts up in
 /// a document-wide cache to avoid re-parsing the same font across pages.
-pub fn page_font_refs(doc: &lopdf::Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
+pub fn page_font_refs(
+    doc: &crate::pdf::Document,
+    resources: &Dictionary,
+) -> HashMap<Vec<u8>, ObjectId> {
     let mut out = HashMap::new();
-    let Ok(font_dict_obj) = resources.get(b"Font") else {
+    let Some(font_dict_obj) = resources.get(b"Font") else {
         return out;
     };
     let font_dict = match font_dict_obj {
-        Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+        Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict),
         Object::Dictionary(d) => Some(d),
         _ => None,
     };
@@ -413,7 +416,7 @@ pub fn page_font_refs(doc: &lopdf::Document, resources: &Dictionary) -> HashMap<
     };
     for (name, obj) in font_dict.iter() {
         if let Object::Reference(id) = obj {
-            out.insert(name.clone(), *id);
+            out.insert(name.to_vec(), *id);
         }
     }
     out

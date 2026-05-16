@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use lopdf::{Document, Object, ObjectId};
+use crate::pdf::{Document, Object, ObjectId};
 
 use super::cmap::{self, CMap};
 use super::encoding::BaseEncoding;
@@ -39,7 +39,7 @@ pub enum FontKind {
 impl PdfFont {
     /// Build a font from its dictionary object.
     pub fn from_object(doc: &Document, obj_id: ObjectId) -> Self {
-        let Ok(font_dict) = doc.get_object(obj_id).and_then(Object::as_dict) else {
+        let Some(font_dict) = doc.get_object(obj_id).and_then(Object::as_dict) else {
             return Self::default();
         };
 
@@ -47,30 +47,28 @@ impl PdfFont {
 
         let subtype = font_dict
             .get(b"Subtype")
-            .ok()
-            .and_then(|o| o.as_name_str().ok())
+            .and_then(Object::as_name_str)
             .unwrap_or("");
         if subtype == "Type0" {
             font.kind = FontKind::Composite;
         }
 
-        // /ToUnicode is an indirect stream.
-        if let Some(stream) = follow_stream(doc, font_dict.get(b"ToUnicode").ok()) {
+        if let Some(stream) = follow_stream(doc, font_dict.get(b"ToUnicode")) {
             font.to_unicode = Some(cmap::parse(&stream));
         }
 
-        match font_dict.get(b"Encoding").ok() {
+        match font_dict.get(b"Encoding") {
             Some(Object::Name(name)) => {
                 font.encoding = BaseEncoding::from_name(std::str::from_utf8(name).unwrap_or(""));
             }
             Some(obj) => {
-                let resolved = resolve(doc, obj);
-                if let Ok(dict) = resolved.as_dict() {
-                    if let Ok(Object::Name(base)) = dict.get(b"BaseEncoding") {
+                let resolved = doc.deref(obj);
+                if let Some(dict) = resolved.as_dict() {
+                    if let Some(Object::Name(base)) = dict.get(b"BaseEncoding") {
                         font.encoding =
                             BaseEncoding::from_name(std::str::from_utf8(base).unwrap_or(""));
                     }
-                    if let Ok(Object::Array(arr)) = dict.get(b"Differences") {
+                    if let Some(Object::Array(arr)) = dict.get(b"Differences") {
                         font.differences = parse_differences(arr);
                     }
                 }
@@ -198,21 +196,10 @@ fn parse_differences(arr: &[Object]) -> HashMap<u8, String> {
 }
 
 fn follow_stream(doc: &Document, obj: Option<&Object>) -> Option<Vec<u8>> {
-    let obj = obj?;
-    let resolved = resolve(doc, obj);
-    match resolved {
-        Object::Stream(stream) => {
-            let mut stream = stream.clone();
-            stream.decompress();
-            Some(stream.content)
-        }
-        _ => None,
-    }
-}
-
-fn resolve<'a>(doc: &'a Document, obj: &'a Object) -> Object {
-    match obj {
-        Object::Reference(id) => doc.get_object(*id).cloned().unwrap_or(Object::Null),
-        other => other.clone(),
+    let resolved = doc.deref(obj?);
+    if let Object::Stream(s) = resolved {
+        doc.decode_stream(s).ok()
+    } else {
+        None
     }
 }

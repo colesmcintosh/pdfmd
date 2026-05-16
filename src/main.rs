@@ -1,96 +1,161 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-
-use anyhow::{anyhow, Context, Result};
-use clap::Parser;
+use std::process::ExitCode;
 
 use pdfmd::{convert_pdf_to_markdown, ConvertOptions, ExtractedImage};
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "pdfmd",
-    version,
-    about = "Convert PDF documents to Markdown",
-    long_about = None,
-)]
+const HELP: &str = "Convert PDF documents to Markdown.
+
+USAGE:
+    pdfmd [OPTIONS] <INPUT>
+
+ARGS:
+    <INPUT>    Path to the input PDF file. Use \"-\" to read from stdin.
+
+OPTIONS:
+    -o, --output <FILE>             Write Markdown to FILE instead of stdout.
+        --page-breaks               Insert `---` between PDF pages.
+        --extract-images <DIR>      Save embedded JPEG / JPEG 2000 images
+                                    into DIR and reference them inline.
+    -h, --help                      Print this help.
+    -V, --version                   Print version information.
+";
+
 struct Cli {
-    /// Path to the input PDF file. Use "-" to read from stdin.
     input: PathBuf,
-
-    /// Path to write the Markdown output. Defaults to stdout.
-    #[arg(short, long)]
     output: Option<PathBuf>,
-
-    /// Insert a page break marker (`---`) between PDF pages.
-    #[arg(long, default_value_t = false)]
     page_breaks: bool,
-
-    /// Extract embedded JPEG / JPEG 2000 images into the given directory
-    /// and reference them inline in the Markdown.
-    #[arg(long, value_name = "DIR")]
     extract_images: Option<PathBuf>,
 }
 
-fn read_input(path: &Path) -> Result<Vec<u8>> {
+/// A lightweight argv parser: enough for our four flags, no dependency.
+/// Returns `Ok(None)` after handling `--help` / `--version`, in which case
+/// the binary exits successfully without doing any work.
+fn parse_args() -> Result<Option<Cli>, String> {
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut page_breaks = false;
+    let mut extract_images: Option<PathBuf> = None;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("pdfmd {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "--page-breaks" => page_breaks = true,
+            "-o" | "--output" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "missing value for --output".to_string())?;
+                output = Some(PathBuf::from(v));
+            }
+            v if v.starts_with("--output=") => {
+                output = Some(PathBuf::from(&v["--output=".len()..]));
+            }
+            "--extract-images" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "missing value for --extract-images".to_string())?;
+                extract_images = Some(PathBuf::from(v));
+            }
+            v if v.starts_with("--extract-images=") => {
+                extract_images = Some(PathBuf::from(&v["--extract-images=".len()..]));
+            }
+            v if v.starts_with("--") || (v.starts_with('-') && v != "-") => {
+                return Err(format!("unknown flag: {v}"));
+            }
+            // Positional input.
+            _ => {
+                if input.is_some() {
+                    return Err(format!("unexpected positional argument: {arg}"));
+                }
+                input = Some(PathBuf::from(arg));
+            }
+        }
+    }
+
+    let input = input.ok_or_else(|| "missing <INPUT>".to_string())?;
+    Ok(Some(Cli {
+        input,
+        output,
+        page_breaks,
+        extract_images,
+    }))
+}
+
+fn read_input(path: &Path) -> io::Result<Vec<u8>> {
     if path.as_os_str() == "-" {
         let mut buf = Vec::new();
-        io::stdin()
-            .read_to_end(&mut buf)
-            .context("failed to read PDF from stdin")?;
+        io::stdin().read_to_end(&mut buf)?;
         Ok(buf)
     } else {
-        fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+        fs::read(path)
     }
 }
 
-fn write_output(path: Option<&PathBuf>, markdown: &str) -> Result<()> {
+fn write_output(path: Option<&PathBuf>, markdown: &str) -> io::Result<()> {
     match path {
-        Some(p) => {
-            fs::write(p, markdown).with_context(|| format!("failed to write {}", p.display()))
-        }
-        None => io::stdout()
-            .write_all(markdown.as_bytes())
-            .context("failed to write to stdout"),
+        Some(p) => fs::write(p, markdown),
+        None => io::stdout().write_all(markdown.as_bytes()),
     }
 }
 
-fn write_images(dir: &Path, images: &[ExtractedImage]) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+fn write_images(dir: &Path, images: &[ExtractedImage]) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
     for img in images {
-        let path = dir.join(&img.filename);
-        fs::write(&path, &img.bytes)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        fs::write(dir.join(&img.filename), &img.bytes)?;
     }
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let bytes = read_input(&cli.input)?;
+fn run() -> Result<(), String> {
+    let Some(cli) = parse_args().map_err(|e| format!("{e}\n\n{HELP}"))? else {
+        return Ok(());
+    };
 
-    let image_dir_str = cli
-        .extract_images
-        .as_ref()
-        .map(|p| {
-            p.to_str().ok_or_else(|| {
-                anyhow!(
-                    "--extract-images path must be valid UTF-8 to embed in Markdown: {}",
-                    p.display()
-                )
-            })
-        })
-        .transpose()?;
+    let bytes = read_input(&cli.input)
+        .map_err(|e| format!("failed to read {}: {e}", cli.input.display()))?;
+
+    let image_dir_str = match cli.extract_images.as_ref() {
+        Some(p) => Some(p.to_str().ok_or_else(|| {
+            format!(
+                "--extract-images path must be valid UTF-8 to embed in Markdown: {}",
+                p.display()
+            )
+        })?),
+        None => None,
+    };
 
     let opts = ConvertOptions {
         include_page_breaks: cli.page_breaks,
         image_dir: image_dir_str,
     };
-    let result = convert_pdf_to_markdown(&bytes, &opts)?;
+    let result = convert_pdf_to_markdown(&bytes, &opts).map_err(|e| e.to_string())?;
 
     if let Some(dir) = cli.extract_images.as_deref() {
-        write_images(dir, &result.images)?;
+        write_images(dir, &result.images)
+            .map_err(|e| format!("failed to write images to {}: {e}", dir.display()))?;
     }
-    write_output(cli.output.as_ref(), &result.markdown)?;
+    write_output(cli.output.as_ref(), &result.markdown).map_err(|e| match cli.output.as_ref() {
+        Some(p) => format!("failed to write {}: {e}", p.display()),
+        None => format!("failed to write to stdout: {e}"),
+    })?;
     Ok(())
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
+    }
 }

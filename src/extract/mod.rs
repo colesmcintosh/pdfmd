@@ -1,10 +1,9 @@
-//! From-scratch PDF text extractor built on `lopdf` for object parsing.
+//! From-scratch PDF text extractor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::thread;
 
-use anyhow::{Context, Result};
-use lopdf::{Document, Object, ObjectId};
-use rayon::prelude::*;
+use crate::pdf::{Dictionary, Document, Object, ObjectId, PdfError};
 
 mod cmap;
 mod content;
@@ -20,6 +19,15 @@ use image::{extract_image, page_xobject_refs, PageImages};
 
 pub use image::ExtractedImage;
 
+/// One unit of per-page extraction work: page id, font name → object id map,
+/// and image name → output filename map. Pre-built once and shipped across
+/// the worker pool so the hot loop touches only borrowed references.
+type PageJob<'a> = (
+    ObjectId,
+    &'a HashMap<Vec<u8>, ObjectId>,
+    &'a HashMap<Vec<u8>, String>,
+);
+
 /// Extract the textual content of a PDF document. Pages are returned as
 /// independent strings so callers don't pay for a join/split round trip.
 ///
@@ -30,16 +38,13 @@ pub use image::ExtractedImage;
 pub fn extract_text(
     pdf_bytes: &[u8],
     extract_images: bool,
-) -> Result<(Vec<String>, Vec<ExtractedImage>)> {
-    let doc = Document::load_mem(pdf_bytes).context("failed to parse PDF")?;
+) -> Result<(Vec<String>, Vec<ExtractedImage>), PdfError> {
+    let doc = Document::load(pdf_bytes)?;
+    let pages: Vec<ObjectId> = doc.pages().to_vec();
 
-    // `get_pages` returns a BTreeMap already sorted by page number, so the
-    // collected vector preserves document order.
-    let pages: Vec<(u32, ObjectId)> = doc.get_pages().into_iter().collect();
-
-    let resources: Vec<Option<lopdf::Dictionary>> = pages
+    let resources: Vec<Option<Dictionary>> = pages
         .iter()
-        .map(|&(_, page_id)| page_resources(&doc, page_id))
+        .map(|&page_id| page_resources(&doc, page_id))
         .collect();
 
     // Serial pre-pass: walk each page's /Resources/Font to collect
@@ -58,13 +63,13 @@ pub fn extract_text(
     let unique_ids: Vec<ObjectId> = page_font_refs_per_page
         .iter()
         .flat_map(|m| m.values().copied())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let font_cache: HashMap<ObjectId, PdfFont> = unique_ids
-        .par_iter()
-        .map(|&id| (id, PdfFont::from_object(&doc, id)))
-        .collect();
+    let font_cache: HashMap<ObjectId, PdfFont> =
+        parallel_map(&unique_ids, |&id| (id, PdfFont::from_object(&doc, id)))
+            .into_iter()
+            .collect();
 
     // Image pre-pass. Only runs when the caller asked for images; otherwise
     // we leave the per-page maps empty so the content interpreter never
@@ -75,14 +80,16 @@ pub fn extract_text(
         (Vec::new(), vec![HashMap::new(); pages.len()])
     };
 
-    let page_texts: Vec<String> = pages
-        .par_iter()
-        .zip(page_font_refs_per_page.par_iter())
-        .zip(page_image_filenames.par_iter())
-        .map(|((&(_, page_id), font_refs), image_names)| {
-            extract_one_page(&doc, page_id, font_refs, &font_cache, image_names).unwrap_or_default()
-        })
+    // Fan out per-page text extraction across worker threads.
+    let inputs: Vec<PageJob<'_>> = pages
+        .iter()
+        .zip(page_font_refs_per_page.iter())
+        .zip(page_image_filenames.iter())
+        .map(|((page_id, refs), names)| (*page_id, refs, names))
         .collect();
+    let page_texts: Vec<String> = parallel_map(&inputs, |(page_id, font_refs, image_names)| {
+        extract_one_page(&doc, *page_id, font_refs, &font_cache, image_names).unwrap_or_default()
+    });
 
     Ok((page_texts, images))
 }
@@ -93,7 +100,7 @@ pub fn extract_text(
 /// `name → filename` maps for the content interpreter.
 fn collect_images(
     doc: &Document,
-    resources: &[Option<lopdf::Dictionary>],
+    resources: &[Option<Dictionary>],
 ) -> (Vec<ExtractedImage>, Vec<HashMap<Vec<u8>, String>>) {
     let mut images: Vec<ExtractedImage> = Vec::new();
     let mut filename_by_object: HashMap<ObjectId, String> = HashMap::new();
@@ -141,28 +148,65 @@ fn extract_one_page(
         .iter()
         .map(|(name, filename)| (name.clone(), filename.as_str()))
         .collect();
-    let content_bytes = doc.get_page_content(page_id).ok()?;
+    let content_bytes = doc.get_page_content(page_id)?;
     Some(content::extract_page_text(&content_bytes, &fonts, &images))
 }
 
 /// Walk up the page tree until we find a `/Resources` dictionary.
-fn page_resources(doc: &Document, page_id: lopdf::ObjectId) -> Option<lopdf::Dictionary> {
+fn page_resources(doc: &Document, page_id: ObjectId) -> Option<Dictionary> {
     let mut current = page_id;
-    loop {
-        let dict = doc.get_object(current).ok()?.as_dict().ok()?;
-        if let Ok(res) = dict.get(b"Resources") {
+    for _ in 0..64 {
+        let dict = doc.get_object(current)?.as_dict()?;
+        if let Some(res) = dict.get(b"Resources") {
             return match res {
-                Object::Reference(id) => doc.get_object(*id).ok()?.as_dict().ok().cloned(),
+                Object::Reference(id) => doc.get_object(*id)?.as_dict().cloned(),
                 Object::Dictionary(d) => Some(d.clone()),
                 _ => None,
             };
         }
-        let Ok(parent) = dict.get(b"Parent") else {
-            return None;
-        };
+        let parent = dict.get(b"Parent")?;
         let Object::Reference(parent_id) = parent else {
             return None;
         };
         current = *parent_id;
     }
+    None
+}
+
+/// Tiny work-stealing-free parallel map: split into one chunk per worker
+/// thread and `Vec::extend` the partial results in place. Stays
+/// dependency-free and is fast enough that the per-page cost dominates.
+fn parallel_map<T, R, F>(input: &[T], f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync + Send,
+{
+    let len = input.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    // Available_parallelism returns 0 on error; clamp to 1.
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+        .min(len);
+    if workers == 1 {
+        return input.iter().map(&f).collect();
+    }
+    let chunk = (len + workers - 1) / workers;
+    // Pre-size the output so each worker can write into its own slice.
+    let mut out: Vec<Option<R>> = (0..len).map(|_| None).collect();
+    thread::scope(|s| {
+        let f = &f;
+        for (in_chunk, out_chunk) in input.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            s.spawn(move || {
+                for (slot, item) in out_chunk.iter_mut().zip(in_chunk) {
+                    *slot = Some(f(item));
+                }
+            });
+        }
+    });
+    out.into_iter().map(Option::unwrap).collect()
 }
