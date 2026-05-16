@@ -168,7 +168,7 @@ mod tests {
     fn read_input_from_disk_returns_bytes() {
         let bytes = read_input(Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/2605.08070v1.pdf"
+            "/tests/fixtures/sample.pdf"
         )))
         .unwrap();
         assert!(!bytes.is_empty());

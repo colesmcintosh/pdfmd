@@ -172,7 +172,10 @@ mod tests {
     #[test]
     fn convert_appends_trailing_newline_when_missing() {
         // Round-trip via the public API on a real PDF.
-        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/2605.08070v1.pdf"))
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample.pdf"
+        ))
             .expect("read fixture");
         let result = convert_pdf_to_markdown(&bytes, &ConvertOptions::default()).unwrap();
         assert!(result.markdown.ends_with('\n'));

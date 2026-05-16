@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn reference_pdf() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("2605.08070v1.pdf")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf")
 }
 
 fn binary() -> PathBuf {
