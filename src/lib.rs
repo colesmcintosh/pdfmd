@@ -176,7 +176,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/sample.pdf"
         ))
-            .expect("read fixture");
+        .expect("read fixture");
         let result = convert_pdf_to_markdown(&bytes, &ConvertOptions::default()).unwrap();
         assert!(result.markdown.ends_with('\n'));
     }
