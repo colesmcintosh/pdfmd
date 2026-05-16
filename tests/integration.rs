@@ -36,8 +36,8 @@ fn page_breaks_insert_horizontal_rules() {
         },
     )
     .expect("convert");
-    let without = pdfmd::convert_pdf_to_markdown(&bytes, &pdfmd::ConvertOptions::default())
-        .expect("convert");
+    let without =
+        pdfmd::convert_pdf_to_markdown(&bytes, &pdfmd::ConvertOptions::default()).expect("convert");
     assert!(with.markdown.contains("\n\n---\n\n"));
     assert!(!without.markdown.contains("\n\n---\n\n"));
 }
@@ -112,7 +112,10 @@ fn cli_streams_from_stdin_to_stdout() {
 
 #[test]
 fn cli_help_exits_clean() {
-    let output = Command::new(binary()).arg("--help").output().expect("spawn");
+    let output = Command::new(binary())
+        .arg("--help")
+        .output()
+        .expect("spawn");
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("USAGE"));
 

@@ -316,7 +316,10 @@ endobj
         assert_eq!(images.len(), 1);
         assert_eq!(per_page.len(), 2);
         // Both pages map Im1 → the same filename.
-        assert_eq!(per_page[0].get(b"Im1".as_slice()), per_page[1].get(b"Im1".as_slice()));
+        assert_eq!(
+            per_page[0].get(b"Im1".as_slice()),
+            per_page[1].get(b"Im1".as_slice())
+        );
     }
 
     #[test]

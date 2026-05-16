@@ -130,7 +130,8 @@ mod tests {
 
     #[test]
     fn rewrite_image_marks_swaps_each_sentinel_pair() {
-        let mut s = "before\u{0001}img-001.jpg\u{0001}after\u{0001}img-002.jpg\u{0001}.".to_string();
+        let mut s =
+            "before\u{0001}img-001.jpg\u{0001}after\u{0001}img-002.jpg\u{0001}.".to_string();
         rewrite_image_marks(&mut s, "figs/");
         assert_eq!(s, "before![](figs/img-001.jpg)after![](figs/img-002.jpg).");
     }
@@ -171,11 +172,8 @@ mod tests {
     #[test]
     fn convert_appends_trailing_newline_when_missing() {
         // Round-trip via the public API on a real PDF.
-        let bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/2605.08070v1.pdf"
-        ))
-        .expect("read fixture");
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/2605.08070v1.pdf"))
+            .expect("read fixture");
         let result = convert_pdf_to_markdown(&bytes, &ConvertOptions::default()).unwrap();
         assert!(result.markdown.ends_with('\n'));
     }

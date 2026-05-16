@@ -291,7 +291,10 @@ mod tests {
     #[test]
     fn font_encoding_dictionary_with_differences() {
         let doc = build_doc(&[
-            (4, "<</Type/Font/Subtype/Type1/BaseFont/Helv/Encoding 5 0 R>>"),
+            (
+                4,
+                "<</Type/Font/Subtype/Type1/BaseFont/Helv/Encoding 5 0 R>>",
+            ),
             (
                 5,
                 "<</Type/Encoding/BaseEncoding/MacRomanEncoding/Differences [65 /Aacute /Bcaron]>>",
@@ -299,8 +302,14 @@ mod tests {
         ]);
         let font = PdfFont::from_object(&doc, ObjectId(4, 0));
         assert!(matches!(font.encoding, BaseEncoding::MacRoman));
-        assert_eq!(font.differences.get(&65).map(String::as_str), Some("Aacute"));
-        assert_eq!(font.differences.get(&66).map(String::as_str), Some("Bcaron"));
+        assert_eq!(
+            font.differences.get(&65).map(String::as_str),
+            Some("Aacute")
+        );
+        assert_eq!(
+            font.differences.get(&66).map(String::as_str),
+            Some("Bcaron")
+        );
     }
 
     #[test]

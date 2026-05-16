@@ -590,7 +590,15 @@ mod tests {
         // exercise the long match arms in the source.
         let winansi = names_for(BaseEncoding::WinAnsi);
         let macroman = names_for(BaseEncoding::MacRoman);
-        assert!(winansi.len() > 200, "winansi only has {} entries", winansi.len());
-        assert!(macroman.len() > 200, "macroman only has {} entries", macroman.len());
+        assert!(
+            winansi.len() > 200,
+            "winansi only has {} entries",
+            winansi.len()
+        );
+        assert!(
+            macroman.len() > 200,
+            "macroman only has {} entries",
+            macroman.len()
+        );
     }
 }

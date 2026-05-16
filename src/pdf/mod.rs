@@ -801,8 +801,7 @@ endobj
     }
 
     fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-        (0..=hay.len().saturating_sub(needle.len()))
-            .find(|&i| &hay[i..i + needle.len()] == needle)
+        (0..=hay.len().saturating_sub(needle.len())).find(|&i| &hay[i..i + needle.len()] == needle)
     }
 
     #[test]
@@ -937,14 +936,26 @@ endobj
         // Short alias `Fl`.
         assert_eq!(apply_filter(b"Fl", &zlib, &empty).unwrap(), b"hi");
         // ASCIIHex + short alias.
-        assert_eq!(apply_filter(b"ASCIIHexDecode", b"4869>", &empty).unwrap(), b"Hi");
+        assert_eq!(
+            apply_filter(b"ASCIIHexDecode", b"4869>", &empty).unwrap(),
+            b"Hi"
+        );
         assert_eq!(apply_filter(b"AHx", b"4869>", &empty).unwrap(), b"Hi");
         // ASCII85 + short alias.
         let a85 = b"87cURD_*#TDfTZ)+T~>";
-        assert_eq!(apply_filter(b"ASCII85Decode", a85, &empty).unwrap(), b"Hello, world!");
+        assert_eq!(
+            apply_filter(b"ASCII85Decode", a85, &empty).unwrap(),
+            b"Hello, world!"
+        );
         assert_eq!(apply_filter(b"A85", a85, &empty).unwrap(), b"Hello, world!");
         // Pass-through filters return data unchanged.
-        for name in [b"DCTDecode".as_slice(), b"DCT", b"JPXDecode", b"CCITTFaxDecode", b"CCF"] {
+        for name in [
+            b"DCTDecode".as_slice(),
+            b"DCT",
+            b"JPXDecode",
+            b"CCITTFaxDecode",
+            b"CCF",
+        ] {
             assert_eq!(apply_filter(name, b"abc", &empty).unwrap(), b"abc");
         }
         // Unsupported filter errors.
@@ -1239,10 +1250,10 @@ endobj
     #[test]
     fn read_xref_stream_recognises_every_entry_kind() {
         let entries = &[
-            (0u8, 0u64, 0u32),    // free
-            (1u8, 100u64, 0u32),  // uncompressed at offset 100
-            (2u8, 99u64, 3u32),   // compressed: lives in objstm 99, idx 3
-            (5u8, 0u64, 0u32),    // unknown kind — silently skipped
+            (0u8, 0u64, 0u32),   // free
+            (1u8, 100u64, 0u32), // uncompressed at offset 100
+            (2u8, 99u64, 3u32),  // compressed: lives in objstm 99, idx 3
+            (5u8, 0u64, 0u32),   // unknown kind — silently skipped
         ];
         let bytes = xref_stream_pdf(entries, "");
         let mut out = BTreeMap::new();
@@ -1255,7 +1266,10 @@ endobj
         ));
         assert!(matches!(
             out.get(&ObjectId(2, 0)).unwrap(),
-            XrefEntry::Compressed { stream_obj: 99, index: 3 }
+            XrefEntry::Compressed {
+                stream_obj: 99,
+                index: 3
+            }
         ));
         assert!(!out.contains_key(&ObjectId(3, 0)));
     }
@@ -1287,8 +1301,7 @@ endobj
 
     #[test]
     fn read_xref_stream_errors_on_bad_w_length() {
-        let body =
-            b"1 0 obj <</Type/XRef/Size 1/W [1 2]/Length 0>>\nstream\n\nendstream endobj\n";
+        let body = b"1 0 obj <</Type/XRef/Size 1/W [1 2]/Length 0>>\nstream\n\nendstream endobj\n";
         let mut out = BTreeMap::new();
         assert!(read_xref_stream(body, 0, &mut out).is_err());
     }
@@ -1347,7 +1360,9 @@ endobj
         let off2 = body.len();
         body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
         let off3 = body.len();
-        body.push_str("3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n");
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
+        );
         let xref_offset = body.len();
         // Build the 5-entry payload (free + obj 1..=4). Field widths 1/2/1.
         let mut payload: Vec<u8> = Vec::new();
@@ -1418,7 +1433,10 @@ endobj
         let mut objs = HashMap::new();
         objs.insert(ObjectId(1, 0), Object::Reference(ObjectId(2, 0)));
         objs.insert(ObjectId(2, 0), Object::Reference(ObjectId(1, 0)));
-        let doc = Document { objects: objs, pages: vec![] };
+        let doc = Document {
+            objects: objs,
+            pages: vec![],
+        };
         let start = Object::Reference(ObjectId(1, 0));
         let end = doc.deref(&start);
         // We don't care which one we land on — just that we terminate.

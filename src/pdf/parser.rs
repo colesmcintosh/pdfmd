@@ -640,12 +640,12 @@ mod tests {
             (b"(\\\\)", b"\\"),
             (b"(\\()", b"("),
             (b"(\\))", b")"),
-            (b"(a\\\nb)", b"ab"),     // line continuation
-            (b"(a\\\r\nb)", b"ab"),   // CRLF continuation
-            (b"(a\\\rb)", b"ab"),     // CR continuation
-            (b"(\\101)", b"A"),       // octal escape
-            (b"(\\7)", b"\x07"),      // single-digit octal
-            (b"(\\z)", b"z"),         // unknown escape echoes the char
+            (b"(a\\\nb)", b"ab"),   // line continuation
+            (b"(a\\\r\nb)", b"ab"), // CRLF continuation
+            (b"(a\\\rb)", b"ab"),   // CR continuation
+            (b"(\\101)", b"A"),     // octal escape
+            (b"(\\7)", b"\x07"),    // single-digit octal
+            (b"(\\z)", b"z"),       // unknown escape echoes the char
         ];
         for (input, expected) in cases {
             match parse(input) {
