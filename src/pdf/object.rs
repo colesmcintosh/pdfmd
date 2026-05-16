@@ -6,13 +6,10 @@ pub struct ObjectId(pub u32, pub u16);
 #[derive(Debug, Clone)]
 pub enum Object {
     Null,
-    // Boolean and String are parsed for completeness; the text extractor
-    // doesn't read them but a corrupt dict with such a value should still
-    // round-trip rather than fail.
-    Boolean(#[allow(dead_code)] bool),
+    Boolean(bool),
     Integer(i64),
     Real(f32),
-    String(#[allow(dead_code)] Vec<u8>),
+    String(Vec<u8>),
     Name(Vec<u8>),
     Array(Vec<Object>),
     Dictionary(Dictionary),
@@ -65,6 +62,38 @@ impl Object {
         } else {
             None
         }
+    }
+    // These accessors round out the variants — they're only consumed by
+    // the test suite today, but keeping them on the public surface lets
+    // future callers extract any Object kind without reaching inside the
+    // enum.
+    #[allow(dead_code)]
+    pub fn as_string(&self) -> Option<&[u8]> {
+        if let Object::String(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+    #[allow(dead_code)]
+    pub fn as_real(&self) -> Option<f32> {
+        match self {
+            Object::Real(r) => Some(*r),
+            Object::Integer(i) => Some(*i as f32),
+            _ => None,
+        }
+    }
+    #[allow(dead_code)]
+    pub fn as_boolean(&self) -> Option<bool> {
+        if let Object::Boolean(b) = self {
+            Some(*b)
+        } else {
+            None
+        }
+    }
+    #[allow(dead_code)]
+    pub fn is_null(&self) -> bool {
+        matches!(self, Object::Null)
     }
 }
 
@@ -134,6 +163,9 @@ mod tests {
             let expect_int_or_real = matches!(obj, Object::Integer(_) | Object::Real(_));
             let expect_stream = matches!(obj, Object::Stream(_));
             let expect_ref = matches!(obj, Object::Reference(_));
+            let expect_string = matches!(obj, Object::String(_));
+            let expect_real_like = matches!(obj, Object::Integer(_) | Object::Real(_));
+            let expect_bool = matches!(obj, Object::Boolean(_));
             assert_eq!(obj.as_dict().is_some(), expect_dict);
             assert_eq!(obj.as_array().is_some(), expect_array);
             assert_eq!(obj.as_name().is_some(), expect_name);
@@ -141,6 +173,10 @@ mod tests {
             assert_eq!(obj.as_integer().is_some(), expect_int_or_real);
             assert_eq!(obj.as_stream().is_some(), expect_stream);
             assert_eq!(obj.as_reference().is_some(), expect_ref);
+            assert_eq!(obj.as_string().is_some(), expect_string);
+            assert_eq!(obj.as_real().is_some(), expect_real_like);
+            assert_eq!(obj.as_boolean().is_some(), expect_bool);
+            assert_eq!(obj.is_null(), matches!(obj, Object::Null));
         }
     }
 

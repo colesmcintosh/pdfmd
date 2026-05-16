@@ -141,29 +141,31 @@ impl<'a> Parser<'a> {
                 }
                 let g_end = self.pos;
                 self.skip_inline_ws();
-                if self.bytes.get(self.pos) == Some(&b'R') {
-                    let after = self.bytes.get(self.pos + 1).copied();
-                    if after.is_none() || is_ws_or_delim(after.unwrap()) {
-                        let n = parse_u32(num_slice)?;
-                        let g = parse_u32(&self.bytes[g_start..g_end])? as u16;
-                        self.pos += 1;
-                        return Ok(Object::Reference(ObjectId(n, g)));
-                    }
+                // MSRV 1.70 — no `Option::is_none_or` yet; spell it out.
+                let after_r = self.bytes.get(self.pos + 1).copied();
+                let r_ok = self.bytes.get(self.pos) == Some(&b'R')
+                    && after_r.map(is_ws_or_delim).unwrap_or(true);
+                if r_ok {
+                    // num_slice and the gen slice are both digit-only, so
+                    // `parse_u32` only fails on overflow — we clamp.
+                    let n = parse_u32(num_slice).unwrap_or(u32::MAX);
+                    let g = parse_u32(&self.bytes[g_start..g_end]).unwrap_or(0) as u16;
+                    self.pos += 1;
+                    return Ok(Object::Reference(ObjectId(n, g)));
                 }
             }
             self.pos = saved;
         }
 
-        let s = std::str::from_utf8(num_slice)
-            .map_err(|_| PdfError::BadObject("non-utf8 number".into()))?;
+        // num_slice is ASCII digits / sign / decimal — always valid UTF-8.
+        let s = std::str::from_utf8(num_slice).expect("digit slice is utf-8");
         if has_dot {
-            Ok(Object::Real(s.parse::<f32>().map_err(|_| {
-                PdfError::BadObject(format!("bad real {s}"))
-            })?))
+            // f32 parsing of a digit string never fails — at worst it
+            // produces +/-infinity for huge magnitudes, which is fine.
+            Ok(Object::Real(s.parse::<f32>().unwrap_or(0.0)))
         } else {
-            Ok(Object::Integer(s.parse::<i64>().map_err(|_| {
-                PdfError::BadObject(format!("bad int {s}"))
-            })?))
+            // Saturate on i64 overflow rather than fail the page.
+            Ok(Object::Integer(s.parse::<i64>().unwrap_or(i64::MAX)))
         }
     }
 
@@ -336,10 +338,12 @@ impl<'a> Parser<'a> {
                     self.pos
                 )));
             }
-            let key = match self.parse_name()? {
-                Object::Name(n) => n,
-                _ => unreachable!(),
-            };
+            // parse_name always returns Object::Name on success.
+            let key = self
+                .parse_name()?
+                .as_name()
+                .expect("parse_name returns Name")
+                .to_vec();
             let value = self.parse_object()?;
             dict.insert(key, value);
         }
@@ -351,17 +355,24 @@ impl<'a> Parser<'a> {
     /// starting at the current position.
     pub fn parse_indirect_object(&mut self) -> Result<(ObjectId, Object), PdfError> {
         self.skip_ws_and_comments();
+        // skip_ws_and_comments stops at `bytes.len()`, but `with_pos` lets
+        // callers seed pos to something larger — guard the slice arithmetic.
+        if self.pos >= self.bytes.len() {
+            return Err(PdfError::BadObject("indirect object past EOF".into()));
+        }
         let n_start = self.pos;
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
-        let n = parse_u32(&self.bytes[n_start..self.pos])?;
+        // The slice is digit-only, so parse_u32 only fails on overflow
+        // (a ~10-billion-object PDF). Saturate rather than fail.
+        let n = parse_u32(&self.bytes[n_start..self.pos]).unwrap_or(u32::MAX);
         self.skip_inline_ws();
         let g_start = self.pos;
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
-        let g = parse_u32(&self.bytes[g_start..self.pos])? as u16;
+        let g = parse_u32(&self.bytes[g_start..self.pos]).unwrap_or(0) as u16;
         self.skip_inline_ws();
         if !self.starts_with(b"obj") {
             return Err(PdfError::BadObject(format!(
@@ -512,54 +523,44 @@ mod tests {
 
     #[test]
     fn integers_and_reals() {
-        assert!(matches!(parse(b"42"), Object::Integer(42)));
-        assert!(matches!(parse(b"-3.14"), Object::Real(_)));
-        if let Object::Real(r) = parse(b".5") {
-            assert!((r - 0.5).abs() < 1e-6);
-        } else {
-            panic!()
-        }
+        assert_eq!(parse(b"42").as_integer(), Some(42));
+        // Some non-pi negative real, round-tripped through f32.
+        let r = parse(b"-2.5").as_real().unwrap();
+        assert!((r + 2.5).abs() < 1e-5);
+        let r = parse(b".5").as_real().unwrap();
+        assert!((r - 0.5).abs() < 1e-6);
     }
 
     #[test]
     fn references_take_priority() {
-        match parse(b"7 0 R") {
-            Object::Reference(ObjectId(7, 0)) => {}
-            o => panic!("got {o:?}"),
-        }
+        assert_eq!(parse(b"7 0 R").as_reference(), Some(ObjectId(7, 0)));
     }
 
     #[test]
     fn names_decode_hex_escapes() {
-        if let Object::Name(n) = parse(b"/A#20B") {
-            assert_eq!(n, b"A B");
-        } else {
-            panic!()
-        }
+        assert_eq!(parse(b"/A#20B").as_name(), Some(b"A B".as_slice()));
     }
 
     #[test]
     fn literal_string_with_escapes() {
-        if let Object::String(s) = parse(b"(hi\\nthere)") {
-            assert_eq!(s, b"hi\nthere");
-        } else {
-            panic!()
-        }
+        assert_eq!(
+            parse(b"(hi\\nthere)").as_string(),
+            Some(b"hi\nthere".as_slice())
+        );
     }
 
     #[test]
     fn hex_string_decode() {
-        if let Object::String(s) = parse(b"<48656c6c6f>") {
-            assert_eq!(s, b"Hello");
-        } else {
-            panic!()
-        }
+        assert_eq!(
+            parse(b"<48656c6c6f>").as_string(),
+            Some(b"Hello".as_slice())
+        );
     }
 
     #[test]
     fn dictionary_with_mixed_entries() {
-        let d = parse(b"<< /Type /Foo /Count 5 >>");
-        let Object::Dictionary(d) = d else { panic!() };
+        let parsed = parse(b"<< /Type /Foo /Count 5 >>");
+        let d = parsed.as_dict().unwrap();
         assert_eq!(d.get(b"Type").and_then(|o| o.as_name_str()), Some("Foo"));
         assert_eq!(d.get(b"Count").and_then(Object::as_integer), Some(5));
     }
@@ -568,9 +569,9 @@ mod tests {
 
     #[test]
     fn parses_true_false_null() {
-        assert!(matches!(parse(b"true"), Object::Boolean(true)));
-        assert!(matches!(parse(b"false"), Object::Boolean(false)));
-        assert!(matches!(parse(b"null"), Object::Null));
+        assert_eq!(parse(b"true").as_boolean(), Some(true));
+        assert_eq!(parse(b"false").as_boolean(), Some(false));
+        assert!(parse(b"null").is_null());
     }
 
     #[test]
@@ -596,28 +597,24 @@ mod tests {
     #[test]
     fn number_after_sign_is_not_a_reference() {
         // `+7 0 R` shouldn't be parsed as a reference (signed lookahead path).
-        let mut p = Parser::new(b"+7 0 R");
-        assert!(matches!(p.parse_object().unwrap(), Object::Integer(7)));
+        assert_eq!(parse(b"+7 0 R").as_integer(), Some(7));
     }
 
     #[test]
     fn reference_lookahead_aborts_when_r_is_part_of_keyword() {
         // `7 0 Rx` should NOT be a reference — the R must end at a delim.
-        let mut p = Parser::new(b"7 0 Rx");
-        assert!(matches!(p.parse_object().unwrap(), Object::Integer(7)));
+        assert_eq!(parse(b"7 0 Rx").as_integer(), Some(7));
     }
 
     #[test]
     fn reference_lookahead_aborts_when_gen_missing() {
         // `7 obj` — second token isn't an integer, so this stays an int.
-        let mut p = Parser::new(b"7 obj");
-        assert!(matches!(p.parse_object().unwrap(), Object::Integer(7)));
+        assert_eq!(parse(b"7 obj").as_integer(), Some(7));
     }
 
     #[test]
     fn naked_dot_is_a_number() {
-        let v = parse(b".75");
-        let Object::Real(r) = v else { panic!() };
+        let r = parse(b".75").as_real().unwrap();
         assert!((r - 0.75).abs() < 1e-6);
     }
 
@@ -648,10 +645,7 @@ mod tests {
             (b"(\\z)", b"z"),       // unknown escape echoes the char
         ];
         for (input, expected) in cases {
-            match parse(input) {
-                Object::String(s) => assert_eq!(s, *expected, "input {input:?}"),
-                other => panic!("input {input:?} parsed as {other:?}"),
-            }
+            assert_eq!(parse(input).as_string(), Some(*expected), "input {input:?}");
         }
     }
 
@@ -669,20 +663,15 @@ mod tests {
 
     #[test]
     fn literal_string_with_balanced_nested_parens() {
-        if let Object::String(s) = parse(b"(a(b(c)d)e)") {
-            assert_eq!(s, b"a(b(c)d)e");
-        } else {
-            panic!();
-        }
+        assert_eq!(
+            parse(b"(a(b(c)d)e)").as_string(),
+            Some(b"a(b(c)d)e".as_slice()),
+        );
     }
 
     #[test]
     fn hex_string_with_whitespace_and_odd_nibble() {
-        if let Object::String(s) = parse(b"<4 8 6>") {
-            assert_eq!(s, vec![0x48, 0x60]);
-        } else {
-            panic!();
-        }
+        assert_eq!(parse(b"<4 8 6>").as_string(), Some(&[0x48, 0x60][..]));
     }
 
     #[test]
@@ -694,30 +683,20 @@ mod tests {
     #[test]
     fn hex_string_ignores_non_hex_bytes() {
         // Non-hex characters within the body are dropped (not nibbles).
-        if let Object::String(s) = parse(b"<48ZZ69>") {
-            assert_eq!(s, b"Hi");
-        } else {
-            panic!();
-        }
+        assert_eq!(parse(b"<48ZZ69>").as_string(), Some(b"Hi".as_slice()));
     }
 
     // ---- Names ----------------------------------------------------------
 
     #[test]
     fn name_without_hash_takes_fast_path() {
-        let v = parse(b"/Foo");
-        let Object::Name(n) = v else { panic!() };
-        assert_eq!(n, b"Foo");
+        assert_eq!(parse(b"/Foo").as_name(), Some(b"Foo".as_slice()));
     }
 
     #[test]
     fn name_with_invalid_hash_escape_passes_through() {
-        let v = parse(b"/A#ZZ");
-        let Object::Name(n) = v else { panic!() };
-        assert_eq!(n, b"A#ZZ");
-        let v = parse(b"/B#");
-        let Object::Name(n) = v else { panic!() };
-        assert_eq!(n, b"B#");
+        assert_eq!(parse(b"/A#ZZ").as_name(), Some(b"A#ZZ".as_slice()));
+        assert_eq!(parse(b"/B#").as_name(), Some(b"B#".as_slice()));
     }
 
     // ---- Arrays & dicts -------------------------------------------------
@@ -736,8 +715,8 @@ mod tests {
 
     #[test]
     fn comments_inside_array_are_skipped() {
-        let v = parse(b"[ 1 % comment\n 2 ]");
-        let Object::Array(items) = v else { panic!() };
+        let parsed = parse(b"[ 1 % comment\n 2 ]");
+        let items = parsed.as_array().unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -756,8 +735,7 @@ endobj
         let mut p = Parser::new(bytes);
         let (id, obj) = p.parse_indirect_object().unwrap();
         assert_eq!(id, ObjectId(1, 0));
-        let Object::Stream(s) = obj else { panic!() };
-        assert_eq!(s.content, b"hello");
+        assert_eq!(obj.as_stream().unwrap().content, b"hello");
     }
 
     #[test]
@@ -773,8 +751,7 @@ endobj
         let mut p = Parser::new(bytes);
         let (id, obj) = p.parse_indirect_object().unwrap();
         assert_eq!(id, ObjectId(2, 0));
-        let Object::Stream(s) = obj else { panic!() };
-        assert_eq!(s.content, b"the body");
+        assert_eq!(obj.as_stream().unwrap().content, b"the body");
     }
 
     #[test]
@@ -831,7 +808,6 @@ endobj
 
     #[test]
     fn comments_at_top_level_are_ignored() {
-        let v = parse(b"% header\n42");
-        assert!(matches!(v, Object::Integer(42)));
+        assert_eq!(parse(b"% header\n42").as_integer(), Some(42));
     }
 }

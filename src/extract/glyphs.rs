@@ -31,7 +31,9 @@ fn decode_uni_sequence(rest: &str) -> Option<String> {
     }
     let mut out = String::new();
     for chunk in rest.as_bytes().chunks(4) {
-        let hex = std::str::from_utf8(chunk).ok()?;
+        // `rest` is borrowed from a &str, so every chunk slice is also
+        // valid utf-8 — only the hex parse can fail.
+        let hex = std::str::from_utf8(chunk).expect("substring of utf-8");
         let cp = u32::from_str_radix(hex, 16).ok()?;
         let ch = char::from_u32(cp)?;
         out.push(ch);

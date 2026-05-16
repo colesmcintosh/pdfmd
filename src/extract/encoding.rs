@@ -533,22 +533,16 @@ mod tests {
 
     #[test]
     fn from_name_dispatch_covers_each_variant() {
-        assert!(matches!(
-            BaseEncoding::from_name("WinAnsiEncoding"),
-            BaseEncoding::WinAnsi
-        ));
-        assert!(matches!(
-            BaseEncoding::from_name("MacRomanEncoding"),
-            BaseEncoding::MacRoman
-        ));
-        assert!(matches!(
-            BaseEncoding::from_name("SymbolEncoding"),
-            BaseEncoding::Symbol
-        ));
-        assert!(matches!(
-            BaseEncoding::from_name("MacExpertEncoding"),
-            BaseEncoding::Standard
-        ));
+        // BaseEncoding derives Debug, so comparing through the Display of
+        // the Debug repr avoids the `matches!`-introduced dead arm.
+        for (name, expected) in [
+            ("WinAnsiEncoding", "WinAnsi"),
+            ("MacRomanEncoding", "MacRoman"),
+            ("SymbolEncoding", "Symbol"),
+            ("MacExpertEncoding", "Standard"),
+        ] {
+            assert_eq!(format!("{:?}", BaseEncoding::from_name(name)), expected);
+        }
     }
 
     #[test]

@@ -282,4 +282,45 @@ mod tests {
         let line = "This is a very long sentence that should clearly remain a paragraph and never be misinterpreted as a heading regardless of capitalization rules.";
         assert!(heading_level(line).is_none());
     }
+
+    #[test]
+    fn match_numbered_heading_requires_digit_prefix() {
+        assert!(match_numbered_heading("Intro 1").is_none());
+        // "1" with no trailing whitespace also returns None.
+        assert!(match_numbered_heading("1.").is_none());
+    }
+
+    #[test]
+    fn match_bullet_rejects_non_bullet_and_missing_space() {
+        // Empty line — chars.next() yields None.
+        assert!(match_bullet("").is_none());
+        // Non-bullet first char.
+        assert!(match_bullet("alpha").is_none());
+        // Bullet without following whitespace.
+        assert!(match_bullet("-foo").is_none());
+    }
+
+    #[test]
+    fn match_ordered_list_rejects_non_digit_prefix() {
+        // First char isn't a digit.
+        assert!(match_ordered_list("alpha. one").is_none());
+        // No `.` or `)` after the digits.
+        assert!(match_ordered_list("12 alpha").is_none());
+        // No trailing whitespace after `.`.
+        assert!(match_ordered_list("12.alpha").is_none());
+    }
+
+    #[test]
+    fn format_list_item_returns_input_for_non_matching_lines() {
+        // is_list_item won't actually call format_list_item with such a
+        // line, but the helper still has the defensive fallthrough — hit
+        // it directly.
+        assert_eq!(format_list_item("nope"), "nope");
+    }
+
+    #[test]
+    fn empty_blocks_produce_no_markdown() {
+        // A page containing only blank lines collapses to empty output.
+        assert_eq!(format_page("\n\n"), "");
+    }
 }

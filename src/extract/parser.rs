@@ -431,11 +431,7 @@ mod tests {
     #[test]
     fn hex_strings_decode_to_bytes() {
         // <48656C6C6F> is "Hello" in ASCII hex.
-        let mut p = Parser::new(b"<48656C6C6F> Tj");
-        match p.next_token() {
-            Token::Str(s) => assert_eq!(&*s, b"Hello"),
-            t => panic!("expected Str, got {t:?}"),
-        }
+        assert_eq!(ops(b"<48656C6C6F> Tj"), ["str:Hello", "op:Tj"]);
     }
 
     #[test]
@@ -445,20 +441,12 @@ mod tests {
 
     #[test]
     fn escape_sequences_in_literal_string() {
-        let mut p = Parser::new(b"(line1\\nline2) Tj");
-        match p.next_token() {
-            Token::Str(s) => assert_eq!(&*s, b"line1\nline2"),
-            t => panic!("expected Str, got {t:?}"),
-        }
+        assert_eq!(ops(b"(line1\\nline2) Tj"), ["str:line1\nline2", "op:Tj"]);
     }
 
     #[test]
     fn balanced_parens_inside_literal() {
-        let mut p = Parser::new(b"((nested)) Tj");
-        match p.next_token() {
-            Token::Str(s) => assert_eq!(&*s, b"(nested)"),
-            t => panic!("expected Str, got {t:?}"),
-        }
+        assert_eq!(ops(b"((nested)) Tj"), ["str:(nested)", "op:Tj"]);
     }
 
     #[test]
@@ -511,33 +499,19 @@ mod tests {
     #[test]
     fn hex_string_handles_odd_nibble() {
         // Odd hex string padded with zero — also covers the `if get == >` branch.
-        let mut p = Parser::new(b"<4> Tj");
-        if let Token::Str(s) = p.next_token() {
-            assert_eq!(&*s, &[0x40]);
-        } else {
-            panic!();
-        }
+        // ops() formats the byte through utf8-or-`?`, so 0x40 ('@') round-trips.
+        assert_eq!(ops(b"<4> Tj"), ["str:@", "op:Tj"]);
     }
 
     #[test]
     fn hex_string_skips_non_hex_bytes() {
-        let mut p = Parser::new(b"<48 6 9>");
-        if let Token::Str(s) = p.next_token() {
-            assert_eq!(&*s, b"Hi");
-        } else {
-            panic!();
-        }
+        assert_eq!(ops(b"<48 6 9>"), ["str:Hi"]);
     }
 
     #[test]
     fn hex_string_without_closing_angle() {
-        let mut p = Parser::new(b"<48");
         // Tokenizer doesn't fail — it returns what it has and EOFs next.
-        if let Token::Str(s) = p.next_token() {
-            assert_eq!(&*s, b"H");
-        } else {
-            panic!();
-        }
+        assert_eq!(ops(b"<48"), ["str:H"]);
     }
 
     #[test]
@@ -586,27 +560,27 @@ mod tests {
 
     #[test]
     fn skip_inline_image_jumps_past_data() {
-        // BI dict ID <raw...> EI body
+        // BI dict ID <raw...> EI body — drain tokens up to the `ID`
+        // operator using ops(), then exercise skip_inline_image on what's
+        // left.
         let stream = b"BI /W 1 /H 1 ID \x00\x01\x02\nEI 99 Tj";
         let mut p = Parser::new(stream);
-        // Walk through BI and its dict tokens until ID.
-        loop {
-            match p.next_token() {
-                Token::Op(op) if op == b"ID" => break,
-                Token::Eof => panic!("hit EOF before ID"),
-                _ => {}
+        // Drain through the `ID` op without leaving an unreachable match arm.
+        let mut hit_id = false;
+        for _ in 0..16 {
+            let tok = p.next_token();
+            let tag = describe(&tok);
+            if tag == "op:ID" {
+                hit_id = true;
+                break;
             }
+            assert_ne!(tag, "eof", "ran off the end before reaching ID");
         }
+        assert!(hit_id);
         p.skip_inline_image();
-        // Next two tokens should be the post-EI content.
-        match p.next_token() {
-            Token::Num(n) => assert_eq!(n, 99.0),
-            t => panic!("expected Num, got {t:?}"),
-        }
-        match p.next_token() {
-            Token::Op(op) => assert_eq!(op, b"Tj"),
-            t => panic!("expected Op, got {t:?}"),
-        }
+        // Post-EI we should see `99 Tj` from the rest of the stream.
+        let remaining: Vec<String> = (0..2).map(|_| describe(&p.next_token())).collect();
+        assert_eq!(remaining, ["num:99", "op:Tj"]);
     }
 
     #[test]
@@ -614,6 +588,18 @@ mod tests {
         // No `EI` sequence in the body → skip_inline_image runs off the end.
         let mut p = Parser::new(b"image-bytes-without-the-end-marker");
         p.skip_inline_image();
-        assert!(matches!(p.next_token(), Token::Eof));
+        assert_eq!(describe(&p.next_token()), "eof");
+    }
+
+    fn describe(tok: &Token<'_>) -> String {
+        match tok {
+            Token::Eof => "eof".into(),
+            Token::Op(b) => format!("op:{}", std::str::from_utf8(b).unwrap_or("?")),
+            Token::Name(n) => format!("name:{}", std::str::from_utf8(n).unwrap_or("?")),
+            Token::Num(n) => format!("num:{n}"),
+            Token::Str(s) => format!("str:{}", std::str::from_utf8(s).unwrap_or("?")),
+            Token::ArrayStart => "[".into(),
+            Token::ArrayEnd => "]".into(),
+        }
     }
 }

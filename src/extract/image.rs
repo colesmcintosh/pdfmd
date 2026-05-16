@@ -36,8 +36,8 @@ pub fn page_xobject_refs(doc: &Document, resources: &Dictionary) -> HashMap<Vec<
         return out;
     };
     for (name, obj) in xobj_dict.iter() {
-        if let Object::Reference(id) = obj {
-            out.insert(name.to_vec(), *id);
+        if let Some(id) = obj.as_reference() {
+            out.insert(name.to_vec(), id);
         }
     }
     out
@@ -201,5 +201,36 @@ mod tests {
     fn extract_image_returns_none_for_missing_object() {
         let doc = build_doc(&[]);
         assert!(extract_image(&doc, ObjectId(99, 0)).is_none());
+    }
+
+    #[test]
+    fn extract_image_returns_none_when_object_is_not_a_stream() {
+        // Object exists but is a plain dictionary, not a stream.
+        let doc = build_doc(&[(7, "<</Subtype/Image>>")]);
+        assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
+    }
+
+    #[test]
+    fn extract_image_returns_none_without_subtype() {
+        // Stream object missing /Subtype — second `?` chain bails.
+        let doc = build_doc(&[(7, "<</Filter/DCTDecode/Length 0>>\nstream\n\nendstream")]);
+        assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
+    }
+
+    #[test]
+    fn extract_image_returns_none_without_filter() {
+        // Image XObject with no /Filter — the pass-through path requires one.
+        let doc = build_doc(&[(7, "<</Subtype/Image/Length 0>>\nstream\n\nendstream")]);
+        assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
+    }
+
+    #[test]
+    fn extract_image_returns_none_when_filter_array_first_is_not_name() {
+        // /Filter is a single-element array but the element isn't a Name.
+        let doc = build_doc(&[(
+            7,
+            "<</Subtype/Image/Filter [42]/Length 0>>\nstream\n\nendstream",
+        )]);
+        assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
     }
 }

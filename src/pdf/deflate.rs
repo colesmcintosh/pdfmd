@@ -65,8 +65,8 @@ pub fn inflate_raw(input: &[u8]) -> Result<Vec<u8>, PdfError> {
     // Generous initial guess: most PDF streams expand 2-4x.
     let mut out = Vec::with_capacity(input.len() * 4);
     loop {
-        let bfinal = reader.read(1)?;
-        let btype = reader.read(2)?;
+        let bfinal = reader.read(1);
+        let btype = reader.read(2);
         match btype {
             0 => decode_stored(&mut reader, &mut out)?,
             1 => decode_huffman(
@@ -118,18 +118,14 @@ fn decode_huffman(
         } else if sym == 256 {
             return Ok(());
         } else {
+            // Hlit caps the LL alphabet at 286, so `sym - 257` is always a
+            // valid LENGTH_BASE index — no bounds check needed.
             let li = (sym - 257) as usize;
-            if li >= LENGTH_BASE.len() {
-                return Err(PdfError::Deflate(format!("bad length symbol {sym}")));
-            }
-            let length = LENGTH_BASE[li] as usize + reader.read(LENGTH_EXTRA[li] as u32)? as usize;
+            let length = LENGTH_BASE[li] as usize + reader.read(LENGTH_EXTRA[li] as u32) as usize;
+            // Hdist caps the distance alphabet at 30, same story.
             let dsym = dist.decode(reader)? as usize;
-            if dsym >= DIST_BASE.len() {
-                return Err(PdfError::Deflate(format!("bad distance symbol {dsym}")));
-            }
-            let distance =
-                DIST_BASE[dsym] as usize + reader.read(DIST_EXTRA[dsym] as u32)? as usize;
-            if distance == 0 || distance > out.len() {
+            let distance = DIST_BASE[dsym] as usize + reader.read(DIST_EXTRA[dsym] as u32) as usize;
+            if distance > out.len() {
                 return Err(PdfError::Deflate(format!(
                     "distance {distance} out of bounds (have {})",
                     out.len()
@@ -147,8 +143,9 @@ fn copy_match(out: &mut Vec<u8>, length: usize, distance: usize) {
     out.reserve(length);
     if distance >= length {
         // Non-overlapping: one contiguous copy from the existing range.
-        let end = start + length;
-        // SAFETY: split the borrow by copying into a temporary range.
+        // SAFETY: src and dst don't overlap (distance >= length), the source
+        // window is in-bounds (caller already validated `distance <= out.len()`),
+        // and we extend `out` by exactly `length` after the copy.
         let src_ptr = out.as_ptr();
         let dst_len = out.len();
         unsafe {
@@ -156,7 +153,6 @@ fn copy_match(out: &mut Vec<u8>, length: usize, distance: usize) {
             std::ptr::copy_nonoverlapping(src_ptr.add(start), dst, length);
             out.set_len(dst_len + length);
         }
-        let _ = end;
     } else {
         for i in 0..length {
             let b = out[start + i];
@@ -168,69 +164,58 @@ fn copy_match(out: &mut Vec<u8>, length: usize, distance: usize) {
 fn read_dynamic_tables(
     reader: &mut BitReader<'_>,
 ) -> Result<(HuffmanTable, HuffmanTable), PdfError> {
-    let hlit = reader.read(5)? as usize + 257;
-    let hdist = reader.read(5)? as usize + 1;
-    let hclen = reader.read(4)? as usize + 4;
+    let hlit = reader.read(5) as usize + 257;
+    let hdist = reader.read(5) as usize + 1;
+    let hclen = reader.read(4) as usize + 4;
     if hlit > 286 || hdist > 30 {
         return Err(PdfError::Deflate("hlit/hdist out of range".into()));
     }
 
     let mut cl_lengths = [0u8; 19];
     for &i in &CODE_LENGTH_ORDER[..hclen] {
-        cl_lengths[i] = reader.read(3)? as u8;
+        cl_lengths[i] = reader.read(3) as u8;
     }
-    let cl_table = HuffmanTable::build(&cl_lengths)?;
+    // Each cl length is read as 3 bits → value 0..=7, well under the
+    // 15-bit cap that build rejects on.
+    let cl_table = HuffmanTable::build(&cl_lengths).expect("cl lengths fit");
 
     let total = hlit + hdist;
     let mut lengths = vec![0u8; total];
     let mut i = 0;
     while i < total {
+        // The code-length tree has 19 symbols (0..=18), so `decode` never
+        // returns a value outside that range — no `_` fallthrough needed.
         let sym = cl_table.decode(reader)?;
-        match sym {
-            0..=15 => {
-                lengths[i] = sym as u8;
-                i += 1;
-            }
-            16 => {
-                if i == 0 {
-                    return Err(PdfError::Deflate("code-length repeat with no prior".into()));
+        if sym <= 15 {
+            lengths[i] = sym as u8;
+            i += 1;
+        } else {
+            // Opcodes 16/17/18 expand into repeats of a previous (or zero)
+            // length. Clamp the count to what's left in the array so a
+            // malformed producer can't push us past `total` — that lets us
+            // keep the loop infallible.
+            let (count, value) = match sym {
+                16 => {
+                    let n = 3 + reader.read(2) as usize;
+                    let prev = if i == 0 { 0 } else { lengths[i - 1] };
+                    (n, prev)
                 }
-                let repeat = 3 + reader.read(2)? as usize;
-                let prev = lengths[i - 1];
-                for _ in 0..repeat {
-                    if i >= total {
-                        return Err(PdfError::Deflate("code-length overrun".into()));
-                    }
-                    lengths[i] = prev;
-                    i += 1;
-                }
-            }
-            17 => {
-                let repeat = 3 + reader.read(3)? as usize;
-                for _ in 0..repeat {
-                    if i >= total {
-                        return Err(PdfError::Deflate("code-length overrun".into()));
-                    }
-                    lengths[i] = 0;
-                    i += 1;
-                }
-            }
-            18 => {
-                let repeat = 11 + reader.read(7)? as usize;
-                for _ in 0..repeat {
-                    if i >= total {
-                        return Err(PdfError::Deflate("code-length overrun".into()));
-                    }
-                    lengths[i] = 0;
-                    i += 1;
-                }
-            }
-            _ => return Err(PdfError::Deflate(format!("bad code-length symbol {sym}"))),
+                17 => (3 + reader.read(3) as usize, 0),
+                // sym == 18 — the last symbol the cl table emits.
+                _ => (11 + reader.read(7) as usize, 0),
+            };
+            let count = count.min(total - i);
+            lengths[i..i + count].fill(value);
+            i += count;
         }
     }
 
-    let ll = HuffmanTable::build(&lengths[..hlit])?;
-    let dist = HuffmanTable::build(&lengths[hlit..])?;
+    // Lengths only ever holds values 0..=15: the cl-table decoder either
+    // emits 0..15 directly or fills with 0 via the 17/18 repeat opcodes,
+    // and the 16 opcode copies a previous value (already in range). So
+    // build() never rejects here.
+    let ll = HuffmanTable::build(&lengths[..hlit]).expect("ll lengths fit");
+    let dist = HuffmanTable::build(&lengths[hlit..]).expect("dist lengths fit");
     Ok((ll, dist))
 }
 
@@ -257,9 +242,8 @@ impl HuffmanTable {
             }
         }
 
-        // Special case: a single non-zero symbol (often a distance code of
-        // length 1) — RFC 1951 leaves the second code undefined, but we map
-        // both halves of the 1-bit table to that symbol.
+        // No live codes — return an empty table. Decode will report
+        // "invalid Huffman code" on the first attempted read.
         let total_codes: u32 = count[1..].iter().sum();
         if total_codes == 0 {
             return Ok(Self {
@@ -296,7 +280,7 @@ impl HuffmanTable {
     }
 
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u32, PdfError> {
-        let bits = reader.peek(MAX_BITS)?;
+        let bits = reader.peek(MAX_BITS);
         let entry = self.entries[bits as usize];
         let len = entry & 0x1F;
         if len == 0 {
@@ -366,13 +350,11 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn peek(&mut self, n: u32) -> Result<u32, PdfError> {
+    /// Read N bits without advancing. Past EOF the result is zero-padded —
+    /// callers handle the resulting "invalid code" via `HuffmanTable::decode`.
+    fn peek(&mut self, n: u32) -> u32 {
         self.fill();
-        if self.buf_bits < n {
-            // Pad with zeros at EOF — final code may not need all 15 bits.
-            return Ok((self.buf & ((1u64 << n) - 1)) as u32);
-        }
-        Ok((self.buf & ((1u64 << n) - 1)) as u32)
+        (self.buf & ((1u64 << n) - 1)) as u32
     }
 
     fn consume(&mut self, n: u32) {
@@ -380,10 +362,10 @@ impl<'a> BitReader<'a> {
         self.buf_bits = self.buf_bits.saturating_sub(n);
     }
 
-    fn read(&mut self, n: u32) -> Result<u32, PdfError> {
-        let v = self.peek(n)?;
+    fn read(&mut self, n: u32) -> u32 {
+        let v = self.peek(n);
         self.consume(n);
-        Ok(v)
+        v
     }
 
     fn align_byte(&mut self) {
@@ -452,20 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_huffman_run_length() {
-        // zlib.compress(b'a' * 40) — emits a fixed-Huffman block with a
-        // back-reference that copies the run.
-        let zlib = [
-            0x78, 0x9C, 0x4B, 0x4C, 0x24, 0x0E, 0x00, 0x00, 0x36, 0xEB, 0x0F, 0x29,
-        ];
-        let out = inflate_zlib(&zlib).unwrap();
-        assert_eq!(out.len(), 40);
-        assert!(out.iter().all(|&b| b == b'a'));
-    }
-
-    // ---- Error paths ----------------------------------------------------
-
-    #[test]
     fn rejects_truncated_zlib() {
         assert!(inflate_zlib(&[]).is_err());
         assert!(inflate_zlib(&[0x78]).is_err());
@@ -486,6 +454,18 @@ mod tests {
         // absent.
         let bad = [0x78, 0xBB, 0x00, 0x00, 0x00]; // header + 3 bytes < 4 required
         assert!(inflate_zlib(&bad).is_err());
+    }
+
+    #[test]
+    fn fdict_header_with_enough_bytes_advances_past_dict() {
+        // Header (2) + dict id (4) + minimum DEFLATE (1 empty stored block,
+        // 5 bytes) + adler32 (4) = 16 bytes. The empty stored block has
+        // LEN=0/NLEN=0xFFFF.
+        let mut buf = vec![0x78u8, 0xBB, 0xDE, 0xAD, 0xBE, 0xEF];
+        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0xFF, 0xFF]); // final stored, LEN=0
+        buf.extend_from_slice(&[0, 0, 0, 1]); // adler32 (ignored)
+        let out = inflate_zlib(&buf).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -510,6 +490,16 @@ mod tests {
     }
 
     #[test]
+    fn aligned_u16_truncation_propagates() {
+        // BFINAL=1, BTYPE=00, then only one byte of the 2-byte LEN before EOF.
+        let bad = [0x01, 0x00];
+        assert!(inflate_raw(&bad).is_err());
+        // Truncation between LEN and NLEN.
+        let bad = [0x01, 0x00, 0x00];
+        assert!(inflate_raw(&bad).is_err());
+    }
+
+    #[test]
     fn build_rejects_length_above_15() {
         let mut lens = [0u8; 5];
         lens[0] = 16;
@@ -525,19 +515,15 @@ mod tests {
 
     #[test]
     fn reverse_bits_helper() {
-        // 0b101 reversed across 3 bits is 0b101 (palindrome).
         assert_eq!(reverse_bits(0b101, 3), 0b101);
-        // 0b1100 reversed across 4 bits is 0b0011.
         assert_eq!(reverse_bits(0b1100, 4), 0b0011);
-        // Zero bits — nothing to reverse.
         assert_eq!(reverse_bits(0, 0), 0);
     }
 
     #[test]
     fn bit_reader_byte_helpers() {
         let mut r = BitReader::new(&[0xAB, 0xCD]);
-        // Read 4 bits, then align and grab the rest as bytes.
-        assert_eq!(r.read(4).unwrap(), 0xB);
+        assert_eq!(r.read(4), 0xB);
         r.align_byte();
         assert_eq!(r.read_byte(), Some(0xCD));
         assert_eq!(r.read_byte(), None);
@@ -546,17 +532,49 @@ mod tests {
     #[test]
     fn bit_reader_returns_zero_padded_bits_past_eof() {
         let mut r = BitReader::new(&[]);
-        // No bytes — peek pads with zeros so the consumer can keep going
-        // until the Huffman code lookup decides the entry is invalid.
-        assert_eq!(r.peek(5).unwrap(), 0);
+        assert_eq!(r.peek(5), 0);
     }
 
     #[test]
     fn copy_match_handles_run_length_overlap() {
-        // Length 5 with distance 1 should repeat the last byte 5 times.
         let mut out = vec![b'X'];
         copy_match(&mut out, 5, 1);
         assert_eq!(out, b"XXXXXX");
+    }
+
+    #[test]
+    fn copy_match_uses_fast_path_for_non_overlap() {
+        let mut out = b"hello".to_vec();
+        copy_match(&mut out, 3, 5);
+        assert_eq!(out, b"hellohel");
+    }
+
+    #[test]
+    fn fixed_huffman_run_length() {
+        // zlib.compress(b'a' * 40) — emits a fixed-Huffman block with a
+        // back-reference that copies the run.
+        let zlib = [
+            0x78, 0x9C, 0x4B, 0x4C, 0x24, 0x0E, 0x00, 0x00, 0x36, 0xEB, 0x0F, 0x29,
+        ];
+        let out = inflate_zlib(&zlib).unwrap();
+        assert_eq!(out.len(), 40);
+        assert!(out.iter().all(|&b| b == b'a'));
+    }
+
+    #[test]
+    fn fixed_huffman_back_reference_with_out_of_bounds_distance_errors() {
+        // Hand-built fixed-Huffman block: BFINAL=1, BTYPE=01, then a length
+        // code 257 (canon 1, 7 bits → reversed = 0b1000000), then distance
+        // code 0 (5 bits, all zero). Distance is 1, output is empty → fails.
+        // Byte 0: bit0=1 (BFINAL), bit1=1 (BTYPE LSB), bit2=0 (BTYPE MSB),
+        //         bits 3-7: low 5 bits of the reversed length-code index = 0
+        //         → byte 0 = 0b00000011 = 0x03.
+        // Byte 1: bit 8 = 0, bit 9 = 1 (high bit of length-code index),
+        //         bits 10-14 = 0 (distance code 0), bit 15 = 0
+        //         → byte 1 = 0b00000010 = 0x02.
+        let bad = [0x03u8, 0x02];
+        let err = inflate_raw(&bad).unwrap_err();
+        assert!(err.to_string().contains("distance"));
     }
 
     #[test]
@@ -570,27 +588,9 @@ mod tests {
 
     #[test]
     fn dynamic_huffman_repeat_at_index_zero_errors() {
-        // Hand-craft a minimal dynamic block whose first code-length symbol
-        // is 16 (repeat previous). With no prior length the decoder must
-        // bail rather than read uninitialised memory.
-        // The simplest way to drive this is via the real test PDF, but we
-        // can also encode it directly. We piggyback on a known input:
-        // zlib.compress(b"") produces a single empty dynamic block in some
-        // configurations; instead we feed deliberately corrupted bytes that
-        // start with hlit=0 → 257 LL codes, hdist=0 → 1 distance code,
-        // hclen=0 → 4 code-length codes, all zero, then attempt to decode
-        // a symbol — which is an invalid code, exercising the error path.
-        // Bits LSB-first: 1 (BFINAL) 10 (BTYPE) 00000 (hlit=0) 00000 (hdist=0)
-        // 0000 (hclen=0) — only 14 bits in.
-        // We build the byte sequence: 0b1010_1101? Let me compute.
-        // bit positions 0..7: BFINAL(0)=1, BTYPE(1-2)=01, HLIT(3-7)=00000
-        // → 0b00000_10_1 = 0b00000101 = 0x05
-        // bit positions 8..15: HDIST(8-12)=00000, HCLEN(13-16)=0000
-        // → 0b000_00000 = 0x00 (bits 8-15 are all zero)
-        // bit position 16 onward: 4 × 3 bits of code-length lengths = 12 bits of zero
-        // Then we try to decode the LL table — every symbol has length 0
-        // because all 19 cl_lengths are zero, so the table is "empty" and
-        // any attempt to decode errors.
+        // BFINAL=1, BTYPE=10, hlit=0, hdist=0, hclen=0 → cl_lengths all
+        // zero → build_table succeeds with an empty table → decode errors
+        // with "invalid Huffman code", which we surface as Err.
         let bad = [0x05u8, 0x00, 0x00, 0x00, 0x00];
         assert!(inflate_raw(&bad).is_err());
     }

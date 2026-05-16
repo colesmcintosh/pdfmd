@@ -285,7 +285,7 @@ mod tests {
             "<</Type/Font/Subtype/Type1/BaseFont/Helv/Encoding/WinAnsiEncoding>>",
         )]);
         let font = PdfFont::from_object(&doc, ObjectId(4, 0));
-        assert!(matches!(font.encoding, BaseEncoding::WinAnsi));
+        assert_eq!(format!("{:?}", font.encoding), "WinAnsi");
     }
 
     #[test]
@@ -301,7 +301,7 @@ mod tests {
             ),
         ]);
         let font = PdfFont::from_object(&doc, ObjectId(4, 0));
-        assert!(matches!(font.encoding, BaseEncoding::MacRoman));
+        assert_eq!(format!("{:?}", font.encoding), "MacRoman");
         assert_eq!(
             font.differences.get(&65).map(String::as_str),
             Some("Aacute")
@@ -386,6 +386,166 @@ mod tests {
         // So after Int 80 → code=80; Name (bad utf8) → no insert, code=81;
         // Name "R" → insert at 81.
         assert_eq!(map.get(&81).map(String::as_str), Some("R"));
+    }
+
+    #[test]
+    fn font_encoding_dict_without_differences_skips_parse() {
+        // /Encoding is a dict with BaseEncoding set but no /Differences —
+        // the parser should pick up the base and leave differences empty.
+        let doc = build_doc(&[
+            (4, "<</Type/Font/Subtype/Type1/Encoding 5 0 R>>"),
+            (5, "<</Type/Encoding/BaseEncoding/WinAnsiEncoding>>"),
+        ]);
+        let font = PdfFont::from_object(&doc, ObjectId(4, 0));
+        assert_eq!(format!("{:?}", font.encoding), "WinAnsi");
+        assert!(font.differences.is_empty());
+    }
+
+    #[test]
+    fn font_encoding_dict_without_base_just_picks_up_differences() {
+        // The dict has /Differences but no /BaseEncoding — base stays
+        // Standard, differences fill from the array.
+        let doc = build_doc(&[
+            (4, "<</Type/Font/Subtype/Type1/Encoding 5 0 R>>"),
+            (5, "<</Type/Encoding/Differences [65 /Aacute]>>"),
+        ]);
+        let font = PdfFont::from_object(&doc, ObjectId(4, 0));
+        assert_eq!(format!("{:?}", font.encoding), "Standard");
+        assert_eq!(
+            font.differences.get(&65).map(String::as_str),
+            Some("Aacute")
+        );
+    }
+
+    #[test]
+    fn decode_into_slow_path_with_to_unicode_lookup() {
+        // Build a composite font with a ToUnicode CMap. decode_into runs
+        // the slow path; each 2-byte code looks up via cmap.
+        // The ToUnicode stream is FlateDecoded with a tiny CMap. The
+        // codespacerange forces 2-byte source codes, and the bfchar maps
+        // <0001> → 'A'.
+        let payload = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n1 beginbfchar <0001> <0041> endbfchar\n";
+        let zlib = zlib_compress(payload);
+        let zlib_len = zlib.len();
+        let mut body = format!(
+            "%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+4 0 obj <</Type/Font/Subtype/Type0/Encoding/Identity-H/BaseFont/Foo/ToUnicode 5 0 R>> endobj
+5 0 obj <</Length {zlib_len}/Filter/FlateDecode>>
+stream
+"
+        );
+        let stream_start_in_body = body.len();
+        let mut bytes = body.clone().into_bytes();
+        bytes.extend_from_slice(&zlib);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        body.clear();
+        body.push_str(&String::from_utf8_lossy(&bytes));
+        // Build xref by hand (offsets relative to file start).
+        let xref_offset = bytes.len();
+        let _ = stream_start_in_body;
+        let needles: Vec<usize> = (1..=5)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                (0..=bytes.len() - needle.len())
+                    .find(|&i| bytes[i..i + needle.len()] == *needle.as_bytes())
+                    .unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for off in &needles {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer <</Size 6/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+        let doc = Document::load(&bytes).expect("load");
+        let font = PdfFont::from_object(&doc, ObjectId(4, 0));
+        // Composite font + ToUnicode (code_width 2) → slow path lookups.
+        assert_eq!(font.code_width, 2);
+        let mut out = String::new();
+        font.decode_into(&[0x00, 0x01], &mut out);
+        assert_eq!(out, "A");
+        // A code that's not in the CMap silently skips (composite path).
+        let mut out2 = String::new();
+        font.decode_into(&[0x00, 0x02], &mut out2);
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn decode_into_slow_path_byte_fallback_via_encoding_glyph() {
+        // Simple-font slow path: have a ToUnicode CMap with code_width 2
+        // (which forces the slow path even for a simple font), then feed a
+        // single byte that falls through every cmap/differences/encoding
+        // table and ultimately hits the `byte >= 0x20` fallback.
+        let payload = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n";
+        let zlib = zlib_compress(payload);
+        let zlib_len = zlib.len();
+        let mut bytes = format!(
+            "%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+4 0 obj <</Type/Font/Subtype/Type1/BaseFont/Helv/Encoding/WinAnsiEncoding/ToUnicode 5 0 R>> endobj
+5 0 obj <</Length {zlib_len}/Filter/FlateDecode>>
+stream
+"
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&zlib);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        let xref_offset = bytes.len();
+        let needles: Vec<usize> = (1..=5)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                (0..=bytes.len() - needle.len())
+                    .find(|&i| bytes[i..i + needle.len()] == *needle.as_bytes())
+                    .unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for off in &needles {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer <</Size 6/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+        let doc = Document::load(&bytes).expect("load");
+        let font = PdfFont::from_object(&doc, ObjectId(4, 0));
+        // Simple font but code_width = 2 from the CMap → slow path.
+        assert_eq!(font.code_width, 2);
+        // Feed an odd-length input so we hit `take == 1` on the second
+        // pass. For byte 'A' (0x41) with WinAnsi encoding the glyph lookup
+        // succeeds; for byte 0x05 it falls through to the `byte >= 0x20`
+        // arm which silently drops it.
+        let mut out = String::new();
+        font.decode_into(b"\x00\x41A", &mut out);
+        // Only the trailing 'A' resolves through the simple-byte fallback.
+        assert_eq!(out, "A");
+    }
+
+    /// Minimal RFC 1950 zlib (stored block only) — used to seed in-test
+    /// `/FlateDecode` payloads without pulling another encoder.
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78u8, 0x9C];
+        // Single final stored block: 0x01, LEN(2 LE), NLEN(2 LE).
+        out.push(0x01);
+        let len = data.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+        // Adler-32 checksum.
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        out
     }
 
     #[test]
