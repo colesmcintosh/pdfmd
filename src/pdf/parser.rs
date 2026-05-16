@@ -555,6 +555,11 @@ mod tests {
             parse(b"<48656c6c6f>").as_string(),
             Some(b"Hello".as_slice())
         );
+        // Uppercase A-F variant exercises the second arm of hex_digit.
+        assert_eq!(
+            parse(b"<DEADBEEF>").as_string(),
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]),
+        );
     }
 
     #[test]

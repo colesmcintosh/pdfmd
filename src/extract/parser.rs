@@ -602,4 +602,14 @@ mod tests {
             Token::ArrayEnd => "]".into(),
         }
     }
+
+    #[test]
+    fn describe_helper_covers_every_token_variant() {
+        // A single stream that produces every Token kind so describe's
+        // arms all execute at least once.
+        let mut p = Parser::new(b"[/N 42 (s) <48> ] op");
+        for _ in 0..8 {
+            let _ = describe(&p.next_token());
+        }
+    }
 }

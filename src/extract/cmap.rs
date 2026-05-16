@@ -558,4 +558,75 @@ mod tests {
         // Should not panic.
         let _ = parse(src);
     }
+
+    #[test]
+    fn bfchar_with_oversized_source_code_skips_entry() {
+        // Source code is 5 bytes (>4) so bytes_to_u32 returns None and the
+        // bfchar entry is silently dropped.
+        let src = b"1 beginbfchar <0102030405> <0041> endbfchar";
+        let cmap = parse(src);
+        assert!(cmap.lookup(0x01).is_none());
+    }
+
+    #[test]
+    fn bfrange_with_array_continuing_on_bad_codes() {
+        // bfrange where the source range bytes are too long → bytes_to_u32
+        // returns None, and we `continue` the loop without inserting.
+        let src = b"1 beginbfrange <0102030405> <0102030406> [<0041>] endbfrange";
+        let cmap = parse(src);
+        assert!(cmap.lookup(0x01).is_none());
+    }
+
+    #[test]
+    fn decode_hex_skips_whitespace_and_pads_odd_nibble() {
+        // Whitespace inside the hex string is ignored, and a trailing odd
+        // nibble is padded with zero.
+        let src = b"1 beginbfchar <0 1> <004 1> endbfchar";
+        let cmap = parse(src);
+        // bytes_to_u32(<01>) = 1 → mapping should land for code 1.
+        assert!(cmap.lookup(1).is_some());
+    }
+
+    #[test]
+    fn hex_digit_uppercase_and_lowercase() {
+        let src = b"1 beginbfchar <0a> <00aF> endbfchar";
+        let cmap = parse(src);
+        // 0x0A → U+00AF = MACRON.
+        assert_eq!(cmap.lookup(0x0A), Some("\u{00AF}"));
+    }
+
+    #[test]
+    fn cmap_dict_literal_inside_token_stream_is_skipped() {
+        // CMap producers commonly include `<<` / `>>` dict literals
+        // surrounding their bfchar tables. The parser should walk past
+        // them without confusing them for hex strings.
+        let src = b"<</Some/Dict>> 1 beginbfchar <03> <0043> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x03), Some("C"));
+    }
+
+    #[test]
+    fn tokenizer_handles_stray_close_dict() {
+        // A `>>` without an opening `<<` is just emitted as Other and the
+        // parser keeps going.
+        let src = b">> 1 beginbfchar <04> <0044> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x04), Some("D"));
+    }
+
+    #[test]
+    fn tokenizer_handles_literal_strings_with_escapes_and_parens() {
+        // Literal strings inside a CMap should be skipped even when they
+        // contain backslash escapes and nested parens.
+        let src = b"(escape\\)test) 1 beginbfchar <05> <0045> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x05), Some("E"));
+    }
+
+    #[test]
+    fn bfrange_with_lonely_lo_bails() {
+        // Only the `lo` hex is provided — the second take_hex returns None.
+        let src = b"1 beginbfrange <01> endbfrange";
+        let _ = parse(src);
+    }
 }

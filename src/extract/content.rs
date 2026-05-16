@@ -415,8 +415,8 @@ pub fn page_font_refs(
         return out;
     };
     for (name, obj) in font_dict.iter() {
-        if let Object::Reference(id) = obj {
-            out.insert(name.to_vec(), *id);
+        if let Some(id) = obj.as_reference() {
+            out.insert(name.to_vec(), id);
         }
     }
     out
@@ -561,6 +561,66 @@ ET
         assert!(out.contains("top"));
         assert!(out.contains("bottom"));
         assert!(out.contains("\n"));
+    }
+
+    #[test]
+    fn emit_without_font_is_a_no_op() {
+        // `Tj` runs before any `Tf` — emit returns early because state.font
+        // is None.
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BT (no font yet) Tj ET";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inline_image_block_is_skipped_via_id() {
+        // BI / ID / EI sequence — the content interpreter should swallow
+        // the inline image bytes and resume with the trailing operator.
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BT /F1 12 Tf BI /W 1 /H 1 ID \x00\x01\x02\nEI (after) Tj ET";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn page_font_refs_returns_empty_for_non_dict_font_entry() {
+        // /Font set to an integer — neither a Reference nor a Dictionary →
+        // page_font_refs returns empty.
+        let mut res = crate::pdf::Dictionary::new();
+        res.insert(b"Font".to_vec(), Object::Integer(0));
+        let bytes = build_pdf_with_xref(
+            b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+",
+        );
+        let doc = crate::pdf::Document::load(&bytes).unwrap();
+        assert!(page_font_refs(&doc, &res).is_empty());
+    }
+
+    #[test]
+    fn page_font_refs_returns_empty_when_font_reference_resolves_to_non_dict() {
+        // /Font is a Reference pointing at a non-dict object → empty.
+        let mut res = crate::pdf::Dictionary::new();
+        res.insert(b"Font".to_vec(), Object::Reference(ObjectId(4, 0)));
+        let bytes = build_pdf_with_xref(
+            b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+4 0 obj 42 endobj
+",
+        );
+        let doc = crate::pdf::Document::load(&bytes).unwrap();
+        assert!(page_font_refs(&doc, &res).is_empty());
     }
 
     #[test]
