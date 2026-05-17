@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 
 use pdfmd::{convert_pdf_to_markdown, ConvertOptions, ExtractedImage};
 
@@ -11,7 +11,9 @@ USAGE:
     pdfmd [OPTIONS] <INPUT>
 
 ARGS:
-    <INPUT>    Path to the input PDF file. Use \"-\" to read from stdin.
+    <INPUT>    Path to the input PDF file, an http(s):// URL, or \"-\"
+               to read from stdin. URLs are fetched via the `curl`
+               command on PATH.
 
 OPTIONS:
     -o, --output <FILE>             Write Markdown to FILE instead of stdout.
@@ -94,10 +96,62 @@ fn read_input(path: &Path) -> io::Result<Vec<u8>> {
     if path.as_os_str() == "-" {
         let mut buf = Vec::new();
         io::stdin().read_to_end(&mut buf)?;
-        Ok(buf)
-    } else {
-        fs::read(path)
+        return Ok(buf);
     }
+    if let Some(url) = path.to_str().filter(|s| is_url(s)) {
+        return fetch_url(url);
+    }
+    fs::read(path)
+}
+
+fn is_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Fetch a URL by shelling out to `curl`. Staying out of the Rust HTTP /
+/// TLS ecosystem keeps the crate's zero-dependency promise; the cost is a
+/// runtime dependency on `curl`, which is universally available on Linux
+/// / macOS and shipped with modern Windows.
+fn fetch_url(url: &str) -> io::Result<Vec<u8>> {
+    let output = Command::new("curl")
+        .args([
+            "--fail",       // non-2xx → curl exits non-zero
+            "--silent",     // suppress progress meter on stderr
+            "--show-error", // but still print actual error messages
+            "--location",   // follow redirects
+            "--max-time",
+            "120",
+            "--user-agent",
+            // Some CDNs (cough, SpaceX) 403 the default curl UA. A neutral
+            // browser-style string gets us past those without changing
+            // behaviour on plain servers.
+            "Mozilla/5.0 (compatible; pdfmd)",
+            "--",
+            url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not run `curl` to fetch {url}: {e}"),
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        let detail = if trimmed.is_empty() {
+            format!("curl exited with status {}", output.status)
+        } else {
+            trimmed.to_string()
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("fetch failed for {url}: {detail}"),
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn write_output(path: Option<&PathBuf>, markdown: &str) -> io::Result<()> {
@@ -169,6 +223,28 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_url_recognises_http_and_https_only() {
+        assert!(is_url("http://example.com/x.pdf"));
+        assert!(is_url("https://example.com/x.pdf"));
+        assert!(!is_url("file:///tmp/x.pdf"));
+        assert!(!is_url("ftp://example.com/x.pdf"));
+        assert!(!is_url("/tmp/x.pdf"));
+        assert!(!is_url("-"));
+        assert!(!is_url(""));
+    }
+
+    #[test]
+    fn fetch_url_reports_curl_error_for_unresolvable_host() {
+        // A `.invalid` host is reserved by RFC 6761 and will never resolve.
+        // We're checking the error-surface shape, not the network — so this
+        // test passes regardless of outbound connectivity.
+        let err = fetch_url("https://nonexistent.invalid/x.pdf").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fetch failed"));
+        assert!(msg.contains("nonexistent.invalid"));
+    }
 
     #[test]
     fn read_input_from_disk_returns_bytes() {
