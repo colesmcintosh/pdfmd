@@ -1289,6 +1289,114 @@ endobj
     }
 
     #[test]
+    fn classic_xref_with_non_integer_first_errors() {
+        // The very first integer in the subsection header is non-numeric,
+        // so the `first` read_uint call errors before we ever reach count.
+        let body = b"%PDF-1.4\n";
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        let mut xref = String::from("xref\nBAD 1\n");
+        xref.push_str(&format!(
+            "trailer <</Size 0/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        out.extend_from_slice(xref.as_bytes());
+        assert!(Document::load(&out).is_err());
+    }
+
+    #[test]
+    fn document_load_propagates_objstm_decode_error() {
+        // Build a PDF whose object stream has /Filter /FlateDecode but a
+        // garbage body. decode_filters errors → propagates through
+        // Document::load via the `?` on line 101.
+        let mut body = String::from("%PDF-1.5\n");
+        let off1 = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
+        );
+        let off4 = body.len();
+        body.push_str("4 0 obj <</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length 4>>\nstream\nJUNK\nendstream endobj\n");
+        let xref_offset = body.len();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        for &off in &[off1, off2, off3, off4] {
+            payload.push(1);
+            payload.extend_from_slice(&(off as u16).to_be_bytes());
+            payload.push(0);
+        }
+        // entry 5: compressed in objstm 4 (which will fail to decode).
+        payload.push(2);
+        payload.extend_from_slice(&4u16.to_be_bytes());
+        payload.push(0);
+        // entry 6: xref stream itself.
+        payload.push(1);
+        payload.extend_from_slice(&(xref_offset as u16).to_be_bytes());
+        payload.push(0);
+        body.push_str(&format!(
+            "6 0 obj <</Type/XRef/Size 7/Root 1 0 R/W [1 2 1]/Length {}>>\nstream\n",
+            payload.len()
+        ));
+        let mut bytes = body.into_bytes();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        assert!(Document::load(&bytes).is_err());
+    }
+
+    #[test]
+    fn document_load_propagates_objstm_header_error() {
+        // Objstm with /N and /First set but the body's header has a
+        // non-numeric obj id → parse_object_stream returns Err and the
+        // outer `?` propagates it.
+        let mut body = String::from("%PDF-1.5\n");
+        let off1 = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
+        );
+        let objstm_body = b"BAD 0 (oops)";
+        let off4 = body.len();
+        body.push_str(&format!(
+            "4 0 obj <</Type/ObjStm/N 1/First 6/Length {}>>\nstream\n",
+            objstm_body.len()
+        ));
+        let mut bytes = body.into_bytes();
+        bytes.extend_from_slice(objstm_body);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        let xref_offset = bytes.len();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        for &off in &[off1, off2, off3, off4] {
+            payload.push(1);
+            payload.extend_from_slice(&(off as u16).to_be_bytes());
+            payload.push(0);
+        }
+        payload.push(2);
+        payload.extend_from_slice(&4u16.to_be_bytes());
+        payload.push(0);
+        payload.push(1);
+        payload.extend_from_slice(&(xref_offset as u16).to_be_bytes());
+        payload.push(0);
+        bytes.extend_from_slice(
+            format!(
+                "6 0 obj <</Type/XRef/Size 7/Root 1 0 R/W [1 2 1]/Length {}>>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        assert!(Document::load(&bytes).is_err());
+    }
+
+    #[test]
     fn parse_object_stream_errors_when_header_has_non_digit() {
         let mut dict = Dictionary::new();
         dict.insert(b"N".to_vec(), Object::Integer(1));

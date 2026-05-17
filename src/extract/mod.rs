@@ -156,19 +156,16 @@ fn extract_one_page(
 fn page_resources(doc: &Document, page_id: ObjectId) -> Option<Dictionary> {
     let mut current = page_id;
     for _ in 0..64 {
-        let dict = doc.get_object(current)?.as_dict()?;
+        let dict = doc.get_object(current).and_then(Object::as_dict)?;
         if let Some(res) = dict.get(b"Resources") {
             return match res {
-                Object::Reference(id) => doc.get_object(*id)?.as_dict().cloned(),
+                Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).cloned(),
                 Object::Dictionary(d) => Some(d.clone()),
                 _ => None,
             };
         }
-        let parent = dict.get(b"Parent")?;
-        let Object::Reference(parent_id) = parent else {
-            return None;
-        };
-        current = *parent_id;
+        let parent = dict.get(b"Parent").and_then(Object::as_reference)?;
+        current = parent;
     }
     None
 }

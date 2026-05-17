@@ -474,6 +474,22 @@ mod tests {
     }
 
     #[test]
+    fn stray_single_close_angle_is_consumed() {
+        // A lone `>` (not part of `>>`) takes the false arm of the
+        // second-char check and is silently skipped.
+        let toks = ops(b"> 7 Tj");
+        assert_eq!(toks, ["num:7", "op:Tj"]);
+    }
+
+    #[test]
+    fn dict_literal_with_nested_dict_is_skipped() {
+        // Nested `<<...>>` inside an outer dict literal — exercises
+        // skip_dict's depth-increment branch when it sees `<<`.
+        let toks = ops(b"<</Outer <</Inner 1>> >> 7 Tj");
+        assert_eq!(toks, ["num:7", "op:Tj"]);
+    }
+
+    #[test]
     fn arrays_emit_start_end_tokens() {
         let toks = ops(b"[ 1 2 3 ] TJ");
         assert_eq!(toks, ["[", "num:1", "num:2", "num:3", "]", "op:TJ"]);
