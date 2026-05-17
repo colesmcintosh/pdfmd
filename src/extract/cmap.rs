@@ -88,9 +88,7 @@ pub fn parse(data: &[u8]) -> CMap {
                     // Reject ranges that would iterate billions of times — a
                     // malformed CMap could otherwise turn a few bytes of
                     // input into a DoS.
-                    if hi_code < lo_code
-                        || (hi_code as u64 - lo_code as u64) >= MAX_BFRANGE_SIZE
-                    {
+                    if hi_code < lo_code || (hi_code as u64 - lo_code as u64) >= MAX_BFRANGE_SIZE {
                         // Skip the destination payload (Hex or Array) so the
                         // outer loop resumes at the next operator.
                         match tokens.get(i) {
