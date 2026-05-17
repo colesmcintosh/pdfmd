@@ -337,6 +337,22 @@ fn read_classic_xref(
         skip_inline(bytes, &mut p.pos);
         let count = read_uint(bytes, &mut p.pos)?;
         skip_eol(bytes, &mut p.pos);
+        // Each entry occupies exactly 20 bytes. A malformed file may
+        // declare `count` close to u32::MAX; the per-entry truncation
+        // check below would still catch it, but only after iterating
+        // billions of times. Bound by the remaining bytes up front, and
+        // refuse subsection bases that would overflow when added to count.
+        let bytes_remaining = (bytes.len() - p.pos) as u64;
+        if (count as u64) * 20 > bytes_remaining {
+            return Err(PdfError::BadXref(format!(
+                "xref subsection count {count} exceeds remaining input"
+            )));
+        }
+        if first.checked_add(count).is_none() {
+            return Err(PdfError::BadXref(
+                "xref subsection first+count overflows u32".into(),
+            ));
+        }
         for i in 0..count {
             // Each entry is 20 bytes exactly per the spec.
             if p.pos + 20 > bytes.len() {
