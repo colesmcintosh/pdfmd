@@ -629,4 +629,65 @@ mod tests {
         let src = b"1 beginbfrange <01> endbfrange";
         let _ = parse(src);
     }
+
+    #[test]
+    fn bfrange_followed_by_unexpected_keyword_breaks_loop() {
+        // Right after `beginbfrange` we drop another block-opening
+        // keyword, which take_hex(lo) treats as Keyword(not-our-end) →
+        // returns None → break out of the bfrange loop.
+        let src = b"1 beginbfrange beginbfchar <01> <0041> endbfchar";
+        let cmap = parse(src);
+        // The bfchar entry still landed.
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
+    fn bfrange_with_hi_keyword_breaks_loop() {
+        // Lo parses, but hi resolves to a keyword — second take_hex
+        // returns None and we break.
+        let src = b"1 beginbfrange <01> beginbfchar <02> <0042> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x02), Some("B"));
+    }
+
+    #[test]
+    fn bfchar_with_only_one_hex_breaks_loop() {
+        // The pair half fails for the second token → take_hex_pair
+        // returns None → break.
+        let src = b"1 beginbfchar <01> beginbfrange <02> <02> <0042> endbfrange";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x02), Some("B"));
+    }
+
+    #[test]
+    fn codespace_with_keyword_in_pair_breaks_loop() {
+        let src = b"1 begincodespacerange <00> beginbfchar <01> <0041> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
+    fn cmap_tokenizer_handles_non_hex_string() {
+        // The `<XY>` style: tokenizer sees a `<...>` but decode_hex fails
+        // → emit Token::Other instead of Hex.
+        let src = b"<XY> 1 beginbfchar <01> <0041> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
+    fn cmap_tokenizer_handles_unterminated_hex_string() {
+        // Hex string at EOF without a closing `>` — the `if i < data.len()`
+        // arm skips past the (missing) close.
+        let src = b"<41";
+        let _ = parse(src);
+    }
+
+    #[test]
+    fn cmap_tokenizer_handles_nested_literal_string_parens() {
+        // Literal string with nested parens exercises the depth increment.
+        let src = b"(outer(inner)outer) 1 beginbfchar <02> <0042> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x02), Some("B"));
+    }
 }

@@ -564,6 +564,19 @@ ET
     }
 
     #[test]
+    fn operators_with_missing_operands_are_no_ops() {
+        // Every text operator's body is gated on having the right operands.
+        // Feeding bare operators without operands exercises the
+        // pattern-doesn't-match arm of each `if let` in the dispatch.
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BT Tf TL Tm Td TD T* Tj ' \" TJ Do ET";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn emit_without_font_is_a_no_op() {
         // `Tj` runs before any `Tf` — emit returns early because state.font
         // is None.
