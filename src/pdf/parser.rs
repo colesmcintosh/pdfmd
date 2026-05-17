@@ -815,4 +815,77 @@ endobj
     fn comments_at_top_level_are_ignored() {
         assert_eq!(parse(b"% header\n42").as_integer(), Some(42));
     }
+
+    #[test]
+    fn parse_array_propagates_inner_object_error() {
+        // `@` isn't a valid object lead byte — the inner parse_object errors.
+        let mut p = Parser::new(b"[ @ ]");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn parse_dictionary_propagates_value_error() {
+        // /Key has no parseable value, so parse_object errors.
+        let mut p = Parser::new(b"<< /K @ >>");
+        assert!(p.parse_object().is_err());
+    }
+
+    #[test]
+    fn parse_indirect_object_propagates_inner_object_error() {
+        // The body between `obj` and `endobj` isn't a valid PDF object.
+        let mut p = Parser::new(b"1 0 obj @ endobj");
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn parse_indirect_object_past_eof_errors() {
+        // with_pos lets a caller seed pos past the end — guard kicks in.
+        let mut p = Parser::with_pos(b"1 0 obj 42 endobj", 999);
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn stream_keyword_followed_by_crlf_is_skipped() {
+        // CRLF after `stream` — both bytes are consumed before body starts.
+        let bytes = b"1 0 obj <</Length 3>>\nstream\r\nABC\nendstream endobj";
+        let mut p = Parser::new(bytes);
+        let (_, obj) = p.parse_indirect_object().unwrap();
+        assert_eq!(obj.as_stream().unwrap().content, b"ABC");
+    }
+
+    #[test]
+    fn stream_keyword_followed_by_lone_cr_is_tolerated() {
+        // Single CR — we consume it and read the body that follows.
+        let bytes = b"1 0 obj <</Length 3>>\nstream\rABC\nendstream endobj";
+        let mut p = Parser::new(bytes);
+        let (_, obj) = p.parse_indirect_object().unwrap();
+        assert_eq!(obj.as_stream().unwrap().content, b"ABC");
+    }
+
+    #[test]
+    fn stream_keyword_with_no_eol_uses_remaining_bytes() {
+        // No EOL at all — the body starts immediately.
+        let bytes = b"1 0 obj <</Length 3>>\nstreamABC\nendstream endobj";
+        let mut p = Parser::new(bytes);
+        let (_, obj) = p.parse_indirect_object().unwrap();
+        assert_eq!(obj.as_stream().unwrap().content, b"ABC");
+    }
+
+    #[test]
+    fn stream_with_length_overflowing_usize_errors() {
+        let bytes = format!(
+            "1 0 obj <</Length {}>>\nstream\nbody\nendstream endobj",
+            usize::MAX
+        );
+        let mut p = Parser::new(bytes.as_bytes());
+        assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn unescape_octal_at_end_with_no_following_digits_breaks_loop() {
+        // The `(\7)` form is already covered; here the octal escape ends
+        // at the closing paren without consuming a 2nd or 3rd digit and
+        // the inner `break` arm runs.
+        assert_eq!(parse(b"(\\7)").as_string(), Some(b"\x07".as_slice()));
+    }
 }

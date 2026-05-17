@@ -289,6 +289,103 @@ mod tests {
     }
 
     #[test]
+    fn page_resources_returns_none_for_unsupported_resources_object() {
+        // /Resources points at an Integer — neither Reference nor Dictionary.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources 42/MediaBox[0 0 1 1]>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        assert!(page_resources(&doc, page).is_none());
+    }
+
+    #[test]
+    fn page_resources_returns_none_when_resources_reference_misses() {
+        // /Resources is a Reference to a non-existent object.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources 99 0 R/MediaBox[0 0 1 1]>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        assert!(page_resources(&doc, page).is_none());
+    }
+
+    #[test]
+    fn page_resources_returns_none_when_parent_is_not_a_reference() {
+        // The page has /Parent set to an Integer rather than a Reference.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 42/MediaBox[0 0 1 1]>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        assert!(page_resources(&doc, page).is_none());
+    }
+
+    #[test]
+    fn extract_one_page_returns_none_when_page_has_no_content() {
+        // Page dict without /Contents — get_page_content returns None.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        let font_refs = HashMap::new();
+        let font_cache: HashMap<ObjectId, PdfFont> = HashMap::new();
+        let image_names: HashMap<Vec<u8>, String> = HashMap::new();
+        assert!(extract_one_page(&doc, page, &font_refs, &font_cache, &image_names).is_none());
+    }
+
+    #[test]
+    fn extract_one_page_populates_image_names_for_caller() {
+        // The closure that builds PageImages from image_names runs only
+        // when image_names has entries. Drive it directly so the .map()
+        // closure region gets covered.
+        let mut image_names = HashMap::new();
+        image_names.insert(b"Im1".to_vec(), "figs/x.jpg".to_string());
+
+        // Minimal PDF with a single empty page so doc.get_page_content
+        // gives us back at least a `Do` operator that references the
+        // image name above.
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]/Contents 4 0 R>> endobj
+4 0 obj <</Length 7>>
+stream
+/Im1 Do
+endstream
+endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let page = doc.pages()[0];
+        let font_refs = HashMap::new();
+        let font_cache: HashMap<ObjectId, PdfFont> = HashMap::new();
+        let out = extract_one_page(&doc, page, &font_refs, &font_cache, &image_names)
+            .expect("extract one page");
+        // The `Do` operator emits the rewritten filename through the
+        // marker; checking for the substring is enough.
+        assert!(out.contains("figs/x.jpg"));
+    }
+
+    #[test]
     fn collect_images_dedupes_across_pages() {
         // Two pages reference the same image XObject; only one entry should
         // end up in the extracted image list and both per-page maps should

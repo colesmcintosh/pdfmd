@@ -323,4 +323,12 @@ mod tests {
         // A page containing only blank lines collapses to empty output.
         assert_eq!(format_page("\n\n"), "");
     }
+
+    #[test]
+    fn format_block_returns_empty_string_for_empty_block() {
+        // The grouper never hands an empty block to format_block, but the
+        // defensive early-return is still part of the contract — call it
+        // directly so the branch is exercised.
+        assert_eq!(format_block(Vec::new()), "");
+    }
 }

@@ -584,6 +584,28 @@ mod tests {
     }
 
     #[test]
+    fn skip_inline_image_ignores_false_ei_matches_in_data() {
+        // The image body legitimately contains an `EI` substring not at an
+        // operator boundary — followed by an ASCII letter, so the
+        // boundary check returns false and we keep scanning.
+        let stream = b"img \nEIabc data \nEI 7 Tj";
+        let mut p = Parser::new(stream);
+        p.skip_inline_image();
+        // After the real EI is consumed, the next tokens are `7 Tj`.
+        let toks: Vec<String> = (0..3).map(|_| describe(&p.next_token())).collect();
+        assert_eq!(toks, ["num:7", "op:Tj", "eof"]);
+    }
+
+    #[test]
+    fn skip_inline_image_stops_when_ei_sits_at_end_of_stream() {
+        // EI is the very last token in the stream → after.is_none() arm.
+        let stream = b"body \nEI";
+        let mut p = Parser::new(stream);
+        p.skip_inline_image();
+        assert_eq!(describe(&p.next_token()), "eof");
+    }
+
+    #[test]
     fn skip_inline_image_bails_at_eof_when_unterminated() {
         // No `EI` sequence in the body → skip_inline_image runs off the end.
         let mut p = Parser::new(b"image-bytes-without-the-end-marker");
