@@ -1,5 +1,11 @@
 # pdfmd
 
+[![CI](https://github.com/colesmcintosh/pdfmd/actions/workflows/ci.yml/badge.svg)](https://github.com/colesmcintosh/pdfmd/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-99.75%25-brightgreen)](#testing--coverage)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-blue)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 A fast, **zero-dependency** PDF → Markdown converter written in Rust.
 
 `pdfmd` extracts text directly from a PDF — parsing the object graph,
@@ -67,6 +73,51 @@ Per-page font and content-stream work runs across a small
 once into a document-wide cache. The content-stream tokenizer and the
 DEFLATE decoder both borrow operands directly from the source bytes, so
 the hot path doesn't allocate per operator or per Huffman code.
+
+## Testing & coverage
+
+326 tests (311 unit + 15 integration). Run them with:
+
+```sh
+cargo test --all-targets
+```
+
+Reproduce the coverage numbers in the badge:
+
+```sh
+cargo install cargo-llvm-cov
+cargo llvm-cov --summary-only --ignore-filename-regex 'src/bin/'
+```
+
+The `src/bin/` exclusion drops `profile.rs` — a developer-only profiling
+harness that isn't part of the shipped library or CLI.
+
+Current breakdown:
+
+| file                  | lines  | regions | functions |
+|-----------------------|--------|---------|-----------|
+| `extract/cmap.rs`     | 99.57% | 98.90%  | 100.00%   |
+| `extract/content.rs`  | 99.10% | 98.76%  | 100.00%   |
+| `extract/encoding.rs` | 100.00%| 100.00% | 100.00%   |
+| `extract/font.rs`     | 99.46% | 99.43%  | 100.00%   |
+| `extract/glyphs.rs`   | 100.00%| 100.00% | 100.00%   |
+| `extract/image.rs`    | 100.00%| 98.77%  | 100.00%   |
+| `extract/mod.rs`      | 99.13% | 98.75%  | 100.00%   |
+| `extract/parser.rs`   | 99.52% | 99.55%  | 100.00%   |
+| `heuristics.rs`       | 100.00%| 100.00% | 100.00%   |
+| `lib.rs`              | 100.00%| 100.00% | 100.00%   |
+| `main.rs`             | 99.68% | 99.35%  | 100.00%   |
+| `pdf/deflate.rs`      | 99.75% | 99.24%  | 100.00%   |
+| `pdf/mod.rs`          | 99.88% | 99.77%  | 100.00%   |
+| `pdf/object.rs`       | 100.00%| 100.00% | 100.00%   |
+| `pdf/parser.rs`       | 99.68% | 99.34%  | 98.67%    |
+| **total**             | **99.75%** | **99.52%** | **99.83%** |
+
+The remaining 0.25% is split between closing-brace regions of `if let`
+arms whose unmatched pattern is never observed by a passing test, `?`
+error arms in DEFLATE where the only way to fail is a hand-crafted bit
+stream that errors mid-block, and a couple of OS-level I/O failure paths
+(stdin/stdout writes) that would need a subprocess to trigger.
 
 ## How it works
 
