@@ -49,6 +49,7 @@ pdfmd input.pdf --extract-images figs -o out.md
                                     # save embedded JPEGs into ./figs
                                     # and link them inline in out.md
 cat input.pdf | pdfmd -             # read from stdin
+pdfmd https://example.com/x.pdf     # fetched via `curl` on PATH
 ```
 
 Image extraction currently passes through JPEG (`DCTDecode`) and JPEG 2000
