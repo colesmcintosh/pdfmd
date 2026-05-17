@@ -306,9 +306,12 @@ fn read_xref_chain(
             None => break,
         }
     }
+    // The loop always runs at least once (visited is empty on entry) and
+    // sets final_trailer before any subsequent iteration. If the first
+    // xref read errors we've already returned via `?`.
     Ok((
         entries,
-        final_trailer.ok_or_else(|| PdfError::BadXref("no trailer".into()))?,
+        final_trailer.expect("first iteration sets trailer"),
     ))
 }
 
@@ -733,8 +736,8 @@ fn read_uint(bytes: &[u8], pos: &mut usize) -> Result<u32, PdfError> {
     if *pos == start {
         return Err(PdfError::BadXref(format!("expected integer at {start}")));
     }
-    let s = std::str::from_utf8(&bytes[start..*pos])
-        .map_err(|_| PdfError::BadXref("non-utf8 integer".into()))?;
+    // The slice is ASCII digits by construction — utf-8 always holds.
+    let s = std::str::from_utf8(&bytes[start..*pos]).expect("digit slice is utf-8");
     s.parse::<u32>()
         .map_err(|_| PdfError::BadXref(format!("integer overflow: {s}")))
 }
@@ -911,6 +914,8 @@ endobj
         // Trailing single nibble pads with zero.
         let out = decode_ascii_hex(b"4");
         assert_eq!(out, vec![0x40]);
+        // Mixed-case A-F exercises both alphabetic arms of the match.
+        assert_eq!(decode_ascii_hex(b"deADBeEf"), vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
@@ -1169,6 +1174,181 @@ endobj
         // Two stream bodies joined by a newline (since neither ends in
         // whitespace).
         assert_eq!(content, b"first\nsecond");
+    }
+
+    #[test]
+    fn get_page_content_returns_none_for_unknown_page_id() {
+        let doc = Document {
+            objects: HashMap::new(),
+            pages: vec![],
+        };
+        assert!(doc.get_page_content(ObjectId(99, 0)).is_none());
+    }
+
+    #[test]
+    fn page_content_array_skips_streams_that_fail_to_decode() {
+        // Two streams in /Contents: the first has a corrupt FlateDecode
+        // body (decode_filters returns Err), the second is fine. Only the
+        // valid one shows up in the joined output.
+        let mut objs = HashMap::new();
+        let mut bad_dict = Dictionary::new();
+        bad_dict.insert(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+        objs.insert(
+            ObjectId(10, 0),
+            Object::Stream(Stream {
+                dict: bad_dict,
+                content: b"NOT-VALID-ZLIB".to_vec(),
+            }),
+        );
+        objs.insert(
+            ObjectId(11, 0),
+            Object::Stream(Stream {
+                dict: Dictionary::new(),
+                content: b"GOOD".to_vec(),
+            }),
+        );
+        let mut page = Dictionary::new();
+        page.insert(
+            b"Contents".to_vec(),
+            Object::Array(vec![
+                Object::Reference(ObjectId(10, 0)),
+                Object::Reference(ObjectId(11, 0)),
+            ]),
+        );
+        objs.insert(ObjectId(20, 0), Object::Dictionary(page));
+        let doc = Document {
+            objects: objs,
+            pages: vec![ObjectId(20, 0)],
+        };
+        let content = doc.get_page_content(ObjectId(20, 0)).unwrap();
+        assert_eq!(content, b"GOOD");
+    }
+
+    #[test]
+    fn classic_xref_with_non_integer_count_errors() {
+        // The xref subsection header reads "first count" — replace count
+        // with a non-digit so read_uint errors.
+        let body = b"%PDF-1.4\n";
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        let mut xref = String::from("xref\n0 BAD\n");
+        xref.push_str(&format!(
+            "trailer <</Size 0/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        out.extend_from_slice(xref.as_bytes());
+        assert!(Document::load(&out).is_err());
+    }
+
+    #[test]
+    fn classic_xref_skips_already_known_entries_on_prev_chain() {
+        // Two xref sections (an "old" one referenced via /Prev and the
+        // current one). They both list obj 1; the most recent xref wins
+        // and the older entry is skipped via `continue`.
+        let mut body = String::from("%PDF-1.4\n");
+        let off1_a = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
+        );
+        // Older xref (just obj 1 at off1_a, plus free entry).
+        let prev_xref_offset = body.len();
+        body.push_str("xref\n0 2\n0000000000 65535 f \n");
+        body.push_str(&format!("{off1_a:010} 00000 n \n"));
+        body.push_str("trailer <</Size 2/Root 1 0 R>>\nstartxref\n");
+        body.push_str(&format!("{prev_xref_offset}\n%%EOF\n"));
+        // Newer copy of obj 1 (functionally identical) plus a new xref.
+        let off1_b = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let xref_offset = body.len();
+        body.push_str("xref\n0 4\n0000000000 65535 f \n");
+        body.push_str(&format!("{off1_b:010} 00000 n \n"));
+        body.push_str(&format!("{off2:010} 00000 n \n"));
+        body.push_str(&format!("{off3:010} 00000 n \n"));
+        body.push_str(&format!(
+            "trailer <</Size 4/Root 1 0 R/Prev {prev_xref_offset}>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        let doc = Document::load(body.as_bytes()).expect("load");
+        assert_eq!(doc.pages().len(), 1);
+    }
+
+    #[test]
+    fn classic_xref_with_malformed_trailer_object_errors() {
+        // The `trailer` keyword is present but is followed by an
+        // unparseable byte stream (no `<<...>>` dict).
+        let body = b"%PDF-1.4\n";
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        out.extend_from_slice(
+            b"xref\n0 1\n0000000000 65535 f \ntrailer @@@\nstartxref\n9\n%%EOF\n",
+        );
+        let _ = xref_offset;
+        assert!(Document::load(&out).is_err());
+    }
+
+    #[test]
+    fn parse_object_stream_errors_when_header_has_non_digit() {
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(1));
+        dict.insert(b"First".to_vec(), Object::Integer(5));
+        // Body header "ABC 0 " — read_uint can't parse the first token.
+        let body = b"ABC 0 (hi)";
+        assert!(parse_object_stream(&dict, body).is_err());
+    }
+
+    #[test]
+    fn document_load_reuses_objstm_cache_across_compressed_entries() {
+        // Two compressed entries pointing into the same objstm. The cache
+        // lookup hits on the second entry (cache Some(v) branch).
+        let obj1 = "<</Type/Catalog/Pages 2 0 R>>";
+        let obj2 = "<</Type/Pages/Kids[3 0 R]/Count 1>>";
+        let obj3 = "<</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>>";
+        let header = format!(
+            "1 0 2 {o2} 3 {o3} ",
+            o2 = obj1.len(),
+            o3 = obj1.len() + obj2.len()
+        );
+        let first = header.len();
+        let mut objstm_payload = header.into_bytes();
+        objstm_payload.extend_from_slice(obj1.as_bytes());
+        objstm_payload.extend_from_slice(obj2.as_bytes());
+        objstm_payload.extend_from_slice(obj3.as_bytes());
+
+        let mut body = String::from("%PDF-1.5\n");
+        let off4 = body.len();
+        body.push_str(&format!(
+            "4 0 obj <</Type/ObjStm/N 3/First {first}/Length {}>>\nstream\n",
+            objstm_payload.len()
+        ));
+        let mut bytes = body.into_bytes();
+        bytes.extend_from_slice(&objstm_payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        let xref_offset = bytes.len();
+        // Three compressed entries (1, 2, 3) all pointing at objstm 4.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]); // entry 0 free
+        for index in 0u8..3 {
+            payload.push(2);
+            payload.extend_from_slice(&4u16.to_be_bytes());
+            payload.push(index);
+        }
+        payload.push(1);
+        payload.extend_from_slice(&(off4 as u16).to_be_bytes());
+        payload.push(0);
+        bytes.extend_from_slice(
+            format!(
+                "5 0 obj <</Type/XRef/Size 5/Root 1 0 R/W [1 2 1]/Length {}>>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        let doc = Document::load(&bytes).expect("load");
+        assert_eq!(doc.pages().len(), 1);
     }
 
     #[test]
@@ -1705,6 +1885,57 @@ endobj
             pages: vec![ObjectId(1, 0)],
         };
         assert_eq!(doc.get_page_content(ObjectId(1, 0)), Some(Vec::new()));
+    }
+
+    #[test]
+    fn walk_pages_returns_ok_for_missing_or_non_dict_node() {
+        let objs = HashMap::new();
+        let mut out = Vec::new();
+        // Node id doesn't exist → early Ok return.
+        walk_pages(&objs, ObjectId(99, 0), &mut out, 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn walk_pages_pushes_leaf_when_called_with_type_page_directly() {
+        // /Pages reference in the catalog points at a /Type Page leaf —
+        // unusual but valid. walk_pages should push it without recursing.
+        let mut objs = HashMap::new();
+        let mut page = Dictionary::new();
+        page.insert(b"Type".to_vec(), Object::Name(b"Page".to_vec()));
+        objs.insert(ObjectId(1, 0), Object::Dictionary(page));
+        let mut out = Vec::new();
+        walk_pages(&objs, ObjectId(1, 0), &mut out, 0).unwrap();
+        assert_eq!(out, vec![ObjectId(1, 0)]);
+    }
+
+    #[test]
+    fn walk_pages_returns_ok_when_pages_node_has_no_kids() {
+        // A /Type Pages node without /Kids is silently treated as empty.
+        let mut objs = HashMap::new();
+        let mut pages = Dictionary::new();
+        pages.insert(b"Type".to_vec(), Object::Name(b"Pages".to_vec()));
+        objs.insert(ObjectId(1, 0), Object::Dictionary(pages));
+        let mut out = Vec::new();
+        walk_pages(&objs, ObjectId(1, 0), &mut out, 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn walk_pages_recurses_into_kids_pointing_at_missing_node() {
+        // A /Kids reference to a non-existent id should propagate as an
+        // Ok no-op rather than blowing up.
+        let mut objs = HashMap::new();
+        let mut pages = Dictionary::new();
+        pages.insert(b"Type".to_vec(), Object::Name(b"Pages".to_vec()));
+        pages.insert(
+            b"Kids".to_vec(),
+            Object::Array(vec![Object::Reference(ObjectId(999, 0))]),
+        );
+        objs.insert(ObjectId(1, 0), Object::Dictionary(pages));
+        let mut out = Vec::new();
+        walk_pages(&objs, ObjectId(1, 0), &mut out, 0).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]

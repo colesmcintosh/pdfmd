@@ -64,11 +64,18 @@ pub fn convert_pdf_to_markdown(pdf_bytes: &[u8], opts: &ConvertOptions) -> Resul
     }
 
     promote_document_title(&mut markdown);
-
-    if !markdown.ends_with('\n') {
-        markdown.push('\n');
-    }
+    ensure_trailing_newline(&mut markdown);
     Ok(ConvertResult { markdown, images })
+}
+
+/// Append a `\n` if the string doesn't already end in one. Extracted so the
+/// tests can hit the both-already-has-newline and append-needed paths
+/// without having to construct PDFs whose extracted text incidentally
+/// terminates either way.
+fn ensure_trailing_newline(s: &mut String) {
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
 }
 
 /// Rewrite each `\u{0001}filename\u{0001}` sentinel emitted by the content
@@ -167,6 +174,16 @@ mod tests {
         let mut s = String::from("First line\nSecond line\n\nBody.\n");
         promote_document_title(&mut s);
         assert!(s.starts_with("First line"));
+    }
+
+    #[test]
+    fn ensure_trailing_newline_appends_only_when_missing() {
+        let mut s = String::from("no newline");
+        ensure_trailing_newline(&mut s);
+        assert_eq!(s, "no newline\n");
+        let mut already = String::from("yes\n");
+        ensure_trailing_newline(&mut already);
+        assert_eq!(already, "yes\n");
     }
 
     #[test]

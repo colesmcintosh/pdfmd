@@ -584,15 +584,17 @@ mod tests {
         // exercise the long match arms in the source.
         let winansi = names_for(BaseEncoding::WinAnsi);
         let macroman = names_for(BaseEncoding::MacRoman);
-        assert!(
-            winansi.len() > 200,
-            "winansi only has {} entries",
-            winansi.len()
-        );
-        assert!(
-            macroman.len() > 200,
-            "macroman only has {} entries",
-            macroman.len()
-        );
+        assert!(winansi.len() > 200);
+        assert!(macroman.len() > 200);
+    }
+
+    #[test]
+    fn ascii_glyph_returns_none_for_non_printable_bytes() {
+        // The helper is private and the public callers always pre-filter
+        // to the 0x20..=0x7E range, so the `_ => None` arm is otherwise
+        // unreachable. Drive it directly so coverage counts it.
+        assert!(ascii_glyph(0x00).is_none());
+        assert!(ascii_glyph(0x7F).is_none());
+        assert!(ascii_glyph(0xFF).is_none());
     }
 }

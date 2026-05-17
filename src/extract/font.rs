@@ -112,32 +112,24 @@ impl PdfFont {
             }
             i += take;
 
-            if let Some(cmap) = &self.to_unicode {
-                if let Some(text) = cmap.lookup(code) {
-                    out.push_str(text);
-                    continue;
-                }
-            }
-
-            if self.kind == FontKind::Simple && take == 1 {
-                let byte = code as u8;
-                if let Some(name) = self.differences.get(&byte) {
-                    if let Some(text) = glyph_to_string(name) {
-                        out.push_str(&text);
-                        continue;
+            let resolved = self
+                .to_unicode
+                .as_ref()
+                .and_then(|cmap| cmap.lookup(code))
+                .map(str::to_owned)
+                .or_else(|| {
+                    // Per-byte glyph lookup is only meaningful for simple
+                    // fonts when we ended up reading exactly one byte (the
+                    // fast-path table handles the common case).
+                    if self.kind == FontKind::Simple && take == 1 {
+                        self.decode_single_byte(code as u8)
+                    } else {
+                        None
                     }
-                }
-                if let Some(name) = self.encoding.glyph(byte) {
-                    if let Some(text) = glyph_to_string(name) {
-                        out.push_str(&text);
-                        continue;
-                    }
-                }
-                if byte >= 0x20 {
-                    out.push(byte as char);
-                }
+                });
+            if let Some(s) = resolved {
+                out.push_str(&s);
             }
-            // Composite font without a usable ToUnicode entry: skip silently.
         }
     }
 
