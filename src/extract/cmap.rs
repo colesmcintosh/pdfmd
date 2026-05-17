@@ -6,6 +6,12 @@
 
 use std::collections::HashMap;
 
+/// Upper bound on the size of a single `beginbfrange` mapping. A malformed
+/// CMap can declare `<0000> <FFFFFFFF>` which expands to ~4 billion entries
+/// — without this cap we'd OOM cloning a `Vec`/`String` per iteration. The
+/// largest legitimate range in practice is one Unicode plane (0x10000).
+const MAX_BFRANGE_SIZE: u64 = 0x10000;
+
 #[derive(Debug, Default, Clone)]
 pub struct CMap {
     /// Width of source codes in bytes (1 for simple fonts, 2 for CID fonts).
@@ -79,6 +85,33 @@ pub fn parse(data: &[u8]) -> CMap {
                     else {
                         continue;
                     };
+                    // Reject ranges that would iterate billions of times — a
+                    // malformed CMap could otherwise turn a few bytes of
+                    // input into a DoS.
+                    if hi_code < lo_code
+                        || (hi_code as u64 - lo_code as u64) >= MAX_BFRANGE_SIZE
+                    {
+                        // Skip the destination payload (Hex or Array) so the
+                        // outer loop resumes at the next operator.
+                        match tokens.get(i) {
+                            Some(Token::Hex(_)) => {
+                                i += 1;
+                            }
+                            Some(Token::ArrayStart) => {
+                                i += 1;
+                                while let Some(tok) = tokens.get(i) {
+                                    i += 1;
+                                    if matches!(tok, Token::ArrayEnd) {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {
+                                i += 1;
+                            }
+                        }
+                        continue;
+                    }
                     match tokens.get(i) {
                         Some(Token::Hex(dst)) => {
                             let dst = dst.clone();
@@ -394,6 +427,23 @@ mod tests {
         assert_eq!(cmap.lookup(0x10), Some("a"));
         assert_eq!(cmap.lookup(0x11), Some("b"));
         assert_eq!(cmap.lookup(0x12), Some("c"));
+    }
+
+    #[test]
+    fn bfrange_oversized_range_is_skipped_without_iterating() {
+        // A range spanning the full 32-bit space would, naively, allocate
+        // billions of entries. The guard should skip both the sequential
+        // and array destination payloads, leaving the map empty without
+        // hanging or OOMing.
+        let src = b"\
+            1 beginbfrange
+            <0000> <FFFFFFFF> <0041>
+            <0000> <FFFFFFFF> [<0042>]
+            endbfrange
+        ";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x00), None);
+        assert_eq!(cmap.lookup(0xFFFF_FFFF), None);
     }
 
     #[test]
