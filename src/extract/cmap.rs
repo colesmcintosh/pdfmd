@@ -431,4 +431,263 @@ mod tests {
         let cmap = parse(src);
         assert_eq!(cmap.lookup(0x01), Some("fi"));
     }
+
+    #[test]
+    fn bytes_to_u32_rejects_empty_and_overlong() {
+        assert!(bytes_to_u32(&[]).is_none());
+        assert!(bytes_to_u32(&[0u8; 5]).is_none());
+        assert_eq!(bytes_to_u32(&[0x01, 0x02]), Some(0x0102));
+    }
+
+    #[test]
+    fn utf16be_to_string_handles_each_length_case() {
+        assert!(utf16be_to_string(&[]).is_none());
+        // Single byte treated as Latin-1.
+        assert_eq!(utf16be_to_string(&[0x41]).as_deref(), Some("A"));
+        // Odd length > 1 is invalid.
+        assert!(utf16be_to_string(&[0x00, 0x41, 0x42]).is_none());
+        // Valid 4-byte UTF-16 surrogate pair (U+1F600).
+        let smile = [0xD8, 0x3D, 0xDE, 0x00];
+        assert!(utf16be_to_string(&smile).is_some());
+        // Lone high surrogate is invalid.
+        let bad = [0xD8, 0x00, 0x00, 0x41];
+        assert!(utf16be_to_string(&bad).is_none());
+    }
+
+    #[test]
+    fn add_to_last_u16_is_no_op_for_short_buffers() {
+        let mut bytes = vec![0x10];
+        add_to_last_u16(&mut bytes, 5);
+        assert_eq!(bytes, vec![0x10]);
+        // With 2 bytes, the last u16 should be incremented.
+        let mut bytes = vec![0x00, 0x10];
+        add_to_last_u16(&mut bytes, 5);
+        assert_eq!(bytes, vec![0x00, 0x15]);
+        // Overflow wraps mod 2^16.
+        let mut bytes = vec![0xFF, 0xFF];
+        add_to_last_u16(&mut bytes, 1);
+        assert_eq!(bytes, vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn codespace_width_detects_two_byte_codes() {
+        let src = b"1 begincodespacerange <0000> <FFFF> endcodespacerange";
+        let cmap = parse(src);
+        assert_eq!(cmap.code_width(), 2);
+    }
+
+    #[test]
+    fn unrecognized_keywords_are_skipped() {
+        // CIDInit/PostScript noise before the real data must not throw the
+        // parser off course.
+        let src = b"\
+            /CIDInit /ProcSet findresource begin 12 dict begin begincmap
+            1 beginbfchar
+            <01> <0041>
+            endbfchar
+            endcmap end end
+        ";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
+    fn comments_and_literal_strings_are_ignored() {
+        let src = b"\
+            % a comment line
+            (a literal string)
+            /Name 1
+            1 beginbfchar
+            <02> <0042>
+            endbfchar
+        ";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x02), Some("B"));
+    }
+
+    #[test]
+    fn bfchar_unterminated_block_bails_cleanly() {
+        let src = b"1 beginbfchar <01>";
+        let cmap = parse(src);
+        // We at least don't panic; the lone hex without a destination is
+        // discarded.
+        assert!(cmap.lookup(0x01).is_none());
+    }
+
+    #[test]
+    fn bfrange_with_non_hex_destination_falls_through() {
+        // Destination isn't a hex string or array — parser should advance
+        // past the `lo hi` pair without inserting anything.
+        let src = b"\
+            1 beginbfrange
+            <10> <12> /SomeName
+            endbfrange
+        ";
+        let cmap = parse(src);
+        assert!(cmap.lookup(0x10).is_none());
+    }
+
+    #[test]
+    fn bfrange_unterminated_lo_or_hi_bails() {
+        // Missing the `hi` half.
+        let src = b"1 beginbfrange <10>";
+        let cmap = parse(src);
+        assert!(cmap.lookup(0x10).is_none());
+        // Missing both halves.
+        let src = b"1 beginbfrange";
+        let _ = parse(src);
+    }
+
+    #[test]
+    fn bfrange_array_with_array_inner_skips_unknown_tokens() {
+        // Array body with stray hex strings + an unknown token; the parser
+        // should still pick up the hex strings in order.
+        let src = b"\
+            1 beginbfrange
+            <20> <21> [/Skip <0041> <0042>]
+            endbfrange
+        ";
+        let cmap = parse(src);
+        // Only 2 entries because the skipped name pushes the alignment.
+        assert!(cmap.lookup(0x20).is_some());
+    }
+
+    #[test]
+    fn codespace_with_unterminated_pair_bails() {
+        let src = b"1 begincodespacerange <00>";
+        // Should not panic.
+        let _ = parse(src);
+    }
+
+    #[test]
+    fn bfchar_with_oversized_source_code_skips_entry() {
+        // Source code is 5 bytes (>4) so bytes_to_u32 returns None and the
+        // bfchar entry is silently dropped.
+        let src = b"1 beginbfchar <0102030405> <0041> endbfchar";
+        let cmap = parse(src);
+        assert!(cmap.lookup(0x01).is_none());
+    }
+
+    #[test]
+    fn bfrange_with_array_continuing_on_bad_codes() {
+        // bfrange where the source range bytes are too long → bytes_to_u32
+        // returns None, and we `continue` the loop without inserting.
+        let src = b"1 beginbfrange <0102030405> <0102030406> [<0041>] endbfrange";
+        let cmap = parse(src);
+        assert!(cmap.lookup(0x01).is_none());
+    }
+
+    #[test]
+    fn decode_hex_skips_whitespace_and_pads_odd_nibble() {
+        // Whitespace inside the hex string is ignored, and a trailing odd
+        // nibble is padded with zero.
+        let src = b"1 beginbfchar <0 1> <004 1> endbfchar";
+        let cmap = parse(src);
+        // bytes_to_u32(<01>) = 1 → mapping should land for code 1.
+        assert!(cmap.lookup(1).is_some());
+    }
+
+    #[test]
+    fn hex_digit_uppercase_and_lowercase() {
+        let src = b"1 beginbfchar <0a> <00aF> endbfchar";
+        let cmap = parse(src);
+        // 0x0A → U+00AF = MACRON.
+        assert_eq!(cmap.lookup(0x0A), Some("\u{00AF}"));
+    }
+
+    #[test]
+    fn cmap_dict_literal_inside_token_stream_is_skipped() {
+        // CMap producers commonly include `<<` / `>>` dict literals
+        // surrounding their bfchar tables. The parser should walk past
+        // them without confusing them for hex strings.
+        let src = b"<</Some/Dict>> 1 beginbfchar <03> <0043> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x03), Some("C"));
+    }
+
+    #[test]
+    fn tokenizer_handles_stray_close_dict() {
+        // A `>>` without an opening `<<` is just emitted as Other and the
+        // parser keeps going.
+        let src = b">> 1 beginbfchar <04> <0044> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x04), Some("D"));
+    }
+
+    #[test]
+    fn tokenizer_handles_literal_strings_with_escapes_and_parens() {
+        // Literal strings inside a CMap should be skipped even when they
+        // contain backslash escapes and nested parens.
+        let src = b"(escape\\)test) 1 beginbfchar <05> <0045> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x05), Some("E"));
+    }
+
+    #[test]
+    fn bfrange_with_lonely_lo_bails() {
+        // Only the `lo` hex is provided — the second take_hex returns None.
+        let src = b"1 beginbfrange <01> endbfrange";
+        let _ = parse(src);
+    }
+
+    #[test]
+    fn bfrange_followed_by_unexpected_keyword_breaks_loop() {
+        // Right after `beginbfrange` we drop another block-opening
+        // keyword, which take_hex(lo) treats as Keyword(not-our-end) →
+        // returns None → break out of the bfrange loop.
+        let src = b"1 beginbfrange beginbfchar <01> <0041> endbfchar";
+        let cmap = parse(src);
+        // The bfchar entry still landed.
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
+    fn bfrange_with_hi_keyword_breaks_loop() {
+        // Lo parses, but hi resolves to a keyword — second take_hex
+        // returns None and we break.
+        let src = b"1 beginbfrange <01> beginbfchar <02> <0042> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x02), Some("B"));
+    }
+
+    #[test]
+    fn bfchar_with_only_one_hex_breaks_loop() {
+        // The pair half fails for the second token → take_hex_pair
+        // returns None → break.
+        let src = b"1 beginbfchar <01> beginbfrange <02> <02> <0042> endbfrange";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x02), Some("B"));
+    }
+
+    #[test]
+    fn codespace_with_keyword_in_pair_breaks_loop() {
+        let src = b"1 begincodespacerange <00> beginbfchar <01> <0041> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
+    fn cmap_tokenizer_handles_non_hex_string() {
+        // The `<XY>` style: tokenizer sees a `<...>` but decode_hex fails
+        // → emit Token::Other instead of Hex.
+        let src = b"<XY> 1 beginbfchar <01> <0041> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
+    fn cmap_tokenizer_handles_unterminated_hex_string() {
+        // Hex string at EOF without a closing `>` — the `if i < data.len()`
+        // arm skips past the (missing) close.
+        let src = b"<41";
+        let _ = parse(src);
+    }
+
+    #[test]
+    fn cmap_tokenizer_handles_nested_literal_string_parens() {
+        // Literal string with nested parens exercises the depth increment.
+        let src = b"(outer(inner)outer) 1 beginbfchar <02> <0042> endbfchar";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x02), Some("B"));
+    }
 }

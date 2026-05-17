@@ -431,11 +431,7 @@ mod tests {
     #[test]
     fn hex_strings_decode_to_bytes() {
         // <48656C6C6F> is "Hello" in ASCII hex.
-        let mut p = Parser::new(b"<48656C6C6F> Tj");
-        match p.next_token() {
-            Token::Str(s) => assert_eq!(&*s, b"Hello"),
-            t => panic!("expected Str, got {t:?}"),
-        }
+        assert_eq!(ops(b"<48656C6C6F> Tj"), ["str:Hello", "op:Tj"]);
     }
 
     #[test]
@@ -445,20 +441,12 @@ mod tests {
 
     #[test]
     fn escape_sequences_in_literal_string() {
-        let mut p = Parser::new(b"(line1\\nline2) Tj");
-        match p.next_token() {
-            Token::Str(s) => assert_eq!(&*s, b"line1\nline2"),
-            t => panic!("expected Str, got {t:?}"),
-        }
+        assert_eq!(ops(b"(line1\\nline2) Tj"), ["str:line1\nline2", "op:Tj"]);
     }
 
     #[test]
     fn balanced_parens_inside_literal() {
-        let mut p = Parser::new(b"((nested)) Tj");
-        match p.next_token() {
-            Token::Str(s) => assert_eq!(&*s, b"(nested)"),
-            t => panic!("expected Str, got {t:?}"),
-        }
+        assert_eq!(ops(b"((nested)) Tj"), ["str:(nested)", "op:Tj"]);
     }
 
     #[test]
@@ -470,27 +458,196 @@ mod tests {
     }
 
     #[test]
+    fn dict_literal_inside_content_stream_is_skipped() {
+        // Real PDFs sometimes embed inline dicts (`<< ... >>`) inside
+        // marked-content operators. Our tokenizer should skip past them
+        // and resume on the next operator.
+        let toks = ops(b"<</K -1>> 42 Tj");
+        assert_eq!(toks, ["num:42", "op:Tj"]);
+    }
+
+    #[test]
+    fn stray_close_dict_does_not_crash() {
+        // `>>` outside of a dict literal — we just resync.
+        let toks = ops(b">> 7 Tj");
+        assert_eq!(toks, ["num:7", "op:Tj"]);
+    }
+
+    #[test]
+    fn stray_single_close_angle_is_consumed() {
+        // A lone `>` (not part of `>>`) takes the false arm of the
+        // second-char check and is silently skipped.
+        let toks = ops(b"> 7 Tj");
+        assert_eq!(toks, ["num:7", "op:Tj"]);
+    }
+
+    #[test]
+    fn dict_literal_with_nested_dict_is_skipped() {
+        // Nested `<<...>>` inside an outer dict literal — exercises
+        // skip_dict's depth-increment branch when it sees `<<`.
+        let toks = ops(b"<</Outer <</Inner 1>> >> 7 Tj");
+        assert_eq!(toks, ["num:7", "op:Tj"]);
+    }
+
+    #[test]
+    fn arrays_emit_start_end_tokens() {
+        let toks = ops(b"[ 1 2 3 ] TJ");
+        assert_eq!(toks, ["[", "num:1", "num:2", "num:3", "]", "op:TJ"]);
+    }
+
+    #[test]
+    fn unterminated_literal_string_returns_partial_payload() {
+        let toks = ops(b"(unclosed forever");
+        assert_eq!(toks.len(), 1);
+        assert!(toks[0].starts_with("str:"));
+    }
+
+    #[test]
+    fn literal_string_round_trips_every_escape() {
+        // Every match arm in `unescape_literal`.
+        let raw = b"(\\n\\r\\t\\b\\f\\\\\\(\\)\\\n\\\r\n\\\rZ\\101\\q)";
+        let toks = ops(raw);
+        assert_eq!(toks.len(), 1);
+        let s = toks[0].trim_start_matches("str:");
+        assert!(s.starts_with("\n\r\t"));
+    }
+
+    #[test]
+    fn hex_string_handles_odd_nibble() {
+        // Odd hex string padded with zero — also covers the `if get == >` branch.
+        // ops() formats the byte through utf8-or-`?`, so 0x40 ('@') round-trips.
+        assert_eq!(ops(b"<4> Tj"), ["str:@", "op:Tj"]);
+    }
+
+    #[test]
+    fn hex_string_skips_non_hex_bytes() {
+        assert_eq!(ops(b"<48 6 9>"), ["str:Hi"]);
+    }
+
+    #[test]
+    fn hex_string_without_closing_angle() {
+        // Tokenizer doesn't fail — it returns what it has and EOFs next.
+        assert_eq!(ops(b"<48"), ["str:H"]);
+    }
+
+    #[test]
+    fn lone_dot_is_a_keyword_not_a_number() {
+        // `.` alone isn't a valid number per our tokenizer — falls through.
+        let toks = ops(b". Tj");
+        assert_eq!(toks, ["op:.", "op:Tj"]);
+    }
+
+    #[test]
+    fn number_followed_by_letters_is_a_keyword() {
+        let toks = ops(b"10x");
+        assert_eq!(toks, ["op:10x"]);
+    }
+
+    #[test]
+    fn decode_hex_pads_odd_trailing_nibble() {
+        assert_eq!(decode_hex(b"4"), vec![0x40]);
+        assert_eq!(decode_hex(b"48 69"), b"Hi");
+        // Non-hex bytes get skipped.
+        assert_eq!(decode_hex(b"!!"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn unescape_literal_handles_each_escape_arm() {
+        let raw = b"\\n\\r\\t\\b\\f\\\\\\(\\)\\\nA\\\r\nB\\\rC\\101D\\?";
+        let out = unescape_literal(raw);
+        assert!(out.starts_with(b"\n\r\t\x08\x0C\\()"));
+    }
+
+    #[test]
+    fn unescape_literal_octal_at_eof() {
+        // Trailing octal sequence with no following digit must not run past
+        // the buffer.
+        let out = unescape_literal(b"\\7");
+        assert_eq!(out, vec![0x07]);
+    }
+
+    #[test]
+    fn unescape_literal_trailing_backslash_passes_through() {
+        // No following byte to escape — the lone backslash falls into the
+        // catch-all `else` and is emitted literally.
+        let out = unescape_literal(b"a\\");
+        assert_eq!(out, b"a\\");
+    }
+
+    #[test]
     fn skip_inline_image_jumps_past_data() {
-        // BI dict ID <raw...> EI body
+        // BI dict ID <raw...> EI body — drain tokens up to the `ID`
+        // operator using ops(), then exercise skip_inline_image on what's
+        // left.
         let stream = b"BI /W 1 /H 1 ID \x00\x01\x02\nEI 99 Tj";
         let mut p = Parser::new(stream);
-        // Walk through BI and its dict tokens until ID.
-        loop {
-            match p.next_token() {
-                Token::Op(op) if op == b"ID" => break,
-                Token::Eof => panic!("hit EOF before ID"),
-                _ => {}
+        // Drain through the `ID` op without leaving an unreachable match arm.
+        let mut hit_id = false;
+        for _ in 0..16 {
+            let tok = p.next_token();
+            let tag = describe(&tok);
+            if tag == "op:ID" {
+                hit_id = true;
+                break;
             }
+            assert_ne!(tag, "eof", "ran off the end before reaching ID");
         }
+        assert!(hit_id);
         p.skip_inline_image();
-        // Next two tokens should be the post-EI content.
-        match p.next_token() {
-            Token::Num(n) => assert_eq!(n, 99.0),
-            t => panic!("expected Num, got {t:?}"),
+        // Post-EI we should see `99 Tj` from the rest of the stream.
+        let remaining: Vec<String> = (0..2).map(|_| describe(&p.next_token())).collect();
+        assert_eq!(remaining, ["num:99", "op:Tj"]);
+    }
+
+    #[test]
+    fn skip_inline_image_ignores_false_ei_matches_in_data() {
+        // The image body legitimately contains an `EI` substring not at an
+        // operator boundary — followed by an ASCII letter, so the
+        // boundary check returns false and we keep scanning.
+        let stream = b"img \nEIabc data \nEI 7 Tj";
+        let mut p = Parser::new(stream);
+        p.skip_inline_image();
+        // After the real EI is consumed, the next tokens are `7 Tj`.
+        let toks: Vec<String> = (0..3).map(|_| describe(&p.next_token())).collect();
+        assert_eq!(toks, ["num:7", "op:Tj", "eof"]);
+    }
+
+    #[test]
+    fn skip_inline_image_stops_when_ei_sits_at_end_of_stream() {
+        // EI is the very last token in the stream → after.is_none() arm.
+        let stream = b"body \nEI";
+        let mut p = Parser::new(stream);
+        p.skip_inline_image();
+        assert_eq!(describe(&p.next_token()), "eof");
+    }
+
+    #[test]
+    fn skip_inline_image_bails_at_eof_when_unterminated() {
+        // No `EI` sequence in the body → skip_inline_image runs off the end.
+        let mut p = Parser::new(b"image-bytes-without-the-end-marker");
+        p.skip_inline_image();
+        assert_eq!(describe(&p.next_token()), "eof");
+    }
+
+    fn describe(tok: &Token<'_>) -> String {
+        match tok {
+            Token::Eof => "eof".into(),
+            Token::Op(b) => format!("op:{}", std::str::from_utf8(b).unwrap_or("?")),
+            Token::Name(n) => format!("name:{}", std::str::from_utf8(n).unwrap_or("?")),
+            Token::Num(n) => format!("num:{n}"),
+            Token::Str(s) => format!("str:{}", std::str::from_utf8(s).unwrap_or("?")),
+            Token::ArrayStart => "[".into(),
+            Token::ArrayEnd => "]".into(),
         }
-        match p.next_token() {
-            Token::Op(op) => assert_eq!(op, b"Tj"),
-            t => panic!("expected Op, got {t:?}"),
+    }
+
+    #[test]
+    fn describe_helper_covers_every_token_variant() {
+        // A single stream that produces every Token kind so describe's
+        // arms all execute at least once.
+        let mut p = Parser::new(b"[/N 42 (s) <48> ] op");
+        for _ in 0..8 {
+            let _ = describe(&p.next_token());
         }
     }
 }

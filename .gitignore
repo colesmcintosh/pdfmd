@@ -1,3 +1,4 @@
 /target
 *.pdf
 *.md.bak
+!tests/fixtures/*.pdf
