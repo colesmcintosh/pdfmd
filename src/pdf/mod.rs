@@ -618,6 +618,19 @@ fn decode_ascii85(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 4 / 5);
     let mut buf = [0u32; 5];
     let mut n = 0;
+    // Accumulate in u64 — the maximum value `buf[0] * 85^4` alone is
+    // 84 * 52_200_625 = 4_384_852_500, which already exceeds u32::MAX. A
+    // malformed group like `uuuuu` would otherwise panic in debug and
+    // silently wrap in release. Any group whose decoded value doesn't fit
+    // in u32 is skipped.
+    let pack = |buf: &[u32; 5]| -> Option<u32> {
+        let v = (buf[0] as u64) * 85u64.pow(4)
+            + (buf[1] as u64) * 85u64.pow(3)
+            + (buf[2] as u64) * 85u64.pow(2)
+            + (buf[3] as u64) * 85
+            + (buf[4] as u64);
+        u32::try_from(v).ok()
+    };
     for &b in data {
         if b == b'~' {
             break;
@@ -635,12 +648,9 @@ fn decode_ascii85(data: &[u8]) -> Vec<u8> {
         buf[n] = (b - b'!') as u32;
         n += 1;
         if n == 5 {
-            let v = buf[0] * 85u32.pow(4)
-                + buf[1] * 85u32.pow(3)
-                + buf[2] * 85u32.pow(2)
-                + buf[3] * 85
-                + buf[4];
-            out.extend_from_slice(&v.to_be_bytes());
+            if let Some(v) = pack(&buf) {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
             n = 0;
         }
     }
@@ -648,12 +658,9 @@ fn decode_ascii85(data: &[u8]) -> Vec<u8> {
         for slot in &mut buf[n..5] {
             *slot = 84;
         }
-        let v = buf[0] * 85u32.pow(4)
-            + buf[1] * 85u32.pow(3)
-            + buf[2] * 85u32.pow(2)
-            + buf[3] * 85
-            + buf[4];
-        out.extend_from_slice(&v.to_be_bytes()[..n - 1]);
+        if let Some(v) = pack(&buf) {
+            out.extend_from_slice(&v.to_be_bytes()[..n - 1]);
+        }
     }
     out
 }
@@ -958,6 +965,15 @@ endobj
         // and the `~` sentinel) are silently skipped. Four bytes of `!`
         // produce 3 padded output bytes (`n - 1`).
         assert_eq!(decode_ascii85(b"!\xFF!!!~>"), vec![0u8, 0, 0]);
+    }
+
+    #[test]
+    fn ascii85_oversized_group_is_skipped_not_panicking() {
+        // Five `u` characters decode to 84*85^4 + ... > u32::MAX. The
+        // legacy u32 arithmetic panicked in debug; we now skip the group
+        // and return whatever decoded successfully (nothing here).
+        let out = decode_ascii85(b"uuuuu~>");
+        assert!(out.is_empty());
     }
 
     #[test]
