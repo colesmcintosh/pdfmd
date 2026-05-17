@@ -7,18 +7,33 @@
 use super::object::{Dictionary, Object, ObjectId, Stream};
 use super::PdfError;
 
+/// Cap on container nesting depth. Real PDFs nest a handful of levels at
+/// most; this guards against malformed input like `[[[[...]]]]` that would
+/// blow the stack via mutual recursion through parse_object → parse_array
+/// / parse_dictionary.
+const MAX_PARSE_DEPTH: u32 = 256;
+
 pub struct Parser<'a> {
     bytes: &'a [u8],
     pub pos: usize,
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+        Self {
+            bytes,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, pos }
+        Self {
+            bytes,
+            pos,
+            depth: 0,
+        }
     }
 
     // ---- Whitespace / comments -------------------------------------------
@@ -308,45 +323,62 @@ impl<'a> Parser<'a> {
     fn parse_array(&mut self) -> Result<Object, PdfError> {
         debug_assert_eq!(self.bytes[self.pos], b'[');
         self.pos += 1;
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(PdfError::BadObject("nested too deep".into()));
+        }
+        self.depth += 1;
         let mut items = Vec::new();
-        loop {
+        let result = loop {
             self.skip_ws_and_comments();
             match self.bytes.get(self.pos) {
                 Some(b']') => {
                     self.pos += 1;
-                    return Ok(Object::Array(items));
+                    break Ok(Object::Array(items));
                 }
-                None => return Err(PdfError::BadObject("unterminated array".into())),
-                _ => items.push(self.parse_object()?),
+                None => break Err(PdfError::BadObject("unterminated array".into())),
+                _ => match self.parse_object() {
+                    Ok(item) => items.push(item),
+                    Err(e) => break Err(e),
+                },
             }
-        }
+        };
+        self.depth -= 1;
+        result
     }
 
     fn parse_dictionary(&mut self) -> Result<Object, PdfError> {
         debug_assert_eq!(&self.bytes[self.pos..self.pos + 2], b"<<");
         self.pos += 2;
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(PdfError::BadObject("nested too deep".into()));
+        }
+        self.depth += 1;
         let mut dict = Dictionary::new();
-        loop {
+        let result = loop {
             self.skip_ws_and_comments();
             if self.bytes.get(self.pos..self.pos + 2) == Some(b">>") {
                 self.pos += 2;
-                return Ok(Object::Dictionary(dict));
+                break Ok(Object::Dictionary(dict));
             }
             if self.bytes.get(self.pos) != Some(&b'/') {
-                return Err(PdfError::BadObject(format!(
+                break Err(PdfError::BadObject(format!(
                     "dict expected name at offset {}",
                     self.pos
                 )));
             }
             // parse_name always returns Object::Name on success.
-            let key = self
-                .parse_name()?
-                .as_name()
-                .expect("parse_name returns Name")
-                .to_vec();
-            let value = self.parse_object()?;
+            let key = match self.parse_name() {
+                Ok(k) => k.as_name().expect("parse_name returns Name").to_vec(),
+                Err(e) => break Err(e),
+            };
+            let value = match self.parse_object() {
+                Ok(v) => v,
+                Err(e) => break Err(e),
+            };
             dict.insert(key, value);
-        }
+        };
+        self.depth -= 1;
+        result
     }
 
     // ---- Indirect objects + streams --------------------------------------
@@ -879,6 +911,26 @@ endobj
         );
         let mut p = Parser::new(bytes.as_bytes());
         assert!(p.parse_indirect_object().is_err());
+    }
+
+    #[test]
+    fn deeply_nested_array_errors_instead_of_overflowing_stack() {
+        // 10_000 levels of `[` would smash the stack without the depth cap.
+        let input = vec![b'['; 10_000];
+        let mut p = Parser::new(&input);
+        let err = p.parse_object().unwrap_err();
+        assert!(err.to_string().contains("nested too deep"));
+    }
+
+    #[test]
+    fn deeply_nested_dictionary_errors_instead_of_overflowing_stack() {
+        let mut input = Vec::new();
+        for _ in 0..2_000 {
+            input.extend_from_slice(b"<</K ");
+        }
+        let mut p = Parser::new(&input);
+        let err = p.parse_object().unwrap_err();
+        assert!(err.to_string().contains("nested too deep"));
     }
 
     #[test]
