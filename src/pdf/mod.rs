@@ -480,14 +480,30 @@ fn be_uint(bytes: &[u8]) -> u64 {
 // ---- Object streams (PDF 1.5+) ---------------------------------------------
 
 fn parse_object_stream(dict: &Dictionary, decoded: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, PdfError> {
-    let n = dict
+    let n_raw = dict
         .get(b"N")
         .and_then(Object::as_integer)
-        .ok_or_else(|| PdfError::BadObject("objstm missing /N".into()))? as usize;
-    let first =
-        dict.get(b"First")
-            .and_then(Object::as_integer)
-            .ok_or_else(|| PdfError::BadObject("objstm missing /First".into()))? as usize;
+        .ok_or_else(|| PdfError::BadObject("objstm missing /N".into()))?;
+    let first_raw = dict
+        .get(b"First")
+        .and_then(Object::as_integer)
+        .ok_or_else(|| PdfError::BadObject("objstm missing /First".into()))?;
+    // /N is an entry count; a negative or absurd value cast through
+    // `as usize` would otherwise become ~1.8×10^19 and abort the allocator
+    // on the with_capacity below. Each header is at least two bytes
+    // ("0 0"), so cap by `decoded.len() / 2`.
+    if n_raw < 0 || (n_raw as u64) > decoded.len() as u64 / 2 {
+        return Err(PdfError::BadObject(format!(
+            "objstm /N out of range: {n_raw}"
+        )));
+    }
+    if first_raw < 0 || (first_raw as u64) > decoded.len() as u64 {
+        return Err(PdfError::BadObject(format!(
+            "objstm /First out of range: {first_raw}"
+        )));
+    }
+    let n = n_raw as usize;
+    let first = first_raw as usize;
 
     // Header: N pairs of "obj_num offset" pointing into the body at byte
     // /First. The Nth object ends at the next offset (or end of stream).
@@ -1604,6 +1620,39 @@ endobj
         let mut dict = Dictionary::new();
         dict.insert(b"N".to_vec(), Object::Integer(0));
         assert!(parse_object_stream(&dict, b"").is_err());
+    }
+
+    #[test]
+    fn parse_object_stream_rejects_negative_or_huge_n() {
+        // A negative /N cast through `as usize` is ~1.8×10^19 and would
+        // abort the allocator on Vec::with_capacity below.
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(-1));
+        dict.insert(b"First".to_vec(), Object::Integer(0));
+        let err = parse_object_stream(&dict, b"").unwrap_err();
+        assert!(err.to_string().contains("/N out of range"));
+
+        // /N larger than the decoded payload can possibly hold.
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(i64::MAX));
+        dict.insert(b"First".to_vec(), Object::Integer(0));
+        let err = parse_object_stream(&dict, b"short").unwrap_err();
+        assert!(err.to_string().contains("/N out of range"));
+    }
+
+    #[test]
+    fn parse_object_stream_rejects_negative_or_huge_first() {
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(0));
+        dict.insert(b"First".to_vec(), Object::Integer(-1));
+        let err = parse_object_stream(&dict, b"").unwrap_err();
+        assert!(err.to_string().contains("/First out of range"));
+
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(0));
+        dict.insert(b"First".to_vec(), Object::Integer(i64::MAX));
+        let err = parse_object_stream(&dict, b"short").unwrap_err();
+        assert!(err.to_string().contains("/First out of range"));
     }
 
     // ---- Xref streams ---------------------------------------------------
