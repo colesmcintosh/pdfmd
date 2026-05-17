@@ -668,18 +668,27 @@ fn apply_predictor(data: &[u8], parms: &Dictionary) -> Result<Vec<u8>, PdfError>
     if predictor <= 1 {
         return Ok(data.to_vec());
     }
-    let columns = parms
-        .get(b"Columns")
-        .and_then(Object::as_integer)
-        .unwrap_or(1) as usize;
-    let colors = parms
-        .get(b"Colors")
-        .and_then(Object::as_integer)
-        .unwrap_or(1) as usize;
-    let bpc = parms
-        .get(b"BitsPerComponent")
-        .and_then(Object::as_integer)
-        .unwrap_or(8) as usize;
+    // /Columns, /Colors, /BitsPerComponent are i64 in the source dict.
+    // Without bounds, a malicious file can pick values whose product
+    // (columns * colors * bpc) wraps in release builds and misallocates,
+    // or panics in debug. Clamp each to a range that comfortably covers
+    // any legitimate image / xref-stream.
+    let read_clamped = |key: &[u8], default: i64, max: i64| -> Result<usize, PdfError> {
+        let v = parms
+            .get(key)
+            .and_then(Object::as_integer)
+            .unwrap_or(default);
+        if v < 1 || v > max {
+            return Err(PdfError::BadFilter(format!(
+                "predictor /{} out of range: {v}",
+                std::str::from_utf8(key).unwrap_or("?")
+            )));
+        }
+        Ok(v as usize)
+    };
+    let columns = read_clamped(b"Columns", 1, 1 << 20)?;
+    let colors = read_clamped(b"Colors", 1, 32)?;
+    let bpc = read_clamped(b"BitsPerComponent", 8, 32)?;
     let bpp = ((colors * bpc) + 7) / 8;
     let row_len = ((columns * colors * bpc) + 7) / 8;
     if row_len == 0 {
@@ -1071,11 +1080,32 @@ endobj
     }
 
     #[test]
-    fn predictor_zero_row_returns_empty() {
+    fn predictor_rejects_out_of_range_columns() {
         let mut params = Dictionary::new();
         params.insert(b"Predictor".to_vec(), Object::Integer(12));
         params.insert(b"Columns".to_vec(), Object::Integer(0));
-        assert!(apply_predictor(&[1, 2, 3], &params).unwrap().is_empty());
+        assert!(apply_predictor(&[1, 2, 3], &params).is_err());
+    }
+
+    #[test]
+    fn predictor_rejects_huge_columns_that_would_overflow_row_len() {
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor".to_vec(), Object::Integer(12));
+        params.insert(b"Columns".to_vec(), Object::Integer(i64::MAX));
+        assert!(apply_predictor(&[1, 2, 3], &params).is_err());
+    }
+
+    #[test]
+    fn predictor_rejects_negative_colors_and_bpc() {
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor".to_vec(), Object::Integer(12));
+        params.insert(b"Colors".to_vec(), Object::Integer(-1));
+        assert!(apply_predictor(&[1, 2, 3], &params).is_err());
+
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor".to_vec(), Object::Integer(12));
+        params.insert(b"BitsPerComponent".to_vec(), Object::Integer(-1));
+        assert!(apply_predictor(&[1, 2, 3], &params).is_err());
     }
 
     #[test]
