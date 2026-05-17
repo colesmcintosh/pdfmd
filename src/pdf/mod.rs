@@ -1304,6 +1304,44 @@ endobj
     }
 
     #[test]
+    fn document_load_skips_uncompressed_entries_that_fail_to_parse() {
+        // The catalog/pages/page chain is valid, but the xref also lists
+        // an obj 4 at a bogus byte offset where no `4 0 obj` header
+        // actually starts. parse_at returns None and the entry is
+        // silently dropped.
+        let body = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+";
+        let mut out = body.to_vec();
+        let xref_offset = out.len();
+        let offsets: Vec<usize> = (1..=3)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                find_subslice(&out, needle.as_bytes()).unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 5\n0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        // Entry 4: offset 5 — points into the middle of `%PDF-1.4` where
+        // there is no indirect-object header. parse_at returns None.
+        xref.push_str("0000000005 00000 n \n");
+        xref.push_str(&format!(
+            "trailer <</Size 5/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        out.extend_from_slice(xref.as_bytes());
+        let doc = Document::load(&out).expect("load");
+        // The non-existent obj 4 was dropped, but the catalog/pages/page
+        // chain is intact.
+        assert_eq!(doc.pages().len(), 1);
+        assert!(doc.get_object(ObjectId(4, 0)).is_none());
+    }
+
+    #[test]
     fn document_load_propagates_objstm_decode_error() {
         // Build a PDF whose object stream has /Filter /FlateDecode but a
         // garbage body. decode_filters errors → propagates through
@@ -1344,6 +1382,65 @@ endobj
         bytes.extend_from_slice(b"\nendstream endobj\n");
         bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
         assert!(Document::load(&bytes).is_err());
+    }
+
+    #[test]
+    fn document_load_falls_back_to_index_based_objstm_lookup() {
+        // Some producers don't put the actual object id in the objstm
+        // header. The xref references obj 1 as compressed[0] in objstm 4,
+        // but the body's header claims it's obj 99. The find-by-number
+        // misses, and the index-based fallback should still pick up the
+        // payload at slot 0.
+        let obj_body = "<</Type/Catalog/Pages 2 0 R>>";
+        let mismatched_header = "99 0 ".to_string();
+        let first = mismatched_header.len();
+        let mut objstm_payload = mismatched_header.into_bytes();
+        objstm_payload.extend_from_slice(obj_body.as_bytes());
+
+        let mut body = String::from("%PDF-1.5\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
+        );
+        let off4 = body.len();
+        body.push_str(&format!(
+            "4 0 obj <</Type/ObjStm/N 1/First {first}/Length {}>>\nstream\n",
+            objstm_payload.len()
+        ));
+        let mut bytes = body.into_bytes();
+        bytes.extend_from_slice(&objstm_payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        let xref_offset = bytes.len();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]); // entry 0 free
+                                                  // entry 1: catalog — compressed in objstm 4 at index 0. The body
+                                                  // header claims it's obj 99; the loader's index fallback rescues us.
+        payload.push(2);
+        payload.extend_from_slice(&4u16.to_be_bytes());
+        payload.push(0);
+        for &off in &[off2, off3, off4] {
+            payload.push(1);
+            payload.extend_from_slice(&(off as u16).to_be_bytes());
+            payload.push(0);
+        }
+        // entry 5: xref stream itself.
+        payload.push(1);
+        payload.extend_from_slice(&(xref_offset as u16).to_be_bytes());
+        payload.push(0);
+        bytes.extend_from_slice(
+            format!(
+                "5 0 obj <</Type/XRef/Size 6/Root 1 0 R/W [1 2 1]/Length {}>>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        let doc = Document::load(&bytes).expect("load");
+        assert_eq!(doc.pages().len(), 1);
     }
 
     #[test]

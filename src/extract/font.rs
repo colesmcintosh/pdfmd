@@ -262,6 +262,17 @@ mod tests {
     }
 
     #[test]
+    fn build_doc_pads_missing_ids_with_free_xref_entries() {
+        // Skipping ids exercises build_doc's `else` arm — id 4 is
+        // present, but the helper still emits ids 1..=4 in the xref
+        // table by padding 1..=3 with `f` markers. Without this test
+        // that padding branch never runs.
+        let doc = build_doc(&[(8, "<</Type/Font/Subtype/Type1/BaseFont/Helv>>")]);
+        let font = PdfFont::from_object(&doc, ObjectId(8, 0));
+        assert_eq!(font.kind, FontKind::Simple);
+    }
+
+    #[test]
     fn type0_font_uses_composite_kind() {
         let doc = build_doc(&[(4, "<</Type/Font/Subtype/Type0/BaseFont/Foo>>")]);
         let font = PdfFont::from_object(&doc, ObjectId(4, 0));
