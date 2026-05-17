@@ -442,7 +442,15 @@ fn read_xref_stream(
             };
             let f1 = be_uint(&row_bytes[widths[0]..widths[0] + widths[1]]);
             let f2 = be_uint(&row_bytes[widths[0] + widths[1]..]);
-            let id = ObjectId(first + i, 0);
+            // Reject Index entries whose `first + count` would wrap u32 —
+            // the wrapped object id would silently alias a different
+            // object on read.
+            let Some(n) = first.checked_add(i) else {
+                return Err(PdfError::BadXref(
+                    "xref stream /Index range overflows u32".into(),
+                ));
+            };
+            let id = ObjectId(n, 0);
             if out.contains_key(&id) {
                 continue;
             }
