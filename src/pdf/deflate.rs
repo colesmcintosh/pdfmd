@@ -10,6 +10,12 @@ use super::PdfError;
 const MAX_BITS: u32 = 15;
 const TABLE_SIZE: usize = 1 << MAX_BITS;
 
+/// Upper bound on the decompressed size of a single FlateDecode stream.
+/// Cheap protection against decompression bombs — a few-KB input that
+/// expands to many GB and exhausts the allocator. PDFs we care about are
+/// nowhere near this size per stream.
+const MAX_INFLATE_OUTPUT: usize = 128 * 1024 * 1024;
+
 const LENGTH_BASE: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
@@ -63,7 +69,8 @@ pub fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>, PdfError> {
 pub fn inflate_raw(input: &[u8]) -> Result<Vec<u8>, PdfError> {
     let mut reader = BitReader::new(input);
     // Generous initial guess: most PDF streams expand 2-4x.
-    let mut out = Vec::with_capacity(input.len() * 4);
+    let initial_capacity = input.len().saturating_mul(4).min(MAX_INFLATE_OUTPUT);
+    let mut out = Vec::with_capacity(initial_capacity);
     loop {
         let bfinal = reader.read(1);
         let btype = reader.read(2);
@@ -95,6 +102,11 @@ fn decode_stored(reader: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Pd
     if (len as u16) != !nlen {
         return Err(PdfError::Deflate("stored block LEN/NLEN mismatch".into()));
     }
+    if out.len().saturating_add(len) > MAX_INFLATE_OUTPUT {
+        return Err(PdfError::Deflate(
+            "inflate output exceeded maximum size".into(),
+        ));
+    }
     out.reserve(len);
     for _ in 0..len {
         let b = reader
@@ -114,6 +126,11 @@ fn decode_huffman(
     loop {
         let sym = ll.decode(reader)?;
         if sym < 256 {
+            if out.len() >= MAX_INFLATE_OUTPUT {
+                return Err(PdfError::Deflate(
+                    "inflate output exceeded maximum size".into(),
+                ));
+            }
             out.push(sym as u8);
         } else if sym == 256 {
             return Ok(());
@@ -130,6 +147,11 @@ fn decode_huffman(
                     "distance {distance} out of bounds (have {})",
                     out.len()
                 )));
+            }
+            if out.len().saturating_add(length) > MAX_INFLATE_OUTPUT {
+                return Err(PdfError::Deflate(
+                    "inflate output exceeded maximum size".into(),
+                ));
             }
             copy_match(out, length, distance);
         }
@@ -593,6 +615,17 @@ mod tests {
         // with "invalid Huffman code", which we surface as Err.
         let bad = [0x05u8, 0x00, 0x00, 0x00, 0x00];
         assert!(inflate_raw(&bad).is_err());
+    }
+
+    #[test]
+    fn stored_block_rejects_output_beyond_cap() {
+        // A stored block whose declared LEN alone would exceed the inflate
+        // output cap: we want the decoder to refuse before it allocates.
+        let mut out = vec![0u8; MAX_INFLATE_OUTPUT - 8];
+        let mut reader = BitReader::new(&[0x10, 0x00, 0xEF, 0xFF]);
+        reader.align_byte();
+        let err = decode_stored(&mut reader, &mut out).unwrap_err();
+        assert!(err.to_string().contains("maximum size"));
     }
 
     #[test]
