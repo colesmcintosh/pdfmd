@@ -13,6 +13,13 @@ use super::PdfError;
 /// / parse_dictionary.
 const MAX_PARSE_DEPTH: u32 = 256;
 
+/// Cap on the number of entries in a single dictionary. `Dictionary::insert`
+/// is an O(n) linear scan on each call, so a malformed file with 100k+
+/// entries would turn the load into an O(n²) hang. Real PDF dicts have a
+/// handful of entries; the largest legitimate cases (e.g. font /CharProcs)
+/// stay well under this limit.
+const MAX_DICT_ENTRIES: usize = 4096;
+
 pub struct Parser<'a> {
     bytes: &'a [u8],
     pub pos: usize,
@@ -354,6 +361,7 @@ impl<'a> Parser<'a> {
         }
         self.depth += 1;
         let mut dict = Dictionary::new();
+        let mut entries: usize = 0;
         let result = loop {
             self.skip_ws_and_comments();
             if self.bytes.get(self.pos..self.pos + 2) == Some(b">>") {
@@ -366,6 +374,11 @@ impl<'a> Parser<'a> {
                     self.pos
                 )));
             }
+            if entries >= MAX_DICT_ENTRIES {
+                break Err(PdfError::BadObject(format!(
+                    "dictionary entries exceed cap of {MAX_DICT_ENTRIES}"
+                )));
+            }
             // parse_name always returns Object::Name on success.
             let key = match self.parse_name() {
                 Ok(k) => k.as_name().expect("parse_name returns Name").to_vec(),
@@ -376,6 +389,7 @@ impl<'a> Parser<'a> {
                 Err(e) => break Err(e),
             };
             dict.insert(key, value);
+            entries += 1;
         };
         self.depth -= 1;
         result
@@ -920,6 +934,21 @@ endobj
         let mut p = Parser::new(&input);
         let err = p.parse_object().unwrap_err();
         assert!(err.to_string().contains("nested too deep"));
+    }
+
+    #[test]
+    fn dictionary_with_too_many_entries_errors() {
+        // Synthesise a dict with MAX_DICT_ENTRIES + 1 unique keys. Each
+        // insert is an O(n) scan, but 4097 entries is still cheap enough
+        // for the test harness; the point is that the cap fires.
+        let mut input = Vec::from(&b"<<"[..]);
+        for i in 0..(MAX_DICT_ENTRIES + 1) {
+            input.extend_from_slice(format!(" /K{i} {i}").as_bytes());
+        }
+        input.extend_from_slice(b" >>");
+        let mut p = Parser::new(&input);
+        let err = p.parse_object().unwrap_err();
+        assert!(err.to_string().contains("exceed cap"));
     }
 
     #[test]
