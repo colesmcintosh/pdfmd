@@ -76,29 +76,27 @@ once into a document-wide cache. The content-stream tokenizer and the
 DEFLATE decoder both borrow operands directly from the source bytes, so
 the hot path doesn't allocate per operator or per Huffman code.
 
-The [LiteParse v2 announcement][liteparse-v2] reports timings for four
-PDF shapes. Mirroring those page counts with local synthetic PDFs, warmed
-in-process `pdfmd` conversion measured:
+Other libraries publish timings for four common PDF shapes. Mirroring those
+page counts with local synthetic PDFs, warmed in-process `pdfmd` conversion
+measured:
 
-| document shape | LiteParse v2 published | `pdfmd` local run | speedup | less wall time |
-|----------------|------------------------|-------------------|---------|----------------|
+| document shape | other-library published | `pdfmd` local run | speedup | less wall time |
+|----------------|-------------------------|-------------------|---------|----------------|
 | `1_page.pdf` | `2.0 ms` | `0.012 ms` | ~167x | ~99.4% |
 | `24_pages.pdf` | `41.0 ms` | `0.118 ms` | ~347x | ~99.7% |
 | `60_pages.pdf` | `123.0 ms` | `0.201 ms` | ~612x | ~99.8% |
 | `457_pages.pdf` | `777.0 ms` | `0.933 ms` | ~833x | ~99.9% |
 
-Those comparisons are throughput targets against the published LiteParse
-v2 numbers, not a claim against LiteParse's exact benchmark corpus or
-hardware. The 457-page local input is a synthetic 100 MB PDF; the smaller
-rows are synthetic text PDFs with matching page counts.
+Those comparisons are throughput targets against other published library
+numbers, not a claim against those exact benchmark corpora or hardware.
+The 457-page local input is a synthetic 100 MB PDF; the smaller rows are
+synthetic text PDFs with matching page counts.
 
 With image extraction enabled on the 457-page, 100 MB local input,
 `target/release/pdfmd ... --extract-images` averaged `52.4 ms ± 10.0 ms`
 over 10 `hyperfine` runs. That is still ~14.8x faster than the published
 `0.777 s` target. A decoded-raster image fixture, which exercises PNG
 generation instead of JPEG pass-through, averaged `170.2 ms ± 4.8 ms`.
-
-[liteparse-v2]: https://www.llamaindex.ai/blog/liteparse-v2-0-runs-everywhere
 
 ## Testing & coverage
 
