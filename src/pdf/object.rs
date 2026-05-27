@@ -146,10 +146,7 @@ mod tests {
                 d.insert(b"k".to_vec(), Object::Integer(1));
                 d
             }),
-            Object::Stream(Stream {
-                dict: Dictionary::new(),
-                content: vec![1, 2, 3],
-            }),
+            Object::Stream(Stream::owned(Dictionary::new(), vec![1, 2, 3])),
             Object::Reference(ObjectId(9, 0)),
         ]
     }
@@ -219,5 +216,48 @@ pub struct Stream {
     /// Raw bytes as they appear in the file — filters have **not** been
     /// applied. Use [`crate::pdf::Document::decode_stream`] to materialise
     /// the decoded payload.
-    pub content: Vec<u8>,
+    pub content: StreamContent,
+}
+
+impl Stream {
+    pub fn borrowed(dict: Dictionary, start: usize, len: usize) -> Self {
+        Self {
+            dict,
+            content: StreamContent::Borrowed { start, len },
+        }
+    }
+
+    #[cfg(test)]
+    pub fn owned(dict: Dictionary, content: Vec<u8>) -> Self {
+        Self {
+            dict,
+            content: StreamContent::Owned(content),
+        }
+    }
+
+    pub fn content<'a>(&'a self, pdf_bytes: &'a [u8]) -> &'a [u8] {
+        self.content.as_slice(pdf_bytes)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamContent {
+    /// Byte range into the original PDF input.
+    Borrowed { start: usize, len: usize },
+    /// Owned payload used by tests and defensive parsing of embedded streams.
+    #[cfg(test)]
+    Owned(Vec<u8>),
+}
+
+impl StreamContent {
+    fn as_slice<'a>(&'a self, pdf_bytes: &'a [u8]) -> &'a [u8] {
+        match self {
+            StreamContent::Borrowed { start, len } => start
+                .checked_add(*len)
+                .and_then(|end| pdf_bytes.get(*start..end))
+                .unwrap_or_default(),
+            #[cfg(test)]
+            StreamContent::Owned(bytes) => bytes,
+        }
+    }
 }

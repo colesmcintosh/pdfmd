@@ -6,16 +6,33 @@
 //! object id. Encryption and incremental updates beyond a single `/Prev`
 //! chain are out of scope.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 
 mod deflate;
+mod filter;
 mod object;
+mod object_stream;
+mod page_tree;
 mod parser;
+mod xref;
 
 pub use object::{Dictionary, Object, ObjectId, Stream};
 
+use filter::decode_filters;
+#[cfg(test)]
+use filter::{
+    apply_filter, apply_predictor, collect_filters, collect_parms, decode_ascii85,
+    decode_ascii_hex, paeth,
+};
+use object_stream::parse_object_stream;
+use page_tree::collect_pages;
+#[cfg(test)]
+use page_tree::walk_pages;
 use parser::Parser;
+#[cfg(test)]
+use xref::{be_uint, read_uint, read_xref_stream, skip_eol, skip_inline};
+use xref::{find_startxref, read_xref_chain, XrefEntry};
 
 // ---- Errors ----------------------------------------------------------------
 
@@ -44,25 +61,17 @@ impl std::error::Error for PdfError {}
 
 // ---- Document --------------------------------------------------------------
 
-/// Where an object actually lives. Classic xref entries are `Uncompressed`;
-/// PDF 1.5+ object streams produce `Compressed` entries instead.
-#[derive(Debug, Clone, Copy)]
-enum XrefEntry {
-    Free,
-    Uncompressed { offset: u64 },
-    Compressed { stream_obj: u32, index: u32 },
-}
-
-pub struct Document {
+pub struct Document<'a> {
+    bytes: &'a [u8],
     objects: HashMap<ObjectId, Object>,
     pages: Vec<ObjectId>,
 }
 
-impl Document {
+impl<'a> Document<'a> {
     /// Parse the entire PDF byte slice and resolve every live indirect
     /// object. Returns a self-contained `Document` that can be shared by
     /// reference across threads.
-    pub fn load(bytes: &[u8]) -> Result<Self, PdfError> {
+    pub fn load(bytes: &'a [u8]) -> Result<Self, PdfError> {
         if !bytes.starts_with(b"%PDF-") {
             return Err(PdfError::NotPdf);
         }
@@ -98,7 +107,7 @@ impl Document {
                     let Some(Object::Stream(s)) = objects.get(&stream_id) else {
                         continue;
                     };
-                    let decoded = decode_filters(s)?;
+                    let decoded = decode_filters(s, bytes)?;
                     let entries = parse_object_stream(&s.dict, &decoded)?;
                     objstm_cache.insert(*stream_obj, entries);
                     &objstm_cache[stream_obj]
@@ -121,7 +130,11 @@ impl Document {
 
         let pages = collect_pages(&objects, &trailer)?;
 
-        Ok(Document { objects, pages })
+        Ok(Document {
+            bytes,
+            objects,
+            pages,
+        })
     }
 
     pub fn get_object(&self, id: ObjectId) -> Option<&Object> {
@@ -129,7 +142,7 @@ impl Document {
     }
 
     /// Follow a chain of indirect references and return the terminal object.
-    pub fn deref<'a>(&'a self, obj: &'a Object) -> &'a Object {
+    pub fn deref<'s>(&'s self, obj: &'s Object) -> &'s Object {
         let mut current = obj;
         for _ in 0..32 {
             match current {
@@ -153,12 +166,12 @@ impl Document {
         let page = self.get_object(page_id)?.as_dict()?;
         let contents = page.get(b"Contents")?;
         match self.deref(contents) {
-            Object::Stream(s) => decode_filters(s).ok(),
+            Object::Stream(s) => decode_filters(s, self.bytes).ok(),
             Object::Array(items) => {
                 let mut out = Vec::new();
                 for item in items {
                     if let Object::Stream(s) = self.deref(item) {
-                        if let Ok(mut bytes) = decode_filters(s) {
+                        if let Ok(mut bytes) = decode_filters(s, self.bytes) {
                             // PDF content streams may abut without trailing
                             // whitespace; the spec wants us to insert one.
                             if !out.is_empty()
@@ -178,595 +191,11 @@ impl Document {
 
     /// Decode the stream's `/Filter` chain and return the resulting bytes.
     pub fn decode_stream(&self, stream: &Stream) -> Result<Vec<u8>, PdfError> {
-        decode_filters(stream)
-    }
-}
-
-// ---- Page tree walk --------------------------------------------------------
-
-fn collect_pages(
-    objects: &HashMap<ObjectId, Object>,
-    trailer: &Dictionary,
-) -> Result<Vec<ObjectId>, PdfError> {
-    let root_ref = trailer
-        .get(b"Root")
-        .and_then(Object::as_reference)
-        .ok_or_else(|| PdfError::BadObject("trailer /Root missing".into()))?;
-    let catalog = objects
-        .get(&root_ref)
-        .and_then(Object::as_dict)
-        .ok_or_else(|| PdfError::BadObject("catalog missing".into()))?;
-    let pages_ref = catalog
-        .get(b"Pages")
-        .and_then(Object::as_reference)
-        .ok_or_else(|| PdfError::BadObject("/Pages missing".into()))?;
-
-    let mut out = Vec::new();
-    walk_pages(objects, pages_ref, &mut out, 0)?;
-    Ok(out)
-}
-
-fn walk_pages(
-    objects: &HashMap<ObjectId, Object>,
-    node_id: ObjectId,
-    out: &mut Vec<ObjectId>,
-    depth: u32,
-) -> Result<(), PdfError> {
-    if depth > 64 {
-        return Err(PdfError::BadObject("page tree too deep".into()));
-    }
-    let Some(node) = objects.get(&node_id).and_then(Object::as_dict) else {
-        return Ok(());
-    };
-    let type_ = node.get(b"Type").and_then(Object::as_name);
-    if type_ == Some(b"Page".as_slice()) {
-        out.push(node_id);
-        return Ok(());
-    }
-    let Some(kids) = node.get(b"Kids").and_then(Object::as_array) else {
-        return Ok(());
-    };
-    for kid in kids {
-        if let Some(kid_id) = kid.as_reference() {
-            // Decide leaf vs interior by the kid's own /Type so we tolerate
-            // producers that omit /Type on the root /Pages node.
-            let kid_dict = objects.get(&kid_id).and_then(Object::as_dict);
-            let kt = kid_dict
-                .and_then(|d| d.get(b"Type"))
-                .and_then(Object::as_name);
-            if kt == Some(b"Page".as_slice()) {
-                out.push(kid_id);
-            } else {
-                walk_pages(objects, kid_id, out, depth + 1)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-// ---- Xref reading ----------------------------------------------------------
-
-fn find_startxref(bytes: &[u8]) -> Result<u64, PdfError> {
-    // Spec: `startxref` then offset then `%%EOF`, within the last 1024 bytes.
-    let tail_start = bytes.len().saturating_sub(2048);
-    let tail = &bytes[tail_start..];
-    let needle = b"startxref";
-    let pos = (0..tail.len().saturating_sub(needle.len()))
-        .rev()
-        .find(|&i| &tail[i..i + needle.len()] == needle)
-        .ok_or_else(|| PdfError::BadXref("missing startxref".into()))?;
-    let mut i = pos + needle.len();
-    while i < tail.len() && tail[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let n_start = i;
-    while i < tail.len() && tail[i].is_ascii_digit() {
-        i += 1;
-    }
-    // The slice is digit-only by construction, so utf-8 always holds. Parse
-    // failures only happen on integer overflow — a ~10^19 offset PDF.
-    let s = std::str::from_utf8(&tail[n_start..i]).expect("digit slice is utf-8");
-    s.parse::<u64>()
-        .map_err(|_| PdfError::BadXref("startxref not numeric".into()))
-}
-
-fn read_xref_chain(
-    bytes: &[u8],
-    startxref: u64,
-) -> Result<(BTreeMap<ObjectId, XrefEntry>, Dictionary), PdfError> {
-    let mut entries: BTreeMap<ObjectId, XrefEntry> = BTreeMap::new();
-    let mut final_trailer: Option<Dictionary> = None;
-    let mut visited: HashMap<u64, ()> = HashMap::new();
-    let mut current = startxref;
-    loop {
-        if visited.contains_key(&current) {
-            break;
-        }
-        visited.insert(current, ());
-
-        let trailer = if at_keyword(bytes, current as usize, b"xref") {
-            read_classic_xref(bytes, current as usize, &mut entries)?
-        } else {
-            read_xref_stream(bytes, current as usize, &mut entries)?
-        };
-
-        // Earliest occurrence wins for incremental updates: the entry from
-        // the most-recent xref is already in the map by the time we follow
-        // /Prev, so we just don't overwrite it.
-        let prev = trailer
-            .get(b"Prev")
-            .and_then(Object::as_integer)
-            .filter(|n| *n > 0);
-
-        if final_trailer.is_none() {
-            final_trailer = Some(trailer);
-        }
-        match prev {
-            Some(p) => current = p as u64,
-            None => break,
-        }
-    }
-    // The loop always runs at least once (visited is empty on entry) and
-    // sets final_trailer before any subsequent iteration. If the first
-    // xref read errors we've already returned via `?`.
-    Ok((
-        entries,
-        final_trailer.expect("first iteration sets trailer"),
-    ))
-}
-
-fn at_keyword(bytes: &[u8], at: usize, kw: &[u8]) -> bool {
-    bytes.get(at..at + kw.len()).is_some_and(|w| w == kw)
-}
-
-fn read_classic_xref(
-    bytes: &[u8],
-    at: usize,
-    out: &mut BTreeMap<ObjectId, XrefEntry>,
-) -> Result<Dictionary, PdfError> {
-    let mut p = Parser::with_pos(bytes, at + b"xref".len());
-    p.skip_ws_and_comments();
-    loop {
-        // Section header: `first count`. The `trailer` keyword ends it.
-        let pos = p.pos;
-        if at_keyword(bytes, pos, b"trailer") {
-            p.pos += b"trailer".len();
-            break;
-        }
-        let first = read_uint(bytes, &mut p.pos)?;
-        skip_inline(bytes, &mut p.pos);
-        let count = read_uint(bytes, &mut p.pos)?;
-        skip_eol(bytes, &mut p.pos);
-        // Each entry occupies exactly 20 bytes. A malformed file may
-        // declare `count` close to u32::MAX; the per-entry truncation
-        // check below would still catch it, but only after iterating
-        // billions of times. Bound by the remaining bytes up front, and
-        // refuse subsection bases that would overflow when added to count.
-        let bytes_remaining = (bytes.len() - p.pos) as u64;
-        if (count as u64) * 20 > bytes_remaining {
-            return Err(PdfError::BadXref(format!(
-                "xref subsection count {count} exceeds remaining input"
-            )));
-        }
-        if first.checked_add(count).is_none() {
-            return Err(PdfError::BadXref(
-                "xref subsection first+count overflows u32".into(),
-            ));
-        }
-        for i in 0..count {
-            // Each entry is 20 bytes exactly per the spec.
-            if p.pos + 20 > bytes.len() {
-                return Err(PdfError::BadXref("xref entry truncated".into()));
-            }
-            let row = &bytes[p.pos..p.pos + 20];
-            p.pos += 20;
-            // Spec mandates 10 ASCII digits + space + 5 ASCII digits, both
-            // always valid utf-8 — non-utf8 indicates a malformed PDF that
-            // we'd reject elsewhere too.
-            let offset_s = std::str::from_utf8(&row[0..10]).expect("ascii digits");
-            let gen_s = std::str::from_utf8(&row[11..16]).expect("ascii digits");
-            let kind = row[17];
-            let n = first + i;
-            let g: u16 = gen_s.trim().parse().unwrap_or(0);
-            let id = ObjectId(n, g);
-            if out.contains_key(&id) {
-                continue;
-            }
-            match kind {
-                b'n' => {
-                    let offset: u64 = offset_s.trim().parse().unwrap_or(0);
-                    out.insert(id, XrefEntry::Uncompressed { offset });
-                }
-                b'f' => {
-                    out.insert(id, XrefEntry::Free);
-                }
-                _ => {}
-            }
-        }
-        p.skip_ws_and_comments();
-    }
-    p.skip_ws_and_comments();
-    let trailer = p.parse_object()?;
-    match trailer {
-        Object::Dictionary(d) => Ok(d),
-        _ => Err(PdfError::BadXref("trailer is not a dictionary".into())),
-    }
-}
-
-fn read_xref_stream(
-    bytes: &[u8],
-    at: usize,
-    out: &mut BTreeMap<ObjectId, XrefEntry>,
-) -> Result<Dictionary, PdfError> {
-    // The cross-reference stream object lives at `at`; its first line is
-    // `N G obj`, same as any indirect object.
-    let mut p = Parser::with_pos(bytes, at);
-    let (_, obj) = p.parse_indirect_object()?;
-    let Object::Stream(stream) = obj else {
-        return Err(PdfError::BadXref("xref stream wasn't a stream".into()));
-    };
-    let dict = stream.dict.clone();
-    let payload = decode_filters(&stream)?;
-
-    let widths: Vec<usize> = dict
-        .get(b"W")
-        .and_then(Object::as_array)
-        .ok_or_else(|| PdfError::BadXref("xref stream missing /W".into()))?
-        .iter()
-        .map(|o| o.as_integer().unwrap_or(0).max(0) as usize)
-        .collect();
-    if widths.len() != 3 {
-        return Err(PdfError::BadXref(format!(
-            "xref stream /W must have 3 entries, got {}",
-            widths.len()
-        )));
-    }
-    let row = widths.iter().sum::<usize>();
-    if row == 0 {
-        return Err(PdfError::BadXref("xref stream row width is zero".into()));
+        decode_filters(stream, self.bytes)
     }
 
-    let size =
-        dict.get(b"Size")
-            .and_then(Object::as_integer)
-            .ok_or_else(|| PdfError::BadXref("xref stream missing /Size".into()))? as u32;
-    let index: Vec<u32> = match dict.get(b"Index").and_then(Object::as_array) {
-        Some(arr) => arr
-            .iter()
-            .map(|o| o.as_integer().unwrap_or(0).max(0) as u32)
-            .collect(),
-        None => vec![0, size],
-    };
-
-    let mut cursor = 0usize;
-    for chunk in index.chunks(2) {
-        if chunk.len() < 2 {
-            break;
-        }
-        let first = chunk[0];
-        let count = chunk[1];
-        for i in 0..count {
-            if cursor + row > payload.len() {
-                return Err(PdfError::BadXref("xref stream truncated".into()));
-            }
-            let row_bytes = &payload[cursor..cursor + row];
-            cursor += row;
-            let t = if widths[0] == 0 {
-                1 // default per spec
-            } else {
-                be_uint(&row_bytes[..widths[0]])
-            };
-            let f1 = be_uint(&row_bytes[widths[0]..widths[0] + widths[1]]);
-            let f2 = be_uint(&row_bytes[widths[0] + widths[1]..]);
-            // Reject Index entries whose `first + count` would wrap u32 —
-            // the wrapped object id would silently alias a different
-            // object on read.
-            let Some(n) = first.checked_add(i) else {
-                return Err(PdfError::BadXref(
-                    "xref stream /Index range overflows u32".into(),
-                ));
-            };
-            let id = ObjectId(n, 0);
-            if out.contains_key(&id) {
-                continue;
-            }
-            match t {
-                0 => {
-                    out.insert(id, XrefEntry::Free);
-                }
-                1 => {
-                    out.insert(id, XrefEntry::Uncompressed { offset: f1 });
-                }
-                2 => {
-                    out.insert(
-                        id,
-                        XrefEntry::Compressed {
-                            stream_obj: f1 as u32,
-                            index: f2 as u32,
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(dict)
-}
-
-fn be_uint(bytes: &[u8]) -> u64 {
-    let mut v: u64 = 0;
-    for &b in bytes {
-        v = (v << 8) | b as u64;
-    }
-    v
-}
-
-// ---- Object streams (PDF 1.5+) ---------------------------------------------
-
-fn parse_object_stream(dict: &Dictionary, decoded: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, PdfError> {
-    let n_raw = dict
-        .get(b"N")
-        .and_then(Object::as_integer)
-        .ok_or_else(|| PdfError::BadObject("objstm missing /N".into()))?;
-    let first_raw = dict
-        .get(b"First")
-        .and_then(Object::as_integer)
-        .ok_or_else(|| PdfError::BadObject("objstm missing /First".into()))?;
-    // /N is an entry count; a negative or absurd value cast through
-    // `as usize` would otherwise become ~1.8×10^19 and abort the allocator
-    // on the with_capacity below. Each header is at least two bytes
-    // ("0 0"), so cap by `decoded.len() / 2`.
-    if n_raw < 0 || (n_raw as u64) > decoded.len() as u64 / 2 {
-        return Err(PdfError::BadObject(format!(
-            "objstm /N out of range: {n_raw}"
-        )));
-    }
-    if first_raw < 0 || (first_raw as u64) > decoded.len() as u64 {
-        return Err(PdfError::BadObject(format!(
-            "objstm /First out of range: {first_raw}"
-        )));
-    }
-    let n = n_raw as usize;
-    let first = first_raw as usize;
-
-    // Header: N pairs of "obj_num offset" pointing into the body at byte
-    // /First. The Nth object ends at the next offset (or end of stream).
-    let mut p = Parser::with_pos(decoded, 0);
-    let mut headers: Vec<(u32, usize)> = Vec::with_capacity(n);
-    for _ in 0..n {
-        p.skip_ws_and_comments();
-        let num = read_uint(decoded, &mut p.pos)?;
-        p.skip_ws_and_comments();
-        let off = read_uint(decoded, &mut p.pos)? as usize;
-        headers.push((num, off));
-    }
-    let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n);
-    for (i, &(num, off)) in headers.iter().enumerate() {
-        let start = first + off;
-        let end = headers
-            .get(i + 1)
-            .map(|(_, next_off)| first + *next_off)
-            .unwrap_or(decoded.len());
-        if start <= end && end <= decoded.len() {
-            out.push((num, decoded[start..end].to_vec()));
-        }
-    }
-    Ok(out)
-}
-
-// ---- Filter chain ----------------------------------------------------------
-
-fn decode_filters(stream: &Stream) -> Result<Vec<u8>, PdfError> {
-    let filters = collect_filters(&stream.dict);
-    let parms = collect_parms(&stream.dict);
-    let mut data = stream.content.clone();
-    for (i, name) in filters.iter().enumerate() {
-        let dp = parms.get(i).cloned().unwrap_or_default();
-        data = apply_filter(name, &data, &dp)?;
-    }
-    Ok(data)
-}
-
-fn collect_filters(dict: &Dictionary) -> Vec<Vec<u8>> {
-    match dict.get(b"Filter") {
-        Some(Object::Name(n)) => vec![n.clone()],
-        Some(Object::Array(arr)) => arr
-            .iter()
-            .filter_map(|o| o.as_name().map(|n| n.to_vec()))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn collect_parms(dict: &Dictionary) -> Vec<Dictionary> {
-    match dict.get(b"DecodeParms") {
-        Some(Object::Dictionary(d)) => vec![d.clone()],
-        Some(Object::Array(arr)) => arr
-            .iter()
-            .map(|o| match o {
-                Object::Dictionary(d) => d.clone(),
-                _ => Dictionary::new(),
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn apply_filter(name: &[u8], data: &[u8], parms: &Dictionary) -> Result<Vec<u8>, PdfError> {
-    match name {
-        b"FlateDecode" | b"Fl" => {
-            let inflated = deflate::inflate_zlib(data)?;
-            apply_predictor(&inflated, parms)
-        }
-        b"ASCIIHexDecode" | b"AHx" => Ok(decode_ascii_hex(data)),
-        b"ASCII85Decode" | b"A85" => Ok(decode_ascii85(data)),
-        // Pass-through filters: the consumer reads `Stream::content`
-        // directly, but if a caller invokes the chain we just hand the
-        // bytes back unchanged.
-        b"DCTDecode" | b"DCT" | b"JPXDecode" | b"CCITTFaxDecode" | b"CCF" => Ok(data.to_vec()),
-        other => Err(PdfError::BadFilter(format!(
-            "unsupported filter /{}",
-            std::str::from_utf8(other).unwrap_or("?")
-        ))),
-    }
-}
-
-fn decode_ascii_hex(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() / 2);
-    let mut nibble: Option<u8> = None;
-    for &b in data {
-        if b == b'>' {
-            break;
-        }
-        let v = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            _ => continue,
-        };
-        match nibble {
-            Some(prev) => {
-                out.push((prev << 4) | v);
-                nibble = None;
-            }
-            None => nibble = Some(v),
-        }
-    }
-    if let Some(prev) = nibble {
-        out.push(prev << 4);
-    }
-    out
-}
-
-fn decode_ascii85(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() * 4 / 5);
-    let mut buf = [0u32; 5];
-    let mut n = 0;
-    // Accumulate in u64 — the maximum value `buf[0] * 85^4` alone is
-    // 84 * 52_200_625 = 4_384_852_500, which already exceeds u32::MAX. A
-    // malformed group like `uuuuu` would otherwise panic in debug and
-    // silently wrap in release. Any group whose decoded value doesn't fit
-    // in u32 is skipped.
-    let pack = |buf: &[u32; 5]| -> Option<u32> {
-        let v = (buf[0] as u64) * 85u64.pow(4)
-            + (buf[1] as u64) * 85u64.pow(3)
-            + (buf[2] as u64) * 85u64.pow(2)
-            + (buf[3] as u64) * 85
-            + (buf[4] as u64);
-        u32::try_from(v).ok()
-    };
-    for &b in data {
-        if b == b'~' {
-            break;
-        }
-        if b.is_ascii_whitespace() {
-            continue;
-        }
-        if b == b'z' && n == 0 {
-            out.extend_from_slice(&[0, 0, 0, 0]);
-            continue;
-        }
-        if !(b'!'..=b'u').contains(&b) {
-            continue;
-        }
-        buf[n] = (b - b'!') as u32;
-        n += 1;
-        if n == 5 {
-            if let Some(v) = pack(&buf) {
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-            n = 0;
-        }
-    }
-    if n > 0 {
-        for slot in &mut buf[n..5] {
-            *slot = 84;
-        }
-        if let Some(v) = pack(&buf) {
-            out.extend_from_slice(&v.to_be_bytes()[..n - 1]);
-        }
-    }
-    out
-}
-
-// ---- PNG predictor (used by xref streams and some image streams) -----------
-
-fn apply_predictor(data: &[u8], parms: &Dictionary) -> Result<Vec<u8>, PdfError> {
-    let predictor = parms
-        .get(b"Predictor")
-        .and_then(Object::as_integer)
-        .unwrap_or(1);
-    if predictor <= 1 {
-        return Ok(data.to_vec());
-    }
-    // /Columns, /Colors, /BitsPerComponent are i64 in the source dict.
-    // Without bounds, a malicious file can pick values whose product
-    // (columns * colors * bpc) wraps in release builds and misallocates,
-    // or panics in debug. Clamp each to a range that comfortably covers
-    // any legitimate image / xref-stream.
-    let read_clamped = |key: &[u8], default: i64, max: i64| -> Result<usize, PdfError> {
-        let v = parms
-            .get(key)
-            .and_then(Object::as_integer)
-            .unwrap_or(default);
-        if v < 1 || v > max {
-            return Err(PdfError::BadFilter(format!(
-                "predictor /{} out of range: {v}",
-                std::str::from_utf8(key).unwrap_or("?")
-            )));
-        }
-        Ok(v as usize)
-    };
-    let columns = read_clamped(b"Columns", 1, 1 << 20)?;
-    let colors = read_clamped(b"Colors", 1, 32)?;
-    let bpc = read_clamped(b"BitsPerComponent", 8, 32)?;
-    let bpp = ((colors * bpc) + 7) / 8;
-    let row_len = ((columns * colors * bpc) + 7) / 8;
-    if row_len == 0 {
-        return Ok(Vec::new());
-    }
-    let stride = row_len + 1;
-    let rows = data.len() / stride;
-    let mut out = Vec::with_capacity(rows * row_len);
-    let mut prev_row: Vec<u8> = vec![0u8; row_len];
-    for r in 0..rows {
-        let row = &data[r * stride..r * stride + stride];
-        let tag = row[0];
-        let raw = &row[1..];
-        let mut decoded = vec![0u8; row_len];
-        for i in 0..row_len {
-            let left = if i >= bpp { decoded[i - bpp] } else { 0 };
-            let up = prev_row[i];
-            let upper_left = if i >= bpp { prev_row[i - bpp] } else { 0 };
-            decoded[i] = match tag {
-                0 => raw[i],
-                1 => raw[i].wrapping_add(left),
-                2 => raw[i].wrapping_add(up),
-                3 => raw[i].wrapping_add(((left as u16 + up as u16) / 2) as u8),
-                4 => raw[i].wrapping_add(paeth(left, up, upper_left)),
-                _ => raw[i],
-            };
-        }
-        out.extend_from_slice(&decoded);
-        prev_row = decoded;
-    }
-    Ok(out)
-}
-
-fn paeth(a: u8, b: u8, c: u8) -> u8 {
-    let a = a as i32;
-    let b = b as i32;
-    let c = c as i32;
-    let p = a + b - c;
-    let pa = (p - a).abs();
-    let pb = (p - b).abs();
-    let pc = (p - c).abs();
-    if pa <= pb && pa <= pc {
-        a as u8
-    } else if pb <= pc {
-        b as u8
-    } else {
-        c as u8
+    pub fn stream_content<'s>(&'s self, stream: &'s Stream) -> &'s [u8] {
+        stream.content(self.bytes)
     }
 }
 
@@ -781,48 +210,10 @@ fn parse_at(bytes: &[u8], at: usize, expected: ObjectId) -> Option<Object> {
     Some(obj)
 }
 
-fn read_uint(bytes: &[u8], pos: &mut usize) -> Result<u32, PdfError> {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\r' | b'\n') {
-        *pos += 1;
-    }
-    let start = *pos;
-    while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
-        *pos += 1;
-    }
-    if *pos == start {
-        return Err(PdfError::BadXref(format!("expected integer at {start}")));
-    }
-    // The slice is ASCII digits by construction — utf-8 always holds.
-    let s = std::str::from_utf8(&bytes[start..*pos]).expect("digit slice is utf-8");
-    s.parse::<u32>()
-        .map_err(|_| PdfError::BadXref(format!("integer overflow: {s}")))
-}
-
-fn skip_inline(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t') {
-        *pos += 1;
-    }
-}
-
-fn skip_eol(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t') {
-        *pos += 1;
-    }
-    match bytes.get(*pos) {
-        Some(&b'\r') => {
-            *pos += 1;
-            if bytes.get(*pos) == Some(&b'\n') {
-                *pos += 1;
-            }
-        }
-        Some(&b'\n') => *pos += 1,
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// Build a minimal valid classic-xref PDF with one `(Hello) Tj`-style
     /// content stream. Used to exercise the loader end-to-end without
@@ -1035,6 +426,22 @@ endobj
         assert!(apply_filter(b"LZWDecode", b"abc", &empty).is_err());
     }
 
+    #[test]
+    fn flate_filter_applies_png_predictor_without_extra_copy_path() {
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor".to_vec(), Object::Integer(12));
+        params.insert(b"Columns".to_vec(), Object::Integer(3));
+        let raw = [0, 10, 20, 30];
+        let mut zlib = vec![0x78, 0x01, 0x01, raw.len() as u8, 0x00];
+        zlib.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(&raw);
+        zlib.extend_from_slice(&[0, 0, 0, 1]);
+        assert_eq!(
+            apply_filter(b"FlateDecode", &zlib, &params).unwrap(),
+            [10, 20, 30]
+        );
+    }
+
     // ---- PNG predictor --------------------------------------------------
 
     #[test]
@@ -1218,6 +625,7 @@ endobj
         objs.insert(ObjectId(1, 0), Object::Reference(ObjectId(2, 0)));
         objs.insert(ObjectId(2, 0), Object::Integer(7));
         let doc = Document {
+            bytes: b"",
             objects: objs,
             pages: vec![],
         };
@@ -1233,14 +641,8 @@ endobj
     fn page_content_supports_array_of_streams() {
         // Build a doc where /Contents is an array of two stream refs.
         let mut objs = HashMap::new();
-        let stream1 = Object::Stream(Stream {
-            dict: Dictionary::new(),
-            content: b"first".to_vec(),
-        });
-        let stream2 = Object::Stream(Stream {
-            dict: Dictionary::new(),
-            content: b"second".to_vec(),
-        });
+        let stream1 = Object::Stream(Stream::owned(Dictionary::new(), b"first".to_vec()));
+        let stream2 = Object::Stream(Stream::owned(Dictionary::new(), b"second".to_vec()));
         objs.insert(ObjectId(10, 0), stream1);
         objs.insert(ObjectId(11, 0), stream2);
         let mut page = Dictionary::new();
@@ -1253,6 +655,7 @@ endobj
         );
         objs.insert(ObjectId(20, 0), Object::Dictionary(page));
         let doc = Document {
+            bytes: b"",
             objects: objs,
             pages: vec![ObjectId(20, 0)],
         };
@@ -1265,6 +668,7 @@ endobj
     #[test]
     fn get_page_content_returns_none_for_unknown_page_id() {
         let doc = Document {
+            bytes: b"",
             objects: HashMap::new(),
             pages: vec![],
         };
@@ -1281,17 +685,11 @@ endobj
         bad_dict.insert(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
         objs.insert(
             ObjectId(10, 0),
-            Object::Stream(Stream {
-                dict: bad_dict,
-                content: b"NOT-VALID-ZLIB".to_vec(),
-            }),
+            Object::Stream(Stream::owned(bad_dict, b"NOT-VALID-ZLIB".to_vec())),
         );
         objs.insert(
             ObjectId(11, 0),
-            Object::Stream(Stream {
-                dict: Dictionary::new(),
-                content: b"GOOD".to_vec(),
-            }),
+            Object::Stream(Stream::owned(Dictionary::new(), b"GOOD".to_vec())),
         );
         let mut page = Dictionary::new();
         page.insert(
@@ -1303,6 +701,7 @@ endobj
         );
         objs.insert(ObjectId(20, 0), Object::Dictionary(page));
         let doc = Document {
+            bytes: b"",
             objects: objs,
             pages: vec![ObjectId(20, 0)],
         };
@@ -1648,6 +1047,7 @@ endobj
         let page = Dictionary::new();
         objs.insert(ObjectId(1, 0), Object::Dictionary(page));
         let doc = Document {
+            bytes: b"",
             objects: objs.clone(),
             pages: vec![],
         };
@@ -1658,6 +1058,7 @@ endobj
         page.insert(b"Contents".to_vec(), Object::Integer(42));
         objs.insert(ObjectId(1, 0), Object::Dictionary(page));
         let doc = Document {
+            bytes: b"",
             objects: objs,
             pages: vec![],
         };
@@ -1938,6 +1339,7 @@ endobj
         objs.insert(ObjectId(1, 0), Object::Reference(ObjectId(2, 0)));
         objs.insert(ObjectId(2, 0), Object::Reference(ObjectId(1, 0)));
         let doc = Document {
+            bytes: b"",
             objects: objs,
             pages: vec![],
         };
@@ -2035,6 +1437,56 @@ endobj
 
         let doc = Document::load(&bytes).expect("load");
         assert_eq!(doc.pages().len(), 1);
+    }
+
+    #[test]
+    fn compressed_object_with_out_of_range_index_is_skipped() {
+        let mut body = String::from("%PDF-1.5\n");
+        let off1 = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
+        );
+
+        let objstm_payload = b"8 0 <</Ignored true>>";
+        let off4 = body.len();
+        body.push_str(&format!(
+            "4 0 obj <</Type/ObjStm/N 1/First 4/Length {}>>\nstream\n",
+            objstm_payload.len(),
+        ));
+        let mut bytes = body.into_bytes();
+        bytes.extend_from_slice(objstm_payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+
+        let xref_offset = bytes.len();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        for &off in &[off1, off2, off3, off4] {
+            payload.push(1);
+            payload.extend_from_slice(&(off as u16).to_be_bytes());
+            payload.push(0);
+        }
+        payload.push(2);
+        payload.extend_from_slice(&4u16.to_be_bytes());
+        payload.push(9);
+
+        bytes.extend_from_slice(
+            format!(
+                "5 0 obj <</Type/XRef/Size 6/Root 1 0 R/W [1 2 1]/Length {}>>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        let doc = Document::load(&bytes).expect("load");
+        assert_eq!(doc.pages().len(), 1);
+        assert!(doc.get_object(ObjectId(5, 0)).is_none());
     }
 
     // ---- Failure paths through Document::load --------------------------
@@ -2141,6 +1593,12 @@ endobj
     }
 
     #[test]
+    fn classic_xref_rejects_first_count_overflow() {
+        let bytes = b"%PDF-1.4\nxref\n4294967295 1\n0000000000 65535 f \ntrailer <</Size 1>>\nstartxref\n9\n%%EOF";
+        assert!(Document::load(bytes).is_err());
+    }
+
+    #[test]
     fn classic_xref_with_non_dict_trailer_errors() {
         // Trailer keyword is followed by a number instead of a dict.
         let body = b"\
@@ -2184,6 +1642,13 @@ endobj
     }
 
     #[test]
+    fn xref_stream_rejects_index_overflow() {
+        let bytes = b"1 0 obj <</Type/XRef/Size 1/W [1 2 1]/Index [4294967295 2]/Length 8>>\nstream\n\x00\x00\x00\x00\x00\x00\x00\x00\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        assert!(read_xref_stream(bytes, 0, &mut out).is_err());
+    }
+
+    #[test]
     fn xref_stream_with_inflate_failure_errors() {
         // Filter is FlateDecode but the body isn't valid zlib.
         let bytes =
@@ -2205,6 +1670,7 @@ endobj
         );
         objs.insert(ObjectId(1, 0), Object::Dictionary(page));
         let doc = Document {
+            bytes: b"",
             objects: objs,
             pages: vec![ObjectId(1, 0)],
         };
@@ -2263,6 +1729,18 @@ endobj
     }
 
     #[test]
+    fn walk_pages_ignores_non_reference_kids() {
+        let mut objs = HashMap::new();
+        let mut pages = Dictionary::new();
+        pages.insert(b"Type".to_vec(), Object::Name(b"Pages".to_vec()));
+        pages.insert(b"Kids".to_vec(), Object::Array(vec![Object::Integer(42)]));
+        objs.insert(ObjectId(1, 0), Object::Dictionary(pages));
+        let mut out = Vec::new();
+        walk_pages(&objs, ObjectId(1, 0), &mut out, 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn page_tree_walk_collects_pages_in_kid_array() {
         // A /Pages node with explicit /Type Pages whose /Kids hold the
         // actual /Page leaves. Exercises the recursive branch of walk_pages.
@@ -2307,11 +1785,8 @@ endobj
         // FlateDecode stream whose body is garbage.
         let mut dict = Dictionary::new();
         dict.insert(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
-        let stream = Stream {
-            dict,
-            content: b"garbage".to_vec(),
-        };
-        assert!(decode_filters(&stream).is_err());
+        let stream = Stream::owned(dict, b"garbage".to_vec());
+        assert!(decode_filters(&stream, b"").is_err());
     }
 
     #[test]

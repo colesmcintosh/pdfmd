@@ -219,7 +219,7 @@ fn read_dynamic_tables(
             let (count, value) = match sym {
                 16 => {
                     let n = 3 + reader.read(2) as usize;
-                    let prev = if i == 0 { 0 } else { lengths[i - 1] };
+                    let prev = lengths[i.saturating_sub(1)];
                     (n, prev)
                 }
                 17 => (3 + reader.read(3) as usize, 0),
@@ -450,6 +450,16 @@ mod tests {
     }
 
     #[test]
+    fn stored_blocks_roundtrip() {
+        let raw = [
+            0x00, 0x02, 0x00, 0xFD, 0xFF, b'A', b'B', 0x01, 0x03, 0x00, 0xFC, 0xFF, b'C', b'D',
+            b'E',
+        ];
+        let out = inflate_raw(&raw).unwrap();
+        assert_eq!(out, b"ABCDE");
+    }
+
+    #[test]
     fn rejects_bad_method() {
         let bad = [0x79, 0x9C, 0x00];
         assert!(inflate_zlib(&bad).is_err());
@@ -626,6 +636,114 @@ mod tests {
         reader.align_byte();
         let err = decode_stored(&mut reader, &mut out).unwrap_err();
         assert!(err.to_string().contains("maximum size"));
+    }
+
+    #[test]
+    fn huffman_literal_rejects_output_beyond_cap() {
+        let ll = HuffmanTable::build(&[1]).unwrap();
+        let dist = HuffmanTable::build(&[]).unwrap();
+        let mut reader = BitReader::new(&[0]);
+        let mut out = vec![0u8; MAX_INFLATE_OUTPUT];
+        let err = decode_huffman(&mut reader, &mut out, &ll, &dist).unwrap_err();
+        assert!(err.to_string().contains("maximum size"));
+    }
+
+    #[test]
+    fn huffman_rejects_invalid_literal_length_code() {
+        let ll = HuffmanTable::build(&[]).unwrap();
+        let dist = HuffmanTable::build(&[]).unwrap();
+        let mut reader = BitReader::new(&[0]);
+        let mut out = Vec::new();
+        let err = decode_huffman(&mut reader, &mut out, &ll, &dist).unwrap_err();
+        assert!(err.to_string().contains("invalid Huffman code"));
+    }
+
+    #[test]
+    fn huffman_match_rejects_output_beyond_cap() {
+        let mut ll_lengths = vec![0u8; 258];
+        ll_lengths[257] = 1;
+        let ll = HuffmanTable::build(&ll_lengths).unwrap();
+        let dist = HuffmanTable::build(&[1]).unwrap();
+        let mut reader = BitReader::new(&[0]);
+        let mut out = vec![b'x'; MAX_INFLATE_OUTPUT - 2];
+        let err = decode_huffman(&mut reader, &mut out, &ll, &dist).unwrap_err();
+        assert!(err.to_string().contains("maximum size"));
+    }
+
+    #[test]
+    fn huffman_match_rejects_invalid_distance_code() {
+        let mut ll_lengths = vec![0u8; 258];
+        ll_lengths[257] = 1;
+        let ll = HuffmanTable::build(&ll_lengths).unwrap();
+        let dist = HuffmanTable::build(&[]).unwrap();
+        let mut reader = BitReader::new(&[0]);
+        let mut out = vec![b'x'];
+        let err = decode_huffman(&mut reader, &mut out, &ll, &dist).unwrap_err();
+        assert!(err.to_string().contains("invalid Huffman code"));
+    }
+
+    #[test]
+    fn dynamic_huffman_with_empty_ll_table_errors_after_header() {
+        let mut raw = Vec::new();
+        let mut bit_pos = 0;
+        push_bits(&mut raw, &mut bit_pos, 1, 1); // BFINAL
+        push_bits(&mut raw, &mut bit_pos, 2, 2); // dynamic block
+        push_bits(&mut raw, &mut bit_pos, 0, 5); // HLIT = 257
+        push_bits(&mut raw, &mut bit_pos, 0, 5); // HDIST = 1
+        push_bits(&mut raw, &mut bit_pos, 0, 4); // HCLEN = 4
+
+        // Code-length-code lengths for symbols 16, 17, 18, 0. Only symbol 18
+        // is live, so the length stream can fill LL+dist lengths with zeroes.
+        push_bits(&mut raw, &mut bit_pos, 0, 3);
+        push_bits(&mut raw, &mut bit_pos, 0, 3);
+        push_bits(&mut raw, &mut bit_pos, 1, 3);
+        push_bits(&mut raw, &mut bit_pos, 0, 3);
+        push_bits(&mut raw, &mut bit_pos, 0, 1); // symbol 18
+        push_bits(&mut raw, &mut bit_pos, 127, 7);
+        push_bits(&mut raw, &mut bit_pos, 0, 1); // symbol 18 again
+        push_bits(&mut raw, &mut bit_pos, 127, 7);
+
+        let err = inflate_raw(&raw).unwrap_err();
+        assert!(err.to_string().contains("invalid Huffman code"));
+    }
+
+    #[test]
+    fn dynamic_repeat_16_copies_previous_length() {
+        let mut bits = Vec::new();
+        let mut bit_pos = 0;
+        push_bits(&mut bits, &mut bit_pos, 0, 5); // HLIT = 257
+        push_bits(&mut bits, &mut bit_pos, 0, 5); // HDIST = 1
+        push_bits(&mut bits, &mut bit_pos, 14, 4); // HCLEN = 18
+
+        for &symbol in &CODE_LENGTH_ORDER[..18] {
+            let len = if symbol == 1 || symbol == 16 { 1 } else { 0 };
+            push_bits(&mut bits, &mut bit_pos, len, 3);
+        }
+
+        push_bits(&mut bits, &mut bit_pos, 0, 1); // symbol 1
+        for _ in 0..43 {
+            push_bits(&mut bits, &mut bit_pos, 1, 1); // symbol 16
+            push_bits(&mut bits, &mut bit_pos, 3, 2); // repeat six times
+        }
+
+        let mut reader = BitReader::new(&bits);
+        let (ll, dist) = read_dynamic_tables(&mut reader).unwrap();
+        assert_ne!(ll.entries[0], 0);
+        assert_ne!(dist.entries[0], 0);
+    }
+
+    fn push_bits(buf: &mut Vec<u8>, bit_pos: &mut usize, mut value: u32, bits: u32) {
+        for _ in 0..bits {
+            if *bit_pos % 8 == 0 {
+                buf.push(0);
+            }
+            if value & 1 != 0 {
+                let last = buf.len() - 1;
+                buf[last] |= 1 << (*bit_pos % 8);
+            }
+            value >>= 1;
+            *bit_pos += 1;
+        }
     }
 
     #[test]
