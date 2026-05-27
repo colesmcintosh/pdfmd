@@ -38,7 +38,7 @@ pub enum FontKind {
 
 impl PdfFont {
     /// Build a font from its dictionary object.
-    pub fn from_object(doc: &Document, obj_id: ObjectId) -> Self {
+    pub fn from_object(doc: &Document<'_>, obj_id: ObjectId) -> Self {
         let Some(font_dict) = doc.get_object(obj_id).and_then(Object::as_dict) else {
             return Self::default();
         };
@@ -149,15 +149,15 @@ impl PdfFont {
                 return Some(text.to_string());
             }
         }
-        if let Some(name) = self.differences.get(&byte) {
-            if let Some(text) = glyph_to_string(name) {
-                return Some(text);
-            }
+        if let Some(text) = self
+            .differences
+            .get(&byte)
+            .and_then(|name| glyph_to_string(name))
+        {
+            return Some(text);
         }
-        if let Some(name) = self.encoding.glyph(byte) {
-            if let Some(text) = glyph_to_string(name) {
-                return Some(text);
-            }
+        if let Some(text) = self.encoding.glyph(byte).and_then(glyph_to_string) {
+            return Some(text);
         }
         if byte >= 0x20 {
             return Some((byte as char).to_string());
@@ -187,7 +187,7 @@ fn parse_differences(arr: &[Object]) -> HashMap<u8, String> {
     out
 }
 
-fn follow_stream(doc: &Document, obj: Option<&Object>) -> Option<Vec<u8>> {
+fn follow_stream(doc: &Document<'_>, obj: Option<&Object>) -> Option<Vec<u8>> {
     let resolved = doc.deref(obj?);
     if let Object::Stream(s) = resolved {
         doc.decode_stream(s).ok()
@@ -203,7 +203,7 @@ mod tests {
 
     /// Helper that builds and loads a tiny PDF containing the given
     /// indirect objects, then hands back the Document.
-    fn build_doc(extra_objs: &[(u32, &str)]) -> Document {
+    fn build_doc(extra_objs: &[(u32, &str)]) -> Document<'static> {
         let mut body = String::from("%PDF-1.4\n");
         body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
         body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
@@ -248,7 +248,8 @@ mod tests {
         ));
         let mut bytes = body.into_bytes();
         bytes.extend_from_slice(xref.as_bytes());
-        Document::load(&bytes).expect("load")
+        let bytes = Box::leak(bytes.into_boxed_slice());
+        Document::load(bytes).expect("load")
     }
 
     #[test]
@@ -401,6 +402,17 @@ mod tests {
         ]);
         let font = PdfFont::from_object(&doc, ObjectId(4, 0));
         assert_eq!(format!("{:?}", font.encoding), "WinAnsi");
+        assert!(font.differences.is_empty());
+    }
+
+    #[test]
+    fn font_encoding_reference_to_non_dict_is_ignored() {
+        let doc = build_doc(&[
+            (4, "<</Type/Font/Subtype/Type1/Encoding 5 0 R>>"),
+            (5, "42"),
+        ]);
+        let font = PdfFont::from_object(&doc, ObjectId(4, 0));
+        assert_eq!(format!("{:?}", font.encoding), "Standard");
         assert!(font.differences.is_empty());
     }
 

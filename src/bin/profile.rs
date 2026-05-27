@@ -40,7 +40,7 @@ fn main() {
     let elapsed = start.elapsed();
 
     eprintln!(
-        "{} iters in {:.2?} → {:.1} ms/iter, {} md bytes total",
+        "{} iters in {:.2?} → {:.3} ms/iter, {} md bytes total",
         iterations,
         elapsed,
         (elapsed.as_secs_f64() * 1000.0) / iterations as f64,

@@ -20,8 +20,7 @@ use heuristics::format_page;
 pub struct ConvertOptions<'a> {
     /// Insert a `---` horizontal rule between pages.
     pub include_page_breaks: bool,
-    /// If `Some`, image XObjects in pass-through formats (JPEG, JPEG 2000)
-    /// are extracted and referenced in the markdown as
+    /// If `Some`, supported image XObjects are extracted and referenced in the markdown as
     /// `![](DIR/img-NNN.ext)`, where `DIR` is the value provided here. If
     /// `None`, images are ignored.
     pub image_dir: Option<&'a str>,

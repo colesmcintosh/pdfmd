@@ -399,7 +399,7 @@ fn ensure_trailing_breaks(out: &mut String, count: usize) {
 /// parsing the fonts themselves — the caller looks the parsed fonts up in
 /// a document-wide cache to avoid re-parsing the same font across pages.
 pub fn page_font_refs(
-    doc: &crate::pdf::Document,
+    doc: &crate::pdf::Document<'_>,
     resources: &Dictionary,
 ) -> HashMap<Vec<u8>, ObjectId> {
     let mut out = HashMap::new();
@@ -507,6 +507,26 @@ ET
     }
 
     #[test]
+    fn tj_array_ignores_non_text_operands() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BT /F1 12 Tf [/Ignored (ok)] TJ ET";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn pending_space_is_restored_when_decode_emits_nothing() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BT /F1 12 Tf [(A) -200 (\x01) (B)] TJ ET";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert_eq!(out, "A B");
+    }
+
+    #[test]
     fn ensure_trailing_breaks_collapses_existing_newlines() {
         let mut s = String::from("abc\n\n\n");
         ensure_trailing_breaks(&mut s, 1);
@@ -564,6 +584,34 @@ ET
     }
 
     #[test]
+    fn position_change_records_normal_line_break_with_text() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"\
+BT
+/F1 12 Tf
+1 0 0 1 0 100 Tm
+(top) Tj
+1 0 0 1 0 88 Tm
+(bottom) Tj
+ET
+";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.contains("top\nbottom"), "{out:?}");
+    }
+
+    #[test]
+    fn position_change_with_empty_output_records_state_only() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let stream = b"BT /F1 12 Tf 1 0 0 1 0 100 Tm 1 0 0 1 0 88 Tm ET";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn operators_with_missing_operands_are_no_ops() {
         // Every text operator's body is gated on having the right operands.
         // Feeding bare operators without operands exercises the
@@ -606,6 +654,21 @@ ET
         // page_font_refs returns empty.
         let mut res = crate::pdf::Dictionary::new();
         res.insert(b"Font".to_vec(), Object::Integer(0));
+        let bytes = build_pdf_with_xref(
+            b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+",
+        );
+        let doc = crate::pdf::Document::load(&bytes).unwrap();
+        assert!(page_font_refs(&doc, &res).is_empty());
+    }
+
+    #[test]
+    fn page_font_refs_returns_empty_when_font_entry_missing() {
+        let res = crate::pdf::Dictionary::new();
         let bytes = build_pdf_with_xref(
             b"\
 %PDF-1.4

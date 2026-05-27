@@ -445,6 +445,18 @@ mod tests {
     }
 
     #[test]
+    fn oversized_bfrange_with_unknown_destination_advances() {
+        let src = b"\
+            1 beginbfrange
+            <0000> <FFFFFFFF> /SkipMe
+            <01> <01> <0041>
+            endbfrange
+        ";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
+
+    #[test]
     fn parses_bfrange_array() {
         let src = b"\
             1 beginbfrange
@@ -455,6 +467,19 @@ mod tests {
         assert_eq!(cmap.lookup(0x20), Some("X"));
         assert_eq!(cmap.lookup(0x21), Some("Y"));
         assert_eq!(cmap.lookup(0x22), Some("Z"));
+    }
+
+    #[test]
+    fn bfrange_array_shorter_than_range_leaves_tail_unmapped() {
+        let src = b"\
+            1 beginbfrange
+            <20> <22> [<0058>]
+            endbfrange
+        ";
+        let cmap = parse(src);
+        assert_eq!(cmap.lookup(0x20), Some("X"));
+        assert!(cmap.lookup(0x21).is_none());
+        assert!(cmap.lookup(0x22).is_none());
     }
 
     #[test]
@@ -633,6 +658,7 @@ mod tests {
         let cmap = parse(src);
         // bytes_to_u32(<01>) = 1 → mapping should land for code 1.
         assert!(cmap.lookup(1).is_some());
+        assert_eq!(decode_hex(b"F"), Some(vec![0xF0]));
     }
 
     #[test]

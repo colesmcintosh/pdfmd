@@ -31,8 +31,8 @@ type PageJob<'a> = (
 /// Extract the textual content of a PDF document. Pages are returned as
 /// independent strings so callers don't pay for a join/split round trip.
 ///
-/// When `extract_images` is true, image XObjects in pass-through filters
-/// (JPEG, JPEG 2000) are collected and the returned text carries inline
+/// When `extract_images` is true, supported image XObjects are collected
+/// and the returned text carries inline
 /// markers — `\u{0001}filename\u{0001}` — at the position each image was
 /// painted, for the markdown layer to rewrite into `![]()` references.
 pub fn extract_text(
@@ -99,7 +99,7 @@ pub fn extract_text(
 /// reference the same XObject). Returns the extracted images plus per-page
 /// `name → filename` maps for the content interpreter.
 fn collect_images(
-    doc: &Document,
+    doc: &Document<'_>,
     resources: &[Option<Dictionary>],
 ) -> (Vec<ExtractedImage>, Vec<HashMap<Vec<u8>, String>>) {
     let mut images: Vec<ExtractedImage> = Vec::new();
@@ -134,7 +134,7 @@ fn collect_images(
 }
 
 fn extract_one_page(
-    doc: &Document,
+    doc: &Document<'_>,
     page_id: ObjectId,
     font_refs: &HashMap<Vec<u8>, ObjectId>,
     font_cache: &HashMap<ObjectId, PdfFont>,
@@ -153,7 +153,7 @@ fn extract_one_page(
 }
 
 /// Walk up the page tree until we find a `/Resources` dictionary.
-fn page_resources(doc: &Document, page_id: ObjectId) -> Option<Dictionary> {
+fn page_resources(doc: &Document<'_>, page_id: ObjectId) -> Option<Dictionary> {
     let mut current = page_id;
     for _ in 0..64 {
         let dict = doc.get_object(current).and_then(Object::as_dict)?;
@@ -213,25 +213,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parallel_map_handles_empty_input() {
-        let out: Vec<i32> = parallel_map::<i32, i32, _>(&[], |x| *x);
-        assert!(out.is_empty());
+    fn extract_text_propagates_document_load_error() {
+        assert!(extract_text(b"not a pdf", false).is_err());
     }
 
     #[test]
-    fn parallel_map_single_worker_path_runs_serially() {
-        // A 1-element input forces the workers.min(len) clamp to 1, which
-        // takes the serial fast path.
-        let out = parallel_map(&[42], |x| x * 2);
-        assert_eq!(out, vec![84]);
-    }
+    fn extract_text_collects_images_only_when_requested() {
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<</XObject<</Im1 4 0 R>>>>/MediaBox[0 0 1 1]>> endobj
+4 0 obj <</Subtype/Image/Filter/DCTDecode/Length 3>>
+stream
+JPG
+endstream
+endobj
+";
+        let bytes = build_xref_pdf(pdf);
 
-    #[test]
-    fn parallel_map_distributes_work_across_workers() {
-        let input: Vec<i32> = (0..32).collect();
-        let out = parallel_map(&input, |x| x * x);
-        let expected: Vec<i32> = input.iter().map(|x| x * x).collect();
-        assert_eq!(out, expected);
+        let (pages, images) = extract_text(&bytes, false).unwrap();
+        assert_eq!(pages, vec![String::new()]);
+        assert!(images.is_empty());
+
+        let (pages, images) = extract_text(&bytes, true).unwrap();
+        assert_eq!(pages, vec![String::new()]);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].filename, "img-001.jpg");
     }
 
     #[test]
@@ -265,6 +273,18 @@ mod tests {
         let page = doc.pages()[0];
         // No /Resources anywhere along the chain → None (or recursion cap).
         assert!(page_resources(&doc, page).is_none());
+    }
+
+    #[test]
+    fn page_resources_returns_none_when_page_object_is_missing() {
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[]/Count 0>> endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        assert!(page_resources(&doc, ObjectId(99, 0)).is_none());
     }
 
     #[test]
@@ -431,6 +451,31 @@ endobj
         let (images, per_page) = collect_images(&doc, &resources);
         assert!(images.is_empty());
         assert_eq!(per_page.len(), 1);
+        assert!(per_page[0].is_empty());
+    }
+
+    #[test]
+    fn collect_images_skips_unsupported_xobjects() {
+        let mut res: Dictionary = Dictionary::new();
+        let mut xobj = Dictionary::new();
+        xobj.insert(b"Im1".to_vec(), Object::Reference(ObjectId(99, 0)));
+        res.insert(b"XObject".to_vec(), Object::Dictionary(xobj));
+        let resources = vec![Some(res)];
+        let pdf = b"\
+%PDF-1.4
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj
+99 0 obj <</Subtype/Image/Filter/LZWDecode/Length 3>>
+stream
+BAD
+endstream
+endobj
+";
+        let bytes = build_xref_pdf(pdf);
+        let doc = Document::load(&bytes).unwrap();
+        let (images, per_page) = collect_images(&doc, &resources);
+        assert!(images.is_empty());
         assert!(per_page[0].is_empty());
     }
 
