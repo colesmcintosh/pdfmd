@@ -180,8 +180,11 @@ fn cli_streams_from_stdin_to_stdout() {
     assert!(!output.stdout.is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_reports_stdout_write_error_when_pipe_is_closed() {
+    // Windows pipe-close timing can let the child write before the parent
+    // observes the closed reader; Unix gives us the deterministic error.
     let mut child = Command::new(binary())
         .arg(reference_pdf())
         .stdout(std::process::Stdio::piped())
@@ -206,8 +209,11 @@ fn cli_url_input_reports_fetch_errors() {
     assert!(stderr.contains("127.0.0.1"));
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_url_input_reports_missing_curl() {
+    // Windows searches system directories for executables even with PATH
+    // cleared, so this subprocess-only assertion is Unix-specific.
     let output = Command::new(binary())
         .arg("http://example.invalid/pdfmd-nope.pdf")
         .env("PATH", "")
