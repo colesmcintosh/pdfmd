@@ -6,9 +6,9 @@
 //! is measurable on the hot path.
 
 use super::PdfError;
+use std::sync::OnceLock;
 
 const MAX_BITS: u32 = 15;
-const TABLE_SIZE: usize = 1 << MAX_BITS;
 
 /// Upper bound on the decompressed size of a single FlateDecode stream.
 /// Cheap protection against decompression bombs — a few-KB input that
@@ -76,12 +76,7 @@ pub fn inflate_raw(input: &[u8]) -> Result<Vec<u8>, PdfError> {
         let btype = reader.read(2);
         match btype {
             0 => decode_stored(&mut reader, &mut out)?,
-            1 => decode_huffman(
-                &mut reader,
-                &mut out,
-                &fixed_ll_table(),
-                &fixed_dist_table(),
-            )?,
+            1 => decode_huffman(&mut reader, &mut out, fixed_ll_table(), fixed_dist_table())?,
             2 => {
                 let (ll, dist) = read_dynamic_tables(&mut reader)?;
                 decode_huffman(&mut reader, &mut out, &ll, &dist)?;
@@ -206,7 +201,6 @@ fn read_dynamic_tables(
     let mut i = 0;
     while i < total {
         // The code-length tree has 19 symbols (0..=18), so `decode` never
-        // returns a value outside that range — no `_` fallthrough needed.
         let sym = cl_table.decode(reader)?;
         if sym <= 15 {
             lengths[i] = sym as u8;
@@ -245,15 +239,17 @@ fn read_dynamic_tables(
 
 /// Canonical Huffman decode table.
 ///
-/// `entries[bits]` is a packed `(symbol << 5) | length` value. We index with
-/// the next `MAX_BITS` source bits; the consumer reads `length` of them and
-/// keeps `symbol`. Length `0` means "no code mapped" (corrupt stream).
+/// `entries[bits]` is a packed `(symbol << 5) | length` value. The table uses
+/// only as many index bits as its longest code. Length `0` means "no code
+/// mapped" (corrupt stream).
 struct HuffmanTable {
-    entries: Box<[u32; TABLE_SIZE]>,
+    entries: Box<[u32]>,
+    mask: u64,
 }
 
 impl HuffmanTable {
     fn build(lengths: &[u8]) -> Result<Self, PdfError> {
+        let table_bits = lengths.iter().copied().max().unwrap_or(0) as u32;
         let mut count = [0u32; (MAX_BITS + 1) as usize];
         for &l in lengths {
             if l as u32 > MAX_BITS {
@@ -269,9 +265,11 @@ impl HuffmanTable {
         let total_codes: u32 = count[1..].iter().sum();
         if total_codes == 0 {
             return Ok(Self {
-                entries: Box::new([0u32; TABLE_SIZE]),
+                entries: vec![0u32; 1usize << table_bits].into_boxed_slice(),
+                mask: 0,
             });
         }
+        let table_size = 1usize << table_bits;
 
         // Canonical-Huffman base code per length (RFC 1951 §3.2.2).
         let mut next_code = [0u32; (MAX_BITS + 2) as usize];
@@ -281,7 +279,7 @@ impl HuffmanTable {
             next_code[bits] = code;
         }
 
-        let mut table = Box::new([0u32; TABLE_SIZE]);
+        let mut table = vec![0u32; table_size].into_boxed_slice();
         for (sym, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
@@ -292,18 +290,22 @@ impl HuffmanTable {
             let reversed = reverse_bits(canon, len);
             let entry = ((sym as u32) << 5) | len;
             let stride = 1u32 << len;
-            let mut idx = reversed;
-            while (idx as usize) < TABLE_SIZE {
-                table[idx as usize] = entry;
-                idx += stride;
+            let mut index = reversed;
+            while (index as usize) < table_size {
+                table[index as usize] = entry;
+                index += stride;
             }
         }
-        Ok(Self { entries: table })
+        Ok(Self {
+            entries: table,
+            mask: (1u64 << table_bits) - 1,
+        })
     }
 
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u32, PdfError> {
-        let bits = reader.peek(MAX_BITS);
-        let entry = self.entries[bits as usize];
+        let bits = reader.peek_mask(self.mask);
+        // `mask + 1` is the table length, so this index is in bounds.
+        let entry = unsafe { *self.entries.get_unchecked(bits as usize) };
         let len = entry & 0x1F;
         if len == 0 {
             return Err(PdfError::Deflate("invalid Huffman code".into()));
@@ -322,26 +324,29 @@ fn reverse_bits(mut v: u32, bits: u32) -> u32 {
     r
 }
 
-// Built once per process — fixed Huffman trees are an RFC 1951 constant.
-fn fixed_ll_table() -> HuffmanTable {
-    let mut lens = [0u8; 288];
-    for l in lens.iter_mut().take(144) {
-        *l = 8;
-    }
-    for l in lens.iter_mut().take(256).skip(144) {
-        *l = 9;
-    }
-    for l in lens.iter_mut().take(280).skip(256) {
-        *l = 7;
-    }
-    for l in lens.iter_mut().take(288).skip(280) {
-        *l = 8;
-    }
-    HuffmanTable::build(&lens).expect("fixed LL table is well-formed")
+fn fixed_ll_table() -> &'static HuffmanTable {
+    static TABLE: OnceLock<HuffmanTable> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut lens = [0u8; 288];
+        for l in lens.iter_mut().take(144) {
+            *l = 8;
+        }
+        for l in lens.iter_mut().take(256).skip(144) {
+            *l = 9;
+        }
+        for l in lens.iter_mut().take(280).skip(256) {
+            *l = 7;
+        }
+        for l in lens.iter_mut().take(288).skip(280) {
+            *l = 8;
+        }
+        HuffmanTable::build(&lens).expect("fixed LL table is well-formed")
+    })
 }
 
-fn fixed_dist_table() -> HuffmanTable {
-    HuffmanTable::build(&[5u8; 30]).expect("fixed dist table is well-formed")
+fn fixed_dist_table() -> &'static HuffmanTable {
+    static TABLE: OnceLock<HuffmanTable> = OnceLock::new();
+    TABLE.get_or_init(|| HuffmanTable::build(&[5u8; 30]).expect("fixed dist table is well-formed"))
 }
 
 // ---- Bit reader ------------------------------------------------------------
@@ -375,8 +380,13 @@ impl<'a> BitReader<'a> {
     /// Read N bits without advancing. Past EOF the result is zero-padded —
     /// callers handle the resulting "invalid code" via `HuffmanTable::decode`.
     fn peek(&mut self, n: u32) -> u32 {
+        self.peek_mask((1u64 << n) - 1)
+    }
+
+    #[inline(always)]
+    fn peek_mask(&mut self, mask: u64) -> u32 {
         self.fill();
-        (self.buf & ((1u64 << n) - 1)) as u32
+        (self.buf & mask) as u32
     }
 
     fn consume(&mut self, n: u32) {
@@ -536,6 +546,19 @@ mod tests {
         let mut lens = [0u8; 5];
         lens[0] = 16;
         assert!(HuffmanTable::build(&lens).is_err());
+    }
+
+    #[test]
+    fn huffman_table_is_sized_to_its_longest_code() {
+        let table = HuffmanTable::build(&[2, 2, 2, 2]).unwrap();
+        assert_eq!(table.mask, 0b11);
+        assert_eq!(table.entries.len(), 4);
+    }
+
+    #[test]
+    fn fixed_huffman_tables_are_reused() {
+        assert!(std::ptr::eq(fixed_ll_table(), fixed_ll_table()));
+        assert!(std::ptr::eq(fixed_dist_table(), fixed_dist_table()));
     }
 
     #[test]
