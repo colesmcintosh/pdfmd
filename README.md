@@ -75,9 +75,47 @@ once into a document-wide cache. The content-stream tokenizer and the
 DEFLATE decoder both borrow operands directly from the source bytes, so
 the hot path doesn't allocate per operator or per Huffman code.
 
+### Corpus benchmark
+
+A broader end-to-end CLI benchmark covers 10 public PDFs: 1,120 pages and
+19.6 MB spanning papers, standards, forms, a handbook, and a typeset legal
+document. Both binaries include the simple-font correctness fix; the optimized
+variant additionally uses compact DEFLATE Huffman tables and process-wide
+caching for the fixed RFC 1951 tables. Their Markdown output is byte-identical.
+
+Each result is the arithmetic mean of 20 measured release-build executions
+after five warmups. Document and binary order were shuffled within paired
+blocks, and output was written to `/dev/null`.
+
+| document | pages | baseline | optimized | speedup |
+|----------|------:|---------:|----------:|--------:|
+| [Attention Is All You Need](https://arxiv.org/pdf/1706.03762) | 15 | 11.48 ms | 10.96 ms | 1.05x |
+| [BERT](https://arxiv.org/pdf/1810.04805) | 16 | 4.58 ms | 4.28 ms | 1.07x |
+| [Bitcoin whitepaper](https://bitcoin.org/bitcoin.pdf) | 9 | 3.47 ms | 3.40 ms | 1.02x |
+| [IRS Form W-9](https://www.irs.gov/pub/irs-pdf/fw9.pdf) | 6 | 8.03 ms | 4.16 ms | 1.93x |
+| [NASA Systems Engineering Handbook](https://www.nasa.gov/wp-content/uploads/2018/09/nasa_systems_engineering_handbook_0.pdf) | 297 | 168.68 ms | 91.01 ms | 1.85x |
+| [NIST Cybersecurity Framework 2.0](https://nvlpubs.nist.gov/nistpubs/CSWP/NIST.CSWP.29.pdf) | 32 | 13.85 ms | 6.03 ms | 2.30x |
+| [NIST FIPS 180-4](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf) | 36 | 5.50 ms | 4.63 ms | 1.19x |
+| [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.pdf) | 194 | 26.33 ms | 23.91 ms | 1.10x |
+| [Constitution of the United States](https://www.govinfo.gov/content/pkg/CDOC-110hdoc50/pdf/CDOC-110hdoc50.pdf) | 85 | 7.67 ms | 6.63 ms | 1.16x |
+| [W3C CSS 2.1](https://www.w3.org/TR/2011/REC-CSS2-20110607/css2.pdf) | 430 | 229.52 ms | 240.94 ms | 0.95x |
+| **sum of document means** | **1,120** | **479.11 ms** | **395.96 ms** | **1.21x** |
+
+Nine documents improve, with a maximum 2.30x speedup. CSS 2.1 is about 5%
+slower and remains a useful stress case for the DEFLATE symbol decoder.
+
+### Extraction validation
+
+All 10 corpus documents convert successfully. Comparing case-folded Unicode
+word tokens against independent Poppler `pdftotext` output gives 86.6–99.8%
+recall and 92.8–99.8% precision, with no Unicode replacement characters or
+unexpected control characters. These numbers measure text fidelity, not
+semantic Markdown reconstruction: multi-column reading order, tables, code
+blocks, and heading inference remain best-effort.
+
 ## Testing & coverage
 
-326 tests (311 unit + 15 integration). Run them with:
+341 tests (326 unit + 15 integration). Run them with:
 
 ```sh
 cargo test --all-targets

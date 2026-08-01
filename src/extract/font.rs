@@ -18,8 +18,8 @@ pub struct PdfFont {
     pub encoding: BaseEncoding,
     /// Per-byte glyph-name overrides from /Encoding /Differences.
     pub differences: HashMap<u8, String>,
-    /// Width of source codes in bytes (1 for simple fonts without a wide
-    /// ToUnicode CMap, 2 for composite fonts or wide simple fonts).
+    /// Width of source codes in bytes. Simple fonts always use one-byte
+    /// character codes; composite fonts take their width from the CMap.
     code_width: usize,
     /// Fast-path decode table for 1-byte simple fonts. When set, `decode_into`
     /// is a tight `byte -> push_str` loop with no branching or hashing.
@@ -78,10 +78,10 @@ impl PdfFont {
 
         font.code_width = match font.kind {
             FontKind::Composite => font.to_unicode.as_ref().map_or(2, CMap::code_width),
-            FontKind::Simple => font.to_unicode.as_ref().map_or(1, CMap::code_width),
+            FontKind::Simple => 1,
         };
 
-        if font.kind == FontKind::Simple && font.code_width == 1 {
+        if font.kind == FontKind::Simple {
             font.simple_table = Some(font.build_simple_table());
         }
 
@@ -112,23 +112,14 @@ impl PdfFont {
             }
             i += take;
 
-            let resolved = self
-                .to_unicode
-                .as_ref()
-                .and_then(|cmap| cmap.lookup(code))
-                .map(str::to_owned)
-                .or_else(|| {
-                    // Per-byte glyph lookup is only meaningful for simple
-                    // fonts when we ended up reading exactly one byte (the
-                    // fast-path table handles the common case).
-                    if self.kind == FontKind::Simple && take == 1 {
-                        self.decode_single_byte(code as u8)
-                    } else {
-                        None
-                    }
-                });
-            if let Some(s) = resolved {
-                out.push_str(&s);
+            // Parsed simple fonts always have `simple_table`; this fallback
+            // keeps a default font useful when a font object is missing.
+            if self.kind == FontKind::Simple && take == 1 {
+                if let Some(text) = self.decode_single_byte(code as u8) {
+                    out.push_str(&text);
+                }
+            } else if let Some(text) = self.to_unicode.as_ref().and_then(|cmap| cmap.lookup(code)) {
+                out.push_str(text);
             }
         }
     }
@@ -479,12 +470,12 @@ stream
     }
 
     #[test]
-    fn decode_into_slow_path_byte_fallback_via_encoding_glyph() {
-        // Simple-font slow path: have a ToUnicode CMap with code_width 2
-        // (which forces the slow path even for a simple font), then feed a
-        // single byte that falls through every cmap/differences/encoding
-        // table and ultimately hits the `byte >= 0x20` fallback.
-        let payload = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n";
+    fn simple_font_ignores_wide_cmap_codespace() {
+        // A simple font's content strings contain one-byte character codes
+        // even when its ToUnicode stream declares two-byte codespace bounds.
+        // Word-generated PDFs commonly combine those bounds with one-byte
+        // bfchar entries.
+        let payload = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n1 beginbfchar <41> <0058> endbfchar\n";
         let zlib = zlib_compress(payload);
         let zlib_len = zlib.len();
         let mut bytes = format!(
@@ -519,16 +510,10 @@ stream
         bytes.extend_from_slice(xref.as_bytes());
         let doc = Document::load(&bytes).expect("load");
         let font = PdfFont::from_object(&doc, ObjectId(4, 0));
-        // Simple font but code_width = 2 from the CMap → slow path.
-        assert_eq!(font.code_width, 2);
-        // Feed an odd-length input so we hit `take == 1` on the second
-        // pass. For byte 'A' (0x41) with WinAnsi encoding the glyph lookup
-        // succeeds; for byte 0x05 it falls through to the `byte >= 0x20`
-        // arm which silently drops it.
+        assert_eq!(font.code_width, 1);
         let mut out = String::new();
-        font.decode_into(b"\x00\x41A", &mut out);
-        // Only the trailing 'A' resolves through the simple-byte fallback.
-        assert_eq!(out, "A");
+        font.decode_into(b"AB", &mut out);
+        assert_eq!(out, "XB");
     }
 
     /// Minimal RFC 1950 zlib (stored block only) — used to seed in-test
