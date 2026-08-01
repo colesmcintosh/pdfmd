@@ -87,7 +87,7 @@ impl<'a> Parser<'a> {
             }
             b'(' => self.parse_literal_string(),
             b'[' => self.parse_array(),
-            b'/' => self.parse_name(),
+            b'/' => Ok(self.parse_name()),
             b't' | b'f' | b'n' => self.parse_keyword_object(),
             b'+' | b'-' | b'.' | b'0'..=b'9' => self.parse_number_or_reference(),
             _ => Err(PdfError::BadObject(format!(
@@ -293,7 +293,7 @@ impl<'a> Parser<'a> {
 
     // ---- Names -----------------------------------------------------------
 
-    fn parse_name(&mut self) -> Result<Object, PdfError> {
+    fn parse_name(&mut self) -> Object {
         debug_assert_eq!(self.bytes[self.pos], b'/');
         self.pos += 1;
         let start = self.pos;
@@ -307,7 +307,7 @@ impl<'a> Parser<'a> {
         // we scan first and only allocate when needed.
         let raw = &self.bytes[start..self.pos];
         if !raw.contains(&b'#') {
-            return Ok(Object::Name(raw.to_vec()));
+            return Object::Name(raw.to_vec());
         }
         let mut out = Vec::with_capacity(raw.len());
         let mut i = 0;
@@ -322,7 +322,7 @@ impl<'a> Parser<'a> {
             out.push(raw[i]);
             i += 1;
         }
-        Ok(Object::Name(out))
+        Object::Name(out)
     }
 
     // ---- Arrays and dicts -----------------------------------------------
@@ -379,11 +379,11 @@ impl<'a> Parser<'a> {
                     "dictionary entries exceed cap of {MAX_DICT_ENTRIES}"
                 )));
             }
-            // parse_name always returns Object::Name on success.
-            let key = match self.parse_name() {
-                Ok(k) => k.as_name().expect("parse_name returns Name").to_vec(),
-                Err(e) => break Err(e),
-            };
+            let key = self
+                .parse_name()
+                .as_name()
+                .expect("parse_name returns Name")
+                .to_vec();
             let value = match self.parse_object() {
                 Ok(v) => v,
                 Err(e) => break Err(e),
@@ -449,31 +449,28 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
             let length = stream_length(&dict)?;
-            let content = if let Some(len) = length {
-                let end = self
-                    .pos
-                    .checked_add(len)
-                    .ok_or_else(|| PdfError::BadObject("stream length overflow".into()))?;
-                if end > self.bytes.len() {
+            let (content_start, content_len) = if let Some(len) = length {
+                if len > self.bytes.len().saturating_sub(self.pos) {
                     return Err(PdfError::BadObject("stream truncated".into()));
                 }
-                let bytes = self.bytes[self.pos..end].to_vec();
+                let start = self.pos;
+                let end = self.pos + len;
                 self.pos = end;
-                bytes
+                (start, len)
             } else {
                 // /Length is an indirect reference we can't resolve at this
                 // layer. Scan forward for the matching `endstream`.
                 let end = find_endstream(&self.bytes[self.pos..])
                     .ok_or_else(|| PdfError::BadObject("missing endstream".into()))?;
-                let bytes = self.bytes[self.pos..self.pos + end].to_vec();
+                let start = self.pos;
                 self.pos += end;
-                bytes
+                (start, end)
             };
             self.skip_ws_and_comments();
             if self.starts_with(b"endstream") {
                 self.pos += b"endstream".len();
             }
-            Object::Stream(Stream { dict, content })
+            Object::Stream(Stream::borrowed(dict, content_start, content_len))
         } else {
             object
         };
@@ -786,7 +783,7 @@ endobj
         let mut p = Parser::new(bytes);
         let (id, obj) = p.parse_indirect_object().unwrap();
         assert_eq!(id, ObjectId(1, 0));
-        assert_eq!(obj.as_stream().unwrap().content, b"hello");
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"hello");
     }
 
     #[test]
@@ -802,7 +799,7 @@ endobj
         let mut p = Parser::new(bytes);
         let (id, obj) = p.parse_indirect_object().unwrap();
         assert_eq!(id, ObjectId(2, 0));
-        assert_eq!(obj.as_stream().unwrap().content, b"the body");
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"the body");
     }
 
     #[test]
@@ -896,7 +893,7 @@ endobj
         let bytes = b"1 0 obj <</Length 3>>\nstream\r\nABC\nendstream endobj";
         let mut p = Parser::new(bytes);
         let (_, obj) = p.parse_indirect_object().unwrap();
-        assert_eq!(obj.as_stream().unwrap().content, b"ABC");
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"ABC");
     }
 
     #[test]
@@ -905,7 +902,7 @@ endobj
         let bytes = b"1 0 obj <</Length 3>>\nstream\rABC\nendstream endobj";
         let mut p = Parser::new(bytes);
         let (_, obj) = p.parse_indirect_object().unwrap();
-        assert_eq!(obj.as_stream().unwrap().content, b"ABC");
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"ABC");
     }
 
     #[test]
@@ -914,7 +911,22 @@ endobj
         let bytes = b"1 0 obj <</Length 3>>\nstreamABC\nendstream endobj";
         let mut p = Parser::new(bytes);
         let (_, obj) = p.parse_indirect_object().unwrap();
-        assert_eq!(obj.as_stream().unwrap().content, b"ABC");
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"ABC");
+    }
+
+    #[test]
+    fn direct_length_stream_tolerates_missing_endstream_marker() {
+        let bytes = b"1 0 obj <</Length 2>>\nstreamhi endobj";
+        let mut p = Parser::new(bytes);
+        let (_, obj) = p.parse_indirect_object().unwrap();
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"hi");
+    }
+
+    #[test]
+    fn indirect_object_without_endobj_still_returns_object() {
+        let mut p = Parser::new(b"1 0 obj 42");
+        let (_, obj) = p.parse_indirect_object().unwrap();
+        assert_eq!(obj.as_integer(), Some(42));
     }
 
     #[test]
@@ -968,5 +980,11 @@ endobj
         // at the closing paren without consuming a 2nd or 3rd digit and
         // the inner `break` arm runs.
         assert_eq!(parse(b"(\\7)").as_string(), Some(b"\x07".as_slice()));
+    }
+
+    #[test]
+    fn unterminated_octal_escape_breaks_at_eof() {
+        let mut p = Parser::new(b"(\\7");
+        assert!(p.parse_object().is_err());
     }
 }
