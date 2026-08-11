@@ -130,9 +130,12 @@ fn decode_huffman(
         } else if sym == 256 {
             return Ok(());
         } else {
-            // Hlit caps the LL alphabet at 286, so `sym - 257` is always a
-            // valid LENGTH_BASE index — no bounds check needed.
             let li = (sym - 257) as usize;
+            if li >= LENGTH_BASE.len() {
+                return Err(PdfError::Deflate(format!(
+                    "invalid literal/length code {sym}"
+                )));
+            }
             let length = LENGTH_BASE[li] as usize + reader.read(LENGTH_EXTRA[li] as u32) as usize;
             // Hdist caps the distance alphabet at 30, same story.
             let dsym = dist.decode(reader)? as usize;
@@ -156,25 +159,37 @@ fn decode_huffman(
 /// LZ77 back-reference copy. Handles `length > distance` by repeating the
 /// last `distance` bytes, which is how DEFLATE encodes runs.
 fn copy_match(out: &mut Vec<u8>, length: usize, distance: usize) {
+    if length == 0 {
+        return;
+    }
     let start = out.len() - distance;
     out.reserve(length);
-    if distance >= length {
-        // Non-overlapping: one contiguous copy from the existing range.
-        // SAFETY: src and dst don't overlap (distance >= length), the source
-        // window is in-bounds (caller already validated `distance <= out.len()`),
-        // and we extend `out` by exactly `length` after the copy.
-        let src_ptr = out.as_ptr();
-        let dst_len = out.len();
+
+    // Seed the destination with at most one full source period, then double
+    // the materialised bytes until the match is complete. Long overlapping
+    // runs are common in compressed PDF streams; copying them a byte at a time is
+    // substantially more expensive than a handful of bulk copies.
+    let dst_start = out.len();
+    let mut copied = length.min(distance);
+    // SAFETY: `reserve` made room for the whole match. The seed source is in
+    // bounds and disjoint from the destination because `copied <= distance`.
+    unsafe {
+        let ptr = out.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(ptr.add(start), ptr.add(dst_start), copied);
+        out.set_len(dst_start + copied);
+    }
+
+    while copied < length {
+        let chunk = copied.min(length - copied);
+        // SAFETY: the source is the already initialised match prefix. Since
+        // `chunk <= copied`, it does not overlap the destination, and both
+        // ranges fit in the capacity reserved above.
         unsafe {
-            let dst = out.as_mut_ptr().add(dst_len);
-            std::ptr::copy_nonoverlapping(src_ptr.add(start), dst, length);
-            out.set_len(dst_len + length);
+            let ptr = out.as_mut_ptr().add(dst_start);
+            std::ptr::copy_nonoverlapping(ptr, ptr.add(copied), chunk);
+            out.set_len(dst_start + copied + chunk);
         }
-    } else {
-        for i in 0..length {
-            let b = out[start + i];
-            out.push(b);
-        }
+        copied += chunk;
     }
 }
 
@@ -598,6 +613,20 @@ mod tests {
     }
 
     #[test]
+    fn copy_match_repeats_multi_byte_pattern() {
+        let mut out = b"abc".to_vec();
+        copy_match(&mut out, 8, 3);
+        assert_eq!(out, b"abcabcabcab");
+    }
+
+    #[test]
+    fn copy_match_accepts_empty_length() {
+        let mut out = b"abc".to_vec();
+        copy_match(&mut out, 0, 3);
+        assert_eq!(out, b"abc");
+    }
+
+    #[test]
     fn copy_match_uses_fast_path_for_non_overlap() {
         let mut out = b"hello".to_vec();
         copy_match(&mut out, 3, 5);
@@ -679,6 +708,18 @@ mod tests {
         let mut out = Vec::new();
         let err = decode_huffman(&mut reader, &mut out, &ll, &dist).unwrap_err();
         assert!(err.to_string().contains("invalid Huffman code"));
+    }
+
+    #[test]
+    fn huffman_rejects_reserved_literal_length_symbol() {
+        let mut ll_lengths = vec![0u8; 287];
+        ll_lengths[286] = 1;
+        let ll = HuffmanTable::build(&ll_lengths).unwrap();
+        let dist = HuffmanTable::build(&[1]).unwrap();
+        let mut reader = BitReader::new(&[0]);
+        let mut out = Vec::new();
+        let err = decode_huffman(&mut reader, &mut out, &ll, &dist).unwrap_err();
+        assert!(err.to_string().contains("invalid literal/length code 286"));
     }
 
     #[test]

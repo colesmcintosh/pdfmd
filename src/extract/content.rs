@@ -17,10 +17,22 @@ use crate::pdf::{Dictionary, Object, ObjectId};
 use super::font::PdfFont;
 use super::image::PageImages;
 use super::parser::{Parser, Token};
+use super::FormXObject;
 
 /// Map from a page's font-resource name (e.g. `b"F1"`) to a borrowed handle
 /// on the parsed font in the document-wide cache.
 pub type PageFonts<'a> = HashMap<Vec<u8>, &'a PdfFont>;
+
+struct ContentResources<'a, 'fonts> {
+    fonts: &'a PageFonts<'fonts>,
+    xobjects: &'a HashMap<Vec<u8>, ObjectId>,
+    images: &'a PageImages<'a>,
+}
+
+struct FormContext<'a, 'fonts> {
+    forms: &'a HashMap<ObjectId, FormXObject>,
+    fonts: &'a HashMap<ObjectId, PageFonts<'fonts>>,
+}
 
 /// Sentinel that wraps image-reference filenames in the extracted text.
 /// The markdown layer rewrites `\u{0001}NAME\u{0001}` into `![](DIR/NAME)`.
@@ -31,6 +43,81 @@ pub const IMAGE_MARK: char = '\u{0001}';
 /// rather than a word-break. PDF expresses these values in thousandths of
 /// the current text-space unit, so 100 ≈ a tenth of an em.
 const TJ_SPACE_THRESHOLD: f32 = 100.0;
+
+/// Bound recursive Form XObject invocation independently of the resource
+/// graph pre-pass. Real documents rarely nest forms more than a few levels;
+/// this cap keeps adversarial acyclic chains from exhausting the stack.
+const MAX_FORM_DEPTH: usize = 32;
+
+/// Page-local limits keep a branching Form graph from multiplying a small
+/// resource set into unbounded work or output.
+const MAX_FORM_INVOCATIONS_PER_PAGE: usize = 16_384;
+const MAX_FORM_INPUT_BYTES_PER_PAGE: usize = 64 * 1024 * 1024;
+const MAX_FORM_OUTPUT_BYTES_PER_PAGE: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct FormExecutionLimits {
+    invocations: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+}
+
+const FORM_EXECUTION_LIMITS: FormExecutionLimits = FormExecutionLimits {
+    invocations: MAX_FORM_INVOCATIONS_PER_PAGE,
+    input_bytes: MAX_FORM_INPUT_BYTES_PER_PAGE,
+    output_bytes: MAX_FORM_OUTPUT_BYTES_PER_PAGE,
+};
+
+struct FormBudget {
+    limits: FormExecutionLimits,
+    invocations: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+}
+
+impl FormBudget {
+    fn new(limits: FormExecutionLimits) -> Self {
+        Self {
+            limits,
+            invocations: 0,
+            input_bytes: 0,
+            output_bytes: 0,
+        }
+    }
+
+    fn output_exhausted(&self) -> bool {
+        self.output_bytes >= self.limits.output_bytes
+    }
+
+    fn charge_output(&mut self, out: &mut String, added: usize) {
+        let remaining = self.limits.output_bytes.saturating_sub(self.output_bytes);
+        if added <= remaining {
+            self.output_bytes += added;
+            return;
+        }
+
+        let mut new_len = out.len().saturating_sub(added - remaining);
+        while new_len > 0 && !out.is_char_boundary(new_len) {
+            new_len -= 1;
+        }
+        out.truncate(new_len);
+        self.output_bytes = self.limits.output_bytes;
+    }
+}
+
+struct FormExecution {
+    active: Vec<ObjectId>,
+    budget: FormBudget,
+}
+
+impl FormExecution {
+    fn new(limits: FormExecutionLimits) -> Self {
+        Self {
+            active: Vec::new(),
+            budget: FormBudget::new(limits),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Matrix {
@@ -59,6 +146,16 @@ impl Matrix {
         self.e += tx * self.a + ty * self.c;
         self.f += tx * self.b + ty * self.d;
     }
+}
+
+fn text_direction_changed(previous: Matrix, next: Matrix) -> bool {
+    let previous_length = previous.a.hypot(previous.b);
+    let next_length = next.a.hypot(next.b);
+    if previous_length <= f32::EPSILON || next_length <= f32::EPSILON {
+        return false;
+    }
+    let dot = previous.a * next.a + previous.b * next.b;
+    dot < previous_length * next_length * 0.99
 }
 
 /// Operand stack for a single content-stream operator. PDF operators take at
@@ -102,20 +199,87 @@ enum ArrayItem<'a> {
 
 /// Extract the page's text. Newlines mark new lines; pages are returned as
 /// independent strings so the caller can splice page breaks between them.
+#[cfg(test)]
 pub fn extract_page_text(
     content_bytes: &[u8],
     fonts: &PageFonts<'_>,
     images: &PageImages<'_>,
 ) -> String {
-    let mut state: TextState<'_> = TextState::default();
+    let xobjects = HashMap::new();
+    let forms = HashMap::new();
+    let form_fonts = HashMap::new();
+    extract_page_text_with_forms(content_bytes, fonts, &xobjects, images, &forms, &form_fonts)
+}
+
+/// Extract page text while resolving Form XObjects at each `Do` paint.
+pub(super) fn extract_page_text_with_forms<'fonts>(
+    content_bytes: &[u8],
+    fonts: &PageFonts<'fonts>,
+    xobjects: &HashMap<Vec<u8>, ObjectId>,
+    images: &PageImages<'_>,
+    forms: &HashMap<ObjectId, FormXObject>,
+    form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
+) -> String {
+    extract_page_text_with_form_limits(
+        content_bytes,
+        fonts,
+        xobjects,
+        images,
+        forms,
+        form_fonts,
+        FORM_EXECUTION_LIMITS,
+    )
+}
+
+fn extract_page_text_with_form_limits<'fonts>(
+    content_bytes: &[u8],
+    fonts: &PageFonts<'fonts>,
+    xobjects: &HashMap<Vec<u8>, ObjectId>,
+    images: &PageImages<'_>,
+    forms: &HashMap<ObjectId, FormXObject>,
+    form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
+    limits: FormExecutionLimits,
+) -> String {
     // PDFs almost always emit more bytes than the content stream; preallocate
     // a generous chunk so the inner push loop avoids early growth.
     let mut out = String::with_capacity(content_bytes.len());
+    let resources = ContentResources {
+        fonts,
+        xobjects,
+        images,
+    };
+    let form_context = FormContext {
+        forms,
+        fonts: form_fonts,
+    };
+    let mut state = TextState::default();
+    let mut form_execution = FormExecution::new(limits);
+    extract_content_into(
+        content_bytes,
+        &resources,
+        &form_context,
+        &mut state,
+        &mut form_execution,
+        &mut out,
+    );
+    out
+}
 
+fn extract_content_into<'fonts>(
+    content_bytes: &[u8],
+    resources: &ContentResources<'_, 'fonts>,
+    form_context: &FormContext<'_, 'fonts>,
+    state: &mut TextState<'fonts>,
+    form_execution: &mut FormExecution,
+    out: &mut String,
+) {
     let mut parser = Parser::new(content_bytes);
     let mut ops: Operands<'_> = Operands::default();
 
     loop {
+        if !form_execution.active.is_empty() && form_execution.budget.output_exhausted() {
+            break;
+        }
         match parser.next_token() {
             Token::Eof => break,
             Token::Num(n) => ops.push_num(n),
@@ -136,7 +300,28 @@ pub fn extract_page_text(
             // A stray `]` outside an array isn't meaningful; ignore.
             Token::ArrayEnd => {}
             Token::Op(op) => {
-                dispatch(op, &ops, &mut state, fonts, images, &mut out);
+                let charge_output = !form_execution.active.is_empty();
+                let output_start = out.len();
+                let charged_start = form_execution.budget.output_bytes;
+                dispatch(
+                    op,
+                    &ops,
+                    state,
+                    resources,
+                    form_context,
+                    form_execution,
+                    out,
+                );
+                if charge_output {
+                    let added = out.len().saturating_sub(output_start);
+                    let nested_charge = form_execution
+                        .budget
+                        .output_bytes
+                        .saturating_sub(charged_start);
+                    form_execution
+                        .budget
+                        .charge_output(out, added.saturating_sub(nested_charge));
+                }
                 if op == b"BI" {
                     // Inline image dictionary follows; consume name/value
                     // pairs until we see `ID`, then skip the raw bytes.
@@ -146,8 +331,6 @@ pub fn extract_page_text(
             }
         }
     }
-
-    out
 }
 
 fn skip_inline_image(parser: &mut Parser<'_>) {
@@ -176,18 +359,31 @@ struct TextState<'a> {
     last_y: Option<f32>,
     last_x: Option<f32>,
     pending_space: bool,
+    pending_form_word_boundary: bool,
     /// Exponential moving average of the vertical distance between
     /// consecutive lines on this page. Used to tell a normal line wrap
     /// (≈ this value) from a paragraph break (significantly more).
     typical_line_height: Option<f32>,
 }
 
-fn dispatch<'a>(
+impl<'a> TextState<'a> {
+    fn inherited_for_form(caller: &Self) -> Self {
+        Self {
+            font: caller.font,
+            font_size: caller.font_size,
+            leading: caller.leading,
+            ..Self::default()
+        }
+    }
+}
+
+fn dispatch<'ops, 'fonts>(
     op: &[u8],
-    ops: &Operands<'a>,
-    state: &mut TextState<'a>,
-    fonts: &PageFonts<'a>,
-    images: &PageImages<'_>,
+    ops: &Operands<'ops>,
+    state: &mut TextState<'fonts>,
+    resources: &ContentResources<'_, 'fonts>,
+    form_context: &FormContext<'_, 'fonts>,
+    form_execution: &mut FormExecution,
     out: &mut String,
 ) {
     match op {
@@ -201,7 +397,7 @@ fn dispatch<'a>(
         }
         b"Tf" => {
             if let (Some(name), [size, ..]) = (ops.name, ops.nums()) {
-                state.font = fonts.get(name).copied();
+                state.font = resources.fonts.get(name).copied();
                 state.font_size = *size;
             }
         }
@@ -220,9 +416,16 @@ fn dispatch<'a>(
                     e: *e,
                     f: *f,
                 };
+                let direction_changed = state
+                    .line_matrix
+                    .map(|previous| text_direction_changed(previous, m))
+                    .unwrap_or(false);
                 state.text_matrix = Some(m);
                 state.line_matrix = Some(m);
                 position_changed(state, m.e, m.f, out);
+                if direction_changed {
+                    state.pending_space = true;
+                }
             }
         }
         b"Td" | b"TD" => {
@@ -275,17 +478,37 @@ fn dispatch<'a>(
             }
         }
         b"Do" => {
-            // Paint an XObject by its resource name. We only care about
-            // image XObjects we previously chose to extract; everything
-            // else (Form XObjects, unsupported filters) is invisible here.
             if let Some(name) = ops.name {
-                if let Some(filename) = images.get(name) {
+                if let Some(filename) = resources.images.get(name) {
                     state.pending_space = false;
+                    state.pending_form_word_boundary = false;
                     ensure_trailing_breaks(out, 2);
                     out.push(IMAGE_MARK);
                     out.push_str(filename);
                     out.push(IMAGE_MARK);
                     out.push_str("\n\n");
+                } else if let Some(id) = resources.xobjects.get(name).copied() {
+                    let start = out.len();
+                    if emit_form(id, state, resources, form_context, form_execution, out) {
+                        let previous = out[..start].chars().next_back();
+                        let first = out[start..].chars().next();
+                        let adjacent_words = previous
+                            .zip(first)
+                            .map(|(left, right)| left.is_alphanumeric() && right.is_alphanumeric())
+                            .unwrap_or(false);
+                        let boundary_is_tight =
+                            previous.map(|ch| !ch.is_whitespace()).unwrap_or(false)
+                                && first.map(|ch| !ch.is_whitespace()).unwrap_or(false);
+                        if boundary_is_tight && (state.pending_space || adjacent_words) {
+                            out.insert(start, ' ');
+                        }
+                        state.pending_space = false;
+                        state.pending_form_word_boundary = out
+                            .chars()
+                            .next_back()
+                            .map(|ch| ch.is_alphanumeric())
+                            .unwrap_or(false);
+                    }
                 }
             }
         }
@@ -310,6 +533,74 @@ fn dispatch<'a>(
     }
 }
 
+fn emit_form<'fonts>(
+    id: ObjectId,
+    caller_state: &TextState<'fonts>,
+    caller_resources: &ContentResources<'_, 'fonts>,
+    form_context: &FormContext<'_, 'fonts>,
+    form_execution: &mut FormExecution,
+    out: &mut String,
+) -> bool {
+    if form_execution.active.len() >= MAX_FORM_DEPTH
+        || form_execution.active.contains(&id)
+        || form_execution.budget.invocations >= form_execution.budget.limits.invocations
+        || form_execution.budget.output_exhausted()
+    {
+        return false;
+    }
+    let Some(form) = form_context.forms.get(&id) else {
+        return false;
+    };
+    if form.content.len()
+        > form_execution
+            .budget
+            .limits
+            .input_bytes
+            .saturating_sub(form_execution.budget.input_bytes)
+    {
+        return false;
+    }
+
+    let start = out.len();
+    form_execution.budget.invocations += 1;
+    form_execution.budget.input_bytes += form.content.len();
+    let mut state = TextState::inherited_for_form(caller_state);
+    form_execution.active.push(id);
+    if let (Some(fonts), Some(xobjects)) = (form_context.fonts.get(&id), form.xobject_refs.as_ref())
+    {
+        // Image discovery currently starts at page resources. A form with
+        // its own resources therefore gets an empty local image map, while
+        // nested forms and text still resolve against its local dictionaries.
+        let images = PageImages::new();
+        let resources = ContentResources {
+            fonts,
+            xobjects,
+            images: &images,
+        };
+        extract_content_into(
+            &form.content,
+            &resources,
+            form_context,
+            &mut state,
+            form_execution,
+            out,
+        );
+    } else {
+        extract_content_into(
+            &form.content,
+            caller_resources,
+            form_context,
+            &mut state,
+            form_execution,
+            out,
+        );
+    }
+    form_execution.active.pop();
+    out.get(start..)
+        .map(|text| text.chars().any(|ch| !ch.is_whitespace()))
+        .unwrap_or(false)
+}
+
 fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
     let Some(font) = state.font else { return };
 
@@ -322,7 +613,9 @@ fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
             true
         };
     let was_pending = state.pending_space;
+    let was_form_boundary_pending = state.pending_form_word_boundary;
     state.pending_space = false;
+    state.pending_form_word_boundary = false;
     let start = out.len();
     font.decode_into(bytes, out);
     if out.len() == start {
@@ -330,6 +623,21 @@ fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
             out.pop();
         }
         state.pending_space = was_pending;
+        state.pending_form_word_boundary = was_form_boundary_pending;
+    } else if was_form_boundary_pending && !added_space {
+        let previous_is_word = out[..start]
+            .chars()
+            .next_back()
+            .map(|ch| ch.is_alphanumeric())
+            .unwrap_or(false);
+        let first_is_word = out[start..]
+            .chars()
+            .next()
+            .map(|ch| ch.is_alphanumeric())
+            .unwrap_or(false);
+        if previous_is_word && first_is_word {
+            out.insert(start, ' ');
+        }
     }
 }
 
@@ -350,19 +658,25 @@ fn position_changed(state: &mut TextState<'_>, new_x: f32, new_y: f32, out: &mut
     }
     let prev_y = state.last_y.unwrap_or(new_y);
     let dy = (new_y - prev_y).abs();
-    let line_threshold = state.font_size.max(1.0) * 0.4;
+    // Some producers set `Tf` to 1 and put the visible point size in `Tm`.
+    // Measure the transformed vertical text basis so those normal line
+    // advances are not mistaken for paragraph-sized jumps.
+    let vertical_scale = state.line_matrix.map(|m| m.c.hypot(m.d)).unwrap_or(1.0);
+    let effective_font_size = (state.font_size.abs() * vertical_scale).max(1.0);
+    let line_threshold = effective_font_size * 0.4;
     if dy > line_threshold {
         // Paragraph break: either we've established a typical line height
         // for this page and this jump is much larger, OR the vertical
         // distance is more than two font sizes (e.g. column reset).
         let is_paragraph = match state.typical_line_height {
             Some(typical) => dy > typical * 1.5,
-            None => dy > state.font_size.max(1.0) * 2.0,
+            None => dy > effective_font_size * 2.0,
         };
         if !out.is_empty() {
             ensure_trailing_breaks(out, if is_paragraph { 2 } else { 1 });
         }
         state.pending_space = false;
+        state.pending_form_word_boundary = false;
         // Train the EMA on line-height-sized jumps only; column/section
         // resets would otherwise blow the running average.
         if !is_paragraph {
@@ -430,6 +744,14 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(b"F1".to_vec(), font);
         m
+    }
+
+    fn form(content: &[u8]) -> FormXObject {
+        FormXObject {
+            content: content.to_vec(),
+            font_refs: None,
+            xobject_refs: None,
+        }
     }
 
     #[test]
@@ -527,6 +849,118 @@ ET
     }
 
     #[test]
+    fn form_word_boundary_waits_for_the_next_decoded_character() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let id = ObjectId(1, 0);
+        let xobjects = HashMap::from([(b"Fm".to_vec(), id)]);
+        let forms = HashMap::from([(id, form(b"BT /F1 12 Tf (word) Tj ET"))]);
+        let form_fonts = HashMap::new();
+
+        let punctuation = extract_page_text_with_forms(
+            b"/Fm Do BT /F1 12 Tf (!) Tj ET",
+            &fonts,
+            &xobjects,
+            &images,
+            &forms,
+            &form_fonts,
+        );
+        assert_eq!(punctuation, "word!");
+
+        let alphanumeric = extract_page_text_with_forms(
+            b"/Fm Do BT /F1 12 Tf (\x01) Tj (next) Tj ET",
+            &fonts,
+            &xobjects,
+            &images,
+            &forms,
+            &form_fonts,
+        );
+        assert_eq!(alphanumeric, "word next");
+    }
+
+    #[test]
+    fn form_execution_budgets_bound_branching_and_output() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        let root = ObjectId(1, 0);
+        let branch = ObjectId(2, 0);
+        let leaf = ObjectId(3, 0);
+        let xobjects = HashMap::from([
+            (b"Root".to_vec(), root),
+            (b"Branch".to_vec(), branch),
+            (b"Leaf".to_vec(), leaf),
+        ]);
+        let forms = HashMap::from([
+            (root, form(b"/Branch Do /Branch Do")),
+            (branch, form(b"/Leaf Do /Leaf Do")),
+            (leaf, form(b"BT /F1 12 Tf (x) Tj ET")),
+        ]);
+        let form_fonts = HashMap::new();
+
+        let invocation_limited = extract_page_text_with_form_limits(
+            b"/Root Do",
+            &fonts,
+            &xobjects,
+            &images,
+            &forms,
+            &form_fonts,
+            FormExecutionLimits {
+                invocations: 4,
+                input_bytes: usize::MAX,
+                output_bytes: usize::MAX,
+            },
+        );
+        assert_eq!(invocation_limited, "x x");
+
+        let output_forms = HashMap::from([(leaf, form(b"BT /F1 12 Tf (abcdef) Tj ET"))]);
+        let output_limited = extract_page_text_with_form_limits(
+            b"/Leaf Do /Leaf Do",
+            &fonts,
+            &xobjects,
+            &images,
+            &output_forms,
+            &form_fonts,
+            FormExecutionLimits {
+                invocations: usize::MAX,
+                input_bytes: usize::MAX,
+                output_bytes: 3,
+            },
+        );
+        assert_eq!(output_limited, "abc");
+
+        let silent = ObjectId(4, 0);
+        let marker = ObjectId(5, 0);
+        let input_xobjects = HashMap::from([
+            (b"Root".to_vec(), root),
+            (b"Silent".to_vec(), silent),
+            (b"Marker".to_vec(), marker),
+        ]);
+        let root_content = b"/Silent Do /Silent Do /Marker Do";
+        let silent_content = b"q Q";
+        let input_forms = HashMap::from([
+            (root, form(root_content)),
+            (silent, form(silent_content)),
+            (marker, form(b"BT /F1 12 Tf (x) Tj ET")),
+        ]);
+        let input_limited = extract_page_text_with_form_limits(
+            b"/Root Do",
+            &fonts,
+            &input_xobjects,
+            &images,
+            &input_forms,
+            &form_fonts,
+            FormExecutionLimits {
+                invocations: usize::MAX,
+                input_bytes: root_content.len() + silent_content.len() * 2,
+                output_bytes: usize::MAX,
+            },
+        );
+        assert!(input_limited.is_empty());
+    }
+
+    #[test]
     fn ensure_trailing_breaks_collapses_existing_newlines() {
         let mut s = String::from("abc\n\n\n");
         ensure_trailing_breaks(&mut s, 1);
@@ -599,6 +1033,48 @@ ET
 ";
         let out = extract_page_text(stream, &fonts, &images);
         assert!(out.contains("top\nbottom"), "{out:?}");
+    }
+
+    #[test]
+    fn line_break_uses_font_size_scaled_by_text_matrix() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        // Word-generated PDFs commonly select a 1-unit font and scale the
+        // text matrix to the visible 12-point size. A one-em line advance is
+        // a normal wrap, not the 12x paragraph jump implied by raw `Tf`.
+        let stream = b"\
+BT
+/F1 1 Tf
+12 0 0 12 0 100 Tm
+(top) Tj
+0 -1 Td
+(bottom) Tj
+ET
+";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert_eq!(out, "top\nbottom");
+    }
+
+    #[test]
+    fn text_direction_change_preserves_word_boundary() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        // A rotated production tag follows an upright footer with a small
+        // page-space delta. It is a distinct text run even though the scaled
+        // vertical threshold correctly does not classify it as a new line.
+        let stream = b"\
+BT
+/F1 1 Tf
+6.5 0 0 6.5 25 20 Tm
+(932) Tj
+0 5 -5 0 22 18 Tm
+(cprice) Tj
+ET
+";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert_eq!(out, "932 cprice");
     }
 
     #[test]

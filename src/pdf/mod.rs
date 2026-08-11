@@ -25,7 +25,7 @@ use filter::{
     apply_filter, apply_predictor, collect_filters, collect_parms, decode_ascii85,
     decode_ascii_hex, paeth,
 };
-use object_stream::parse_object_stream;
+use object_stream::{parse_object_stream, ObjectStreamEntry};
 use page_tree::collect_pages;
 #[cfg(test)]
 use page_tree::walk_pages;
@@ -82,11 +82,20 @@ impl<'a> Document<'a> {
         // the surrounding objects to already exist when we expand them.
         let mut objects: HashMap<ObjectId, Object> = HashMap::with_capacity(xref.len());
         let mut compressed: Vec<(ObjectId, u32, u32)> = Vec::new();
+        let length_cache = std::cell::RefCell::new(HashMap::new());
         for (id, entry) in &xref {
             match *entry {
                 XrefEntry::Free => {}
                 XrefEntry::Uncompressed { offset } => {
-                    if let Some(obj) = parse_at(bytes, offset as usize, *id) {
+                    let resolve_length = |length_id| {
+                        resolve_indirect_length_cached(
+                            &mut length_cache.borrow_mut(),
+                            bytes,
+                            &xref,
+                            length_id,
+                        )
+                    };
+                    if let Some(obj) = parse_at(bytes, offset as usize, *id, &resolve_length) {
                         objects.insert(*id, obj);
                     }
                 }
@@ -98,9 +107,14 @@ impl<'a> Document<'a> {
 
         // Expand each object stream once, then pull every referenced index
         // out of it. PDF 1.5+ stores most metadata objects this way.
-        let mut objstm_cache: HashMap<u32, Vec<(u32, Vec<u8>)>> = HashMap::new();
+        struct CachedObjectStream {
+            decoded: Vec<u8>,
+            entries: Vec<ObjectStreamEntry>,
+        }
+
+        let mut objstm_cache: HashMap<u32, CachedObjectStream> = HashMap::new();
         for (id, stream_obj, index) in &compressed {
-            let entries = match objstm_cache.get(stream_obj) {
+            let cached = match objstm_cache.get(stream_obj) {
                 Some(v) => v,
                 None => {
                     let stream_id = ObjectId(*stream_obj, 0);
@@ -109,24 +123,76 @@ impl<'a> Document<'a> {
                     };
                     let decoded = decode_filters(s, bytes)?;
                     let entries = parse_object_stream(&s.dict, &decoded)?;
-                    objstm_cache.insert(*stream_obj, entries);
+                    objstm_cache.insert(*stream_obj, CachedObjectStream { decoded, entries });
                     &objstm_cache[stream_obj]
                 }
             };
-            if let Some((_, bytes_)) = entries.iter().find(|(n, _)| *n == id.0) {
-                if let Ok(obj) = Parser::new(bytes_).parse_object() {
+
+            // The xref index is authoritative and is correct for normal PDFs,
+            // so consult it before falling back to a linear number search.
+            // Keep the number-first malformed-producer behaviour: if the
+            // indexed header names a different object, prefer an entry whose
+            // header names the requested id, then try the indexed payload if
+            // parsing that entry fails.
+            let (numbered, indexed_fallback) =
+                object_stream_candidates(&cached.entries, id.0, *index as usize);
+            let mut inserted = false;
+            if let Some(entry) = numbered {
+                if let Ok(obj) = Parser::new(entry.content(&cached.decoded)).parse_object() {
                     objects.insert(*id, obj);
+                    inserted = true;
                 }
             }
             // Index-based lookup variant — some producers don't number entries.
-            if !objects.contains_key(id) {
-                if let Some((_, bytes_)) = entries.get(*index as usize) {
-                    if let Ok(obj) = Parser::new(bytes_).parse_object() {
+            if !inserted {
+                if let Some(entry) = indexed_fallback {
+                    if let Ok(obj) = Parser::new(entry.content(&cached.decoded)).parse_object() {
                         objects.insert(*id, obj);
                     }
                 }
             }
         }
+
+        // Streams whose /Length integer lives in an object stream could not
+        // be bounded exactly during the first pass. Reparse ordinary streams
+        // now that compressed objects are materialized. Object and xref
+        // streams stay untouched because they bootstrap the object/xref maps
+        // above; reparsing one here could create a self/cyclic dependency and
+        // leave those maps inconsistent with their source.
+        let mut repaired_streams = Vec::new();
+        for (id, entry) in &xref {
+            let XrefEntry::Uncompressed { offset } = *entry else {
+                continue;
+            };
+            let Some(Object::Stream(stream)) = objects.get(id) else {
+                continue;
+            };
+            let Some(length_id) = stream.dict.get(b"Length").and_then(Object::as_reference) else {
+                continue;
+            };
+            let Some(XrefEntry::Compressed { stream_obj, .. }) = xref.get(&length_id) else {
+                continue;
+            };
+            let stream_type = stream.dict.get(b"Type").and_then(Object::as_name);
+            if *stream_obj == id.0 || stream_type == Some(b"ObjStm") || stream_type == Some(b"XRef")
+            {
+                continue;
+            }
+            if resolve_materialized_length(&objects, length_id).is_none() {
+                continue;
+            }
+            let resolve_length = |candidate| resolve_materialized_length(&objects, candidate);
+            let mut parser = Parser::with_pos(bytes, offset as usize);
+            let Ok((parsed_id, obj)) =
+                parser.parse_indirect_object_with_length_resolver(&resolve_length)
+            else {
+                continue;
+            };
+            if parsed_id == *id {
+                repaired_streams.push((*id, obj));
+            }
+        }
+        objects.extend(repaired_streams);
 
         let pages = collect_pages(&objects, &trailer)?;
 
@@ -201,13 +267,80 @@ impl<'a> Document<'a> {
 
 // ---- Helpers ---------------------------------------------------------------
 
-fn parse_at(bytes: &[u8], at: usize, expected: ObjectId) -> Option<Object> {
+fn parse_at(
+    bytes: &[u8],
+    at: usize,
+    expected: ObjectId,
+    resolve_length: &dyn Fn(ObjectId) -> Option<usize>,
+) -> Option<Object> {
     let mut p = Parser::with_pos(bytes, at);
-    let (id, obj) = p.parse_indirect_object().ok()?;
+    let (id, obj) = p
+        .parse_indirect_object_with_length_resolver(resolve_length)
+        .ok()?;
     if id.0 != expected.0 {
         return None;
     }
     Some(obj)
+}
+
+fn resolve_indirect_length(
+    bytes: &[u8],
+    xref: &std::collections::BTreeMap<ObjectId, XrefEntry>,
+    id: ObjectId,
+) -> Option<usize> {
+    let XrefEntry::Uncompressed { offset } = xref.get(&id)? else {
+        return None;
+    };
+    let mut p = Parser::with_pos(bytes, *offset as usize);
+    let (parsed_id, value) = p.parse_indirect_object().ok()?;
+    if parsed_id != id {
+        return None;
+    }
+    let Object::Integer(value) = value else {
+        return None;
+    };
+    usize::try_from(value).ok()
+}
+
+fn resolve_indirect_length_cached(
+    cache: &mut HashMap<ObjectId, Option<usize>>,
+    bytes: &[u8],
+    xref: &std::collections::BTreeMap<ObjectId, XrefEntry>,
+    id: ObjectId,
+) -> Option<usize> {
+    if let Some(value) = cache.get(&id) {
+        return *value;
+    }
+    let value = resolve_indirect_length(bytes, xref, id);
+    cache.insert(id, value);
+    value
+}
+
+fn resolve_materialized_length(objects: &HashMap<ObjectId, Object>, id: ObjectId) -> Option<usize> {
+    let Object::Integer(value) = objects.get(&id)? else {
+        return None;
+    };
+    usize::try_from(*value).ok()
+}
+
+fn object_stream_candidates(
+    entries: &[ObjectStreamEntry],
+    expected_number: u32,
+    index: usize,
+) -> (Option<&ObjectStreamEntry>, Option<&ObjectStreamEntry>) {
+    let indexed = entries.get(index);
+    let numbered = match indexed {
+        Some(entry) if entry.number() == expected_number => Some(entry),
+        _ => entries
+            .iter()
+            .find(|entry| entry.number() == expected_number),
+    };
+    let indexed_fallback = indexed.filter(|entry| {
+        numbered
+            .map(|numbered| !std::ptr::eq(*entry, numbered))
+            .unwrap_or(true)
+    });
+    (numbered, indexed_fallback)
 }
 
 #[cfg(test)]
@@ -264,6 +397,93 @@ endobj
         let page = doc.pages()[0];
         let content = doc.get_page_content(page).expect("page content");
         assert!(content.windows(2).any(|w| w == b"Hi"));
+    }
+
+    #[test]
+    fn indirect_stream_length_preserves_terminal_cr_data_byte() {
+        let mut body = Vec::from(
+            &b"%PDF-1.4\n\
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n\
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n\
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]/Contents 4 0 R>> endobj\n\
+4 0 obj <</Length 5 0 R>>\nstream\nABC\r\nendstream\nendobj\n\
+5 0 obj 4 endobj\n"[..],
+        );
+        let xref_offset = body.len();
+        let offsets: Vec<usize> = (1..=5)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                find_subslice(&body, needle.as_bytes()).unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets {
+            xref.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer <</Size 6/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        body.extend_from_slice(xref.as_bytes());
+
+        let doc = Document::load(&body).expect("load");
+        let content = doc.get_page_content(doc.pages()[0]).expect("page content");
+        assert_eq!(content, b"ABC\r");
+    }
+
+    #[test]
+    fn compressed_indirect_stream_length_preserves_terminal_cr_data_byte() {
+        let mut body = String::from("%PDF-1.5\n");
+        let off1 = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]/Contents 4 0 R>> endobj\n",
+        );
+        let off4 = body.len();
+        body.push_str("4 0 obj <</Length 5 0 R>>\nstream\nABC\r\nendstream\nendobj\n");
+
+        // Object 5 is the integer length and is compressed inside object 6.
+        let off6 = body.len();
+        body.push_str(
+            "6 0 obj <</Type/ObjStm/N 1/First 4/Length 5>>\nstream\n5 0 4\nendstream\nendobj\n",
+        );
+        let mut bytes = body.into_bytes();
+
+        // Xref stream entries 0..=7. Object 5 is type 2 (compressed in
+        // object stream 6 at index 0); all other live objects are type 1.
+        let xref_offset = bytes.len();
+        let mut xref_data = Vec::new();
+        xref_data.extend_from_slice(&[0, 0, 0, 0]);
+        for offset in [off1, off2, off3, off4] {
+            xref_data.push(1);
+            xref_data.extend_from_slice(&(offset as u16).to_be_bytes());
+            xref_data.push(0);
+        }
+        xref_data.push(2);
+        xref_data.extend_from_slice(&6u16.to_be_bytes());
+        xref_data.push(0);
+        for offset in [off6, xref_offset] {
+            xref_data.push(1);
+            xref_data.extend_from_slice(&(offset as u16).to_be_bytes());
+            xref_data.push(0);
+        }
+
+        bytes.extend_from_slice(
+            format!(
+                "7 0 obj <</Type/XRef/Size 8/Root 1 0 R/W[1 2 1]/Length {}>>\nstream\n",
+                xref_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        let doc = Document::load(&bytes).expect("load");
+        let content = doc.get_page_content(doc.pages()[0]).expect("page content");
+        assert_eq!(content, b"ABC\r");
     }
 
     #[test]
@@ -1078,10 +1298,36 @@ endobj
         let body = b"10 0 11 4 (hi)(by)";
         let entries = parse_object_stream(&dict, body).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, 10);
-        assert_eq!(entries[0].1, b"(hi)");
-        assert_eq!(entries[1].0, 11);
-        assert_eq!(entries[1].1, b"(by)");
+        assert_eq!(entries[0].number(), 10);
+        assert_eq!(entries[0].content(body), b"(hi)");
+        assert_eq!(entries[1].number(), 11);
+        assert_eq!(entries[1].content(body), b"(by)");
+    }
+
+    #[test]
+    fn object_stream_lookup_keeps_malformed_producer_fallback_order() {
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(2));
+        dict.insert(b"First".to_vec(), Object::Integer(9));
+        let body = b"10 0 11 4(aa)(bb)";
+        let entries = parse_object_stream(&dict, body).unwrap();
+
+        // A valid xref index is the common O(1) path and needs no fallback.
+        let (primary, fallback) = object_stream_candidates(&entries, 11, 1);
+        assert_eq!(primary.unwrap().content(body), b"(bb)");
+        assert!(fallback.is_none());
+
+        // If the index and header disagree, preserve the old behaviour: try
+        // the matching object number first, then the indexed payload.
+        let (primary, fallback) = object_stream_candidates(&entries, 10, 1);
+        assert_eq!(primary.unwrap().content(body), b"(aa)");
+        assert_eq!(fallback.unwrap().content(body), b"(bb)");
+
+        // Some malformed producers do not put the requested id in the header;
+        // their indexed payload remains available as the sole fallback.
+        let (primary, fallback) = object_stream_candidates(&entries, 99, 0);
+        assert!(primary.is_none());
+        assert_eq!(fallback.unwrap().content(body), b"(aa)");
     }
 
     #[test]
@@ -1793,10 +2039,61 @@ endobj
     fn parse_at_returns_none_for_mismatched_id_or_bad_offset() {
         let bytes = b"5 0 obj 42 endobj";
         // Asking for id 7 at offset 0 returns None because id 5 lives there.
-        assert!(parse_at(bytes, 0, ObjectId(7, 0)).is_none());
+        assert!(parse_at(bytes, 0, ObjectId(7, 0), &|_| None).is_none());
         // A wildly out-of-bounds offset also returns None (parse_indirect
         // bails on an empty slice).
-        assert!(parse_at(bytes, bytes.len() + 100, ObjectId(5, 0)).is_none());
+        assert!(parse_at(bytes, bytes.len() + 100, ObjectId(5, 0), &|_| None,).is_none());
+    }
+
+    #[test]
+    fn indirect_length_resolvers_reject_non_integer_values() {
+        let bytes = b"5 0 obj 4.5 endobj";
+        let id = ObjectId(5, 0);
+        let mut xref = BTreeMap::new();
+        xref.insert(id, XrefEntry::Uncompressed { offset: 0 });
+        assert_eq!(resolve_indirect_length(bytes, &xref, id), None);
+
+        let mut objects = HashMap::new();
+        objects.insert(id, Object::Real(4.5));
+        assert_eq!(resolve_materialized_length(&objects, id), None);
+    }
+
+    #[test]
+    fn indirect_length_cache_memoizes_hits_and_misses_by_exact_id() {
+        let mut cache = HashMap::new();
+        let mut xref = BTreeMap::new();
+
+        let hit = ObjectId(5, 0);
+        xref.insert(hit, XrefEntry::Uncompressed { offset: 0 });
+        assert_eq!(
+            resolve_indirect_length_cached(&mut cache, b"5 0 obj 4 endobj", &xref, hit,),
+            Some(4)
+        );
+        // Changing the backing bytes makes a repeated parse observable: the
+        // cached result must still win.
+        assert_eq!(
+            resolve_indirect_length_cached(&mut cache, b"5 0 obj 9 endobj", &xref, hit,),
+            Some(4)
+        );
+
+        let miss = ObjectId(6, 0);
+        xref.insert(miss, XrefEntry::Uncompressed { offset: 0 });
+        assert_eq!(
+            resolve_indirect_length_cached(&mut cache, b"6 0 obj [1 2 3] endobj", &xref, miss,),
+            None
+        );
+        assert_eq!(
+            resolve_indirect_length_cached(&mut cache, b"6 0 obj 8 endobj", &xref, miss,),
+            None
+        );
+
+        let next_generation = ObjectId(5, 1);
+        xref.insert(next_generation, XrefEntry::Uncompressed { offset: 0 });
+        assert_eq!(
+            resolve_indirect_length_cached(&mut cache, b"5 1 obj 9 endobj", &xref, next_generation,),
+            Some(9)
+        );
+        assert_eq!(cache.len(), 3);
     }
 
     #[test]

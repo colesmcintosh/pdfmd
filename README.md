@@ -68,7 +68,7 @@ release build, `hyperfine --warmup 5 --runs 20 -N`):
 | mean              | 4.4 ms ± 0.3 ms      |
 | throughput        | ~240 MB/s of PDF     |
 | pages/sec         | ~3,900               |
-| release binary    | ~600 KB              |
+| release binary    | ~700 KB              |
 
 Per-page font and content-stream work runs across a small
 `std::thread::scope` worker pool, and fonts shared across pages are parsed
@@ -104,43 +104,38 @@ generation instead of JPEG pass-through, averaged `170.2 ms ± 4.8 ms`.
 
 A broader end-to-end CLI benchmark covers 10 public PDFs: 1,120 pages and
 19.6 MB spanning papers, standards, forms, a handbook, and a typeset legal
-document. Both binaries include the simple-font correctness fix; the optimized
-variant additionally uses compact DEFLATE Huffman tables and process-wide
-caching for the fixed RFC 1951 tables. Their Markdown output is byte-identical.
+document. A warm-cache batch benchmark converts all 10 documents to
+`/dev/null` in each measured command (`hyperfine --warmup 3 --runs 20`):
 
-Each result is the arithmetic mean of 20 measured release-build executions
-after five warmups. Document and binary order were shuffled within paired
-blocks, and output was written to `/dev/null`.
+| build | mean | relative throughput |
+|-------|-----:|--------------------:|
+| before this optimization pass | 390.6 ms ± 42.4 ms | 1.00x |
+| current | 158.8 ms ± 12.1 ms | 2.46x |
 
-| document | pages | baseline | optimized | speedup |
-|----------|------:|---------:|----------:|--------:|
-| [Attention Is All You Need](https://arxiv.org/pdf/1706.03762) | 15 | 11.48 ms | 10.96 ms | 1.05x |
-| [BERT](https://arxiv.org/pdf/1810.04805) | 16 | 4.58 ms | 4.28 ms | 1.07x |
-| [Bitcoin whitepaper](https://bitcoin.org/bitcoin.pdf) | 9 | 3.47 ms | 3.40 ms | 1.02x |
-| [IRS Form W-9](https://www.irs.gov/pub/irs-pdf/fw9.pdf) | 6 | 8.03 ms | 4.16 ms | 1.93x |
-| [NASA Systems Engineering Handbook](https://www.nasa.gov/wp-content/uploads/2018/09/nasa_systems_engineering_handbook_0.pdf) | 297 | 168.68 ms | 91.01 ms | 1.85x |
-| [NIST Cybersecurity Framework 2.0](https://nvlpubs.nist.gov/nistpubs/CSWP/NIST.CSWP.29.pdf) | 32 | 13.85 ms | 6.03 ms | 2.30x |
-| [NIST FIPS 180-4](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf) | 36 | 5.50 ms | 4.63 ms | 1.19x |
-| [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.pdf) | 194 | 26.33 ms | 23.91 ms | 1.10x |
-| [Constitution of the United States](https://www.govinfo.gov/content/pkg/CDOC-110hdoc50/pdf/CDOC-110hdoc50.pdf) | 85 | 7.67 ms | 6.63 ms | 1.16x |
-| [W3C CSS 2.1](https://www.w3.org/TR/2011/REC-CSS2-20110607/css2.pdf) | 430 | 229.52 ms | 240.94 ms | 0.95x |
-| **sum of document means** | **1,120** | **479.11 ms** | **395.96 ms** | **1.21x** |
-
-Nine documents improve, with a maximum 2.30x speedup. CSS 2.1 is about 5%
-slower and remains a useful stress case for the DEFLATE symbol decoder.
+The largest individual gain is CSS 2.1, which falls from 237.8 ms to
+22.6 ms (10.51x); the object-stream-heavy NASA handbook falls from 84.6 ms
+to 72.4 ms (1.17x). Recursive Form XObject interpretation intentionally does
+more work on papers that place diagrams or equations in Forms: those small
+documents can add roughly 1–2 ms while recovering text the old extractor never
+visited.
 
 ### Extraction validation
 
-All 10 corpus documents convert successfully. Comparing case-folded Unicode
-word tokens against independent Poppler `pdftotext` output gives 86.6–99.8%
-recall and 92.8–99.8% precision, with no Unicode replacement characters or
-unexpected control characters. These numbers measure text fidelity, not
-semantic Markdown reconstruction: multi-column reading order, tables, code
-blocks, and heading inference remain best-effort.
+All 10 corpus documents convert successfully. Comparing 431,422 case-folded
+Unicode word tokens against independent Poppler `pdftotext` output gives
+98.02% weighted recall and 97.16% weighted precision. Recall rises from
+96.79%; the small precision tradeoff from 97.31% reflects additional Form
+text. Token F1 rises from 97.05% to 97.59%, with 5,317 additional reference
+tokens recovered and no Unicode replacement characters or unexpected control
+characters. Per-document recall is 90.8–99.9% and precision is 91.1–99.8%.
+
+These numbers measure text fidelity, not semantic Markdown reconstruction:
+multi-column reading order, tables, code blocks, and heading inference remain
+best-effort.
 
 ## Testing & coverage
 
-391 tests (364 unit + 27 integration). Run them with:
+409 tests (382 unit + 27 integration). Run them with:
 
 ```sh
 cargo test --all-targets
@@ -162,26 +157,26 @@ Current breakdown:
 |-----------------------|--------|---------|-----------|
 | `cli.rs`              | 100.00%| 100.00% | 100.00%   |
 | `extract/cmap.rs`     | 100.00%| 99.49%  | 100.00%   |
-| `extract/content.rs`  | 100.00%| 99.38%  | 100.00%   |
+| `extract/content.rs`  | 99.66% | 99.45%  | 100.00%   |
 | `extract/encoding.rs` | 100.00%| 100.00% | 100.00%   |
 | `extract/font.rs`     | 100.00%| 100.00% | 100.00%   |
 | `extract/glyphs.rs`   | 100.00%| 100.00% | 100.00%   |
 | `extract/image.rs`    | 100.00%| 98.22%  | 100.00%   |
 | `extract/image/png.rs`| 100.00%| 99.65%  | 100.00%   |
-| `extract/mod.rs`      | 100.00%| 100.00% | 100.00%   |
+| `extract/mod.rs`      | 99.46% | 99.62%  | 100.00%   |
 | `extract/parser.rs`   | 100.00%| 99.85%  | 100.00%   |
 | `heuristics.rs`       | 100.00%| 100.00% | 100.00%   |
 | `lib.rs`              | 100.00%| 100.00% | 100.00%   |
 | `main.rs`             | 100.00%| 100.00% | 100.00%   |
 | `pdf/deflate.rs`      | 100.00%| 100.00% | 100.00%   |
 | `pdf/filter.rs`       | 100.00%| 99.69%  | 100.00%   |
-| `pdf/mod.rs`          | 100.00%| 99.90%  | 100.00%   |
+| `pdf/mod.rs`          | 99.74% | 99.70%  | 100.00%   |
 | `pdf/object.rs`       | 100.00%| 100.00% | 100.00%   |
-| `pdf/object_stream.rs`| 100.00%| 98.88%  | 100.00%   |
+| `pdf/object_stream.rs`| 96.61% | 96.94%  | 100.00%   |
 | `pdf/page_tree.rs`    | 100.00%| 97.83%  | 100.00%   |
-| `pdf/parser.rs`       | 100.00%| 100.00% | 100.00%   |
+| `pdf/parser.rs`       | 99.87% | 99.92%  | 100.00%   |
 | `pdf/xref.rs`         | 100.00%| 100.00% | 100.00%   |
-| **total**             | **100.00%** | **99.77%** | **100.00%** |
+| **total**             | **99.84%** | **99.68%** | **100.00%** |
 
 The badge tracks line coverage. The table also includes llvm-cov region
 coverage, which is stricter about expression-level instrumentation.
@@ -208,7 +203,7 @@ src/
 │   ├── image/
 │   │   └── png.rs    minimal PNG encoder for decoded image rasters
 │   ├── parser.rs     streaming content-stream tokenizer
-│   ├── content.rs    content-stream interpreter and text-state machine
+│   ├── content.rs    content/Form interpreter and text-state machine
 │   └── mod.rs        page walking + per-page parallelism
 ├── heuristics.rs     headings, lists, paragraph reflow
 ├── lib.rs            public API
@@ -224,6 +219,8 @@ src/
   encoding nor a `/Differences` array will silently drop glyphs.
 - The heuristic layer targets academic and prose documents. Forms,
   invoices, and other heavily-structured PDFs will not reconstruct well.
+- `--extract-images` does not yet follow image XObjects referenced only through
+  a Form XObject's local `/Resources` dictionary.
 - Encrypted PDFs and `LZWDecode` streams are not supported.
 
 ## License
