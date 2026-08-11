@@ -24,6 +24,7 @@ pub struct ExtractedImage {
 /// Map from a page's XObject-resource name (e.g. `b"Im1"`) to the filename
 /// chosen for the extracted image. Names absent from this map either point
 /// at a Form XObject or an image in a filter we don't pass through.
+#[cfg(test)]
 pub type PageImages<'a> = HashMap<Vec<u8>, &'a str>;
 
 /// Walk a page's `/Resources/XObject` dictionary and collect

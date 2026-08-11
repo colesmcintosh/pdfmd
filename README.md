@@ -55,7 +55,8 @@ pdfmd https://example.com/x.pdf     # fetched via `curl` on PATH
 Image extraction passes through JPEG (`DCTDecode`) and JPEG 2000
 (`JPXDecode`) streams verbatim, including simple ASCIIHex/ASCII85 wrapper
 chains. It also converts decoded 8-bit `DeviceGray`, `DeviceRGB`, and
-`DeviceCMYK` raster image XObjects into PNG.
+`DeviceCMYK` raster image XObjects into PNG. Resource discovery follows
+nested Form XObjects and deduplicates shared images by object ID.
 
 ## Performance
 
@@ -135,7 +136,7 @@ best-effort.
 
 ## Testing & coverage
 
-409 tests (382 unit + 27 integration). Run them with:
+413 tests (386 unit + 27 integration). Run them with:
 
 ```sh
 cargo test --all-targets
@@ -157,13 +158,13 @@ Current breakdown:
 |-----------------------|--------|---------|-----------|
 | `cli.rs`              | 100.00%| 100.00% | 100.00%   |
 | `extract/cmap.rs`     | 100.00%| 99.49%  | 100.00%   |
-| `extract/content.rs`  | 99.66% | 99.45%  | 100.00%   |
+| `extract/content.rs`  | 99.64% | 99.49%  | 100.00%   |
 | `extract/encoding.rs` | 100.00%| 100.00% | 100.00%   |
 | `extract/font.rs`     | 100.00%| 100.00% | 100.00%   |
 | `extract/glyphs.rs`   | 100.00%| 100.00% | 100.00%   |
 | `extract/image.rs`    | 100.00%| 98.22%  | 100.00%   |
 | `extract/image/png.rs`| 100.00%| 99.65%  | 100.00%   |
-| `extract/mod.rs`      | 99.46% | 99.62%  | 100.00%   |
+| `extract/mod.rs`      | 99.54% | 99.57%  | 100.00%   |
 | `extract/parser.rs`   | 100.00%| 99.85%  | 100.00%   |
 | `heuristics.rs`       | 100.00%| 100.00% | 100.00%   |
 | `lib.rs`              | 100.00%| 100.00% | 100.00%   |
@@ -219,8 +220,6 @@ src/
   encoding nor a `/Differences` array will silently drop glyphs.
 - The heuristic layer targets academic and prose documents. Forms,
   invoices, and other heavily-structured PDFs will not reconstruct well.
-- `--extract-images` does not yet follow image XObjects referenced only through
-  a Form XObject's local `/Resources` dictionary.
 - Encrypted PDFs and `LZWDecode` streams are not supported.
 
 ## License
