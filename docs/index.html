@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pdfmd — fast, zero-dependency PDF to Markdown</title>
+  <meta name="description" content="pdfmd extracts text from PDFs and converts it to Markdown. Written in Rust with zero runtime dependencies.">
+  <link rel="canonical" href="https://colesmcintosh.github.io/pdfmd/">
+  <meta property="og:title" content="pdfmd — fast, zero-dependency PDF to Markdown">
+  <meta property="og:description" content="A Rust CLI and library that owns the path from PDF bytes to Markdown. No runtime dependencies.">
+  <meta property="og:url" content="https://colesmcintosh.github.io/pdfmd/">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="page">
+    <header class="site-header">
+      <a class="wordmark" href="./"><span>pdf</span>md</a>
+      <nav aria-label="Site">
+        <a href="#install">Install</a>
+        <a href="#usage">Usage</a>
+        <a href="#performance">Performance</a>
+        <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="content">
+      <section class="hero">
+        <p class="kicker">Rust CLI &amp; library · v0.3.0 · MIT</p>
+        <h1>PDF to Markdown, from scratch, in a few milliseconds.</h1>
+        <p class="lede">
+          <code>pdfmd</code> parses the object graph, inflates streams, decodes fonts,
+          and interprets content operators itself — then recovers headings, lists,
+          and paragraphs. <code>[dependencies]</code> is empty.
+        </p>
+        <div class="stats" role="list">
+          <div role="listitem"><b>0</b><span>runtime crates</span></div>
+          <div role="listitem"><b>4.4&nbsp;ms</b><span>mean, 17-page paper</span></div>
+          <div role="listitem"><b>99.84%</b><span>line coverage</span></div>
+          <div role="listitem"><b>~700&nbsp;KB</b><span>release binary</span></div>
+        </div>
+      </section>
+
+      <section id="install">
+        <h2>Install</h2>
+        <p>Build from the repository. The release binary lands at <code>./target/release/pdfmd</code>.</p>
+<pre>cargo install --path .
+cargo build --release</pre>
+      </section>
+
+      <section id="usage">
+        <h2>Usage</h2>
+<pre>pdfmd input.pdf                     # markdown to stdout
+pdfmd input.pdf -o output.md        # write to a file
+pdfmd input.pdf --page-breaks       # insert --- between pages
+pdfmd input.pdf --extract-images figs -o out.md
+cat input.pdf | pdfmd -             # read from stdin
+pdfmd https://example.com/x.pdf     # fetched via curl on PATH</pre>
+        <p>
+          Image extraction passes through JPEG and JPEG 2000 streams, and converts
+          decoded 8-bit DeviceGray / DeviceRGB / DeviceCMYK rasters to PNG.
+        </p>
+      </section>
+
+      <section id="library">
+        <h2>Library</h2>
+        <p>The same converter is a Rust API with one error type:</p>
+<pre>use pdfmd::{convert_pdf_to_markdown, ConvertOptions};
+
+let result = convert_pdf_to_markdown(&amp;pdf_bytes, &amp;ConvertOptions::default())?;
+print!("{}", result.markdown);</pre>
+      </section>
+
+      <section id="performance">
+        <h2>Performance</h2>
+        <p>
+          End-to-end CLI on a 1.05&nbsp;MB, 17-page arXiv paper (Apple Silicon, release,
+          <code>hyperfine --warmup 5 --runs 20 -N</code>): min 3.8&nbsp;ms, mean 4.4&nbsp;ms ± 0.3&nbsp;ms,
+          about 3,900 pages/sec.
+        </p>
+        <p>
+          Pages extract in parallel via <code>std::thread::scope</code>. Fonts are parsed once
+          and cached document-wide. The content-stream tokenizer and DEFLATE decoder
+          borrow operands from the source bytes — no per-operator or per-Huffman allocation.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <caption class="kicker">Published comparison targets (local synthetic PDFs)</caption>
+            <thead>
+              <tr>
+                <th>document</th>
+                <th>other published</th>
+                <th>pdfmd</th>
+                <th>speedup</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>1 page</td><td>2.0 ms</td><td>0.012 ms</td><td>~167×</td></tr>
+              <tr><td>24 pages</td><td>41.0 ms</td><td>0.118 ms</td><td>~347×</td></tr>
+              <tr><td>60 pages</td><td>123.0 ms</td><td>0.201 ms</td><td>~612×</td></tr>
+              <tr><td>457 pages</td><td>777.0 ms</td><td>0.933 ms</td><td>~833×</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Those rows are throughput targets against other published library numbers,
+          not a claim against those exact corpora or hardware.
+        </p>
+      </section>
+
+      <section id="how">
+        <h2>How it works</h2>
+        <p>
+          Every layer lives in this crate: xref and object-stream reading, zlib/DEFLATE,
+          font and ToUnicode CMap handling, the content-stream interpreter, heuristics,
+          and the argv parser.
+        </p>
+        <div class="arch" role="img" aria-label="Source layout of the pdfmd crate">src/
+├── pdf/          xref, objects, streams, DEFLATE, page tree
+├── extract/      fonts, CMaps, content ops, images, PNG
+├── heuristics.rs headings, lists, paragraph reflow
+├── lib.rs        convert_pdf_to_markdown
+└── cli.rs        argv parser and execution</div>
+      </section>
+
+      <section id="limits">
+        <h2>Limitations</h2>
+        <ul class="limits">
+          <li>Tables, multi-column captions, and complex math are best-effort reflow.</li>
+          <li>Fonts without a ToUnicode CMap, a standard encoding, or <code>/Differences</code> drop glyphs.</li>
+          <li>Heuristics target academic and prose documents, not forms or invoices.</li>
+          <li>Encrypted PDFs and <code>LZWDecode</code> streams are unsupported by design.</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>MIT · Cole McIntosh</span>
+      <span>
+        <a href="https://github.com/colesmcintosh/pdfmd">github.com/colesmcintosh/pdfmd</a>
+      </span>
+    </footer>
+  </div>
+</body>
+</html>

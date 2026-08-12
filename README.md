@@ -5,8 +5,11 @@
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-blue)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Site](https://img.shields.io/badge/site-github.io-blue)](https://colesmcintosh.github.io/pdfmd/)
 
 A fast, **zero-dependency** PDF → Markdown converter written in Rust.
+
+Site: [colesmcintosh.github.io/pdfmd](https://colesmcintosh.github.io/pdfmd/).
 
 `pdfmd` extracts text directly from a PDF — parsing the object graph,
 inflating compressed streams, decoding fonts, and interpreting the
