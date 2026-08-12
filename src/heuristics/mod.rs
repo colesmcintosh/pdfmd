@@ -132,34 +132,45 @@ fn format_column(
     roles: &RoleMap,
     median: f32,
 ) -> String {
-    if let Some((table, bbox)) = tables::ruled_table(spans, rects) {
-        let rest: Vec<&Span> = spans
+    let x0 = spans.iter().map(|s| s.x).fold(f32::MAX, f32::min);
+    let x1 = spans.iter().map(|s| s.x + s.width).fold(f32::MIN, f32::max);
+    if rects.len() >= 3 {
+        let col_rects: Vec<_> = rects
             .iter()
             .copied()
-            .filter(|s| {
-                s.kind == SpanKind::Image
-                    || s.x + s.width < bbox[0] - 1.0
-                    || s.x > bbox[2] + 1.0
-                    || s.y + s.height < bbox[1] - 1.0
-                    || s.y > bbox[3] + 1.0
-            })
+            .filter(|r| r.x < x1 && r.x + r.w > x0)
             .collect();
-        if rest.is_empty() {
-            return table;
+        if col_rects.len() >= 3 {
+            if let Some((table, bbox)) = tables::ruled_table(spans, &col_rects) {
+                let rest: Vec<&Span> = spans
+                    .iter()
+                    .copied()
+                    .filter(|s| {
+                        s.kind == SpanKind::Image
+                            || s.x + s.width < bbox[0] - 1.0
+                            || s.x > bbox[2] + 1.0
+                            || s.y + s.height < bbox[1] - 1.0
+                            || s.y > bbox[3] + 1.0
+                    })
+                    .collect();
+                if rest.is_empty() {
+                    return table;
+                }
+                let rest_md = format_column_text(&rest, page_idx, roles, median);
+                if rest.iter().any(|s| s.y > bbox[3]) {
+                    return [rest_md, table]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                }
+                return [table, rest_md]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+            }
         }
-        let rest_md = format_column_text(&rest, page_idx, roles, median);
-        if rest.iter().any(|s| s.y > bbox[3]) {
-            return [rest_md, table]
-                .into_iter()
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-        }
-        return [table, rest_md]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
     }
     format_column_text(spans, page_idx, roles, median)
 }
@@ -190,7 +201,7 @@ fn format_column_text(spans: &[&Span], page_idx: usize, roles: &RoleMap, median:
             if dy > size * 1.5 {
                 break;
             }
-            if tables::borderless_run(&lines[i..]).is_some() {
+            if tables::is_table_prefix(&lines[i..]) {
                 break;
             }
             i += 1;
@@ -207,11 +218,10 @@ fn format_line_block(lines: &[VLine<'_>], page_idx: usize, roles: &RoleMap, medi
     if lines.is_empty() {
         return String::new();
     }
-    let texts: Vec<String> = lines.iter().map(plain_line).collect();
-    if texts.iter().all(|t| t.is_empty()) {
+    if lines.iter().all(line_is_blank) {
         return image_block(lines);
     }
-    if texts.iter().all(|t| is_list_item(t)) {
+    if lines.iter().all(|l| is_list_item(&plain_line(l))) {
         return lines
             .iter()
             .map(|l| format_list_item(&plain_line(l)))
@@ -219,17 +229,29 @@ fn format_line_block(lines: &[VLine<'_>], page_idx: usize, roles: &RoleMap, medi
             .join("\n");
     }
     if lines.len() >= 2 && lines.iter().all(is_mono_line) {
-        let body = texts.join("\n");
+        let mut body = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                body.push('\n');
+            }
+            body.push_str(&plain_line(line));
+        }
         return format!("```\n{body}\n```");
     }
     if lines.len() == 1 {
-        let line = &texts[0];
-        if let Some(level) = heading_for_line(&lines[0], line, page_idx, roles, median) {
-            return format!("{} {}", "#".repeat(level), strip_heading_prefix(line));
+        let line = plain_line(&lines[0]);
+        if let Some(level) = heading_for_line(&lines[0], &line, page_idx, roles, median) {
+            return format!("{} {}", "#".repeat(level), strip_heading_prefix(&line));
         }
         return style_line(&lines[0]);
     }
     join_paragraph(lines)
+}
+
+fn line_is_blank(line: &VLine<'_>) -> bool {
+    line.spans
+        .iter()
+        .all(|s| s.kind == SpanKind::Image || s.text.trim().is_empty())
 }
 
 fn heading_for_line(
@@ -268,7 +290,56 @@ fn heading_for_line(
             return Some(3);
         }
     }
-    heading_level(line)
+    if match_numbered_heading(line).is_some() {
+        return heading_level(line);
+    }
+    if let Some(level) = named_section(line) {
+        return Some(level);
+    }
+    // Body-size Title Case lines are ordinary prose; all-caps stays a heading.
+    if is_all_caps_heading(line) {
+        return Some(2);
+    }
+    None
+}
+
+fn named_section(line: &str) -> Option<usize> {
+    // Title-case only — all-caps names still go through `is_all_caps_heading`.
+    match line.trim() {
+        "Abstract" => Some(3),
+        "Introduction" => Some(1),
+        "References" | "Bibliography" => Some(2),
+        "Conclusion" | "Conclusions" | "Acknowledgements" | "Acknowledgments" => Some(2),
+        "Related Work" | "Related Works" => Some(2),
+        _ => None,
+    }
+}
+
+fn is_all_caps_heading(line: &str) -> bool {
+    if line.len() > 120 || line.ends_with('.') || line.ends_with(',') {
+        return false;
+    }
+    let mut n_alpha = 0usize;
+    let mut words = 0usize;
+    let mut in_word = false;
+    for c in line.chars() {
+        if c.is_alphabetic() {
+            if !c.is_uppercase() {
+                return false;
+            }
+            n_alpha += 1;
+        }
+        if c.is_whitespace() {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            words += 1;
+            if words > 12 {
+                return false;
+            }
+        }
+    }
+    n_alpha > 0
 }
 
 fn line_role(line: &VLine<'_>, page_idx: usize, roles: &RoleMap) -> Option<Role> {
@@ -318,24 +389,31 @@ fn style_line(line: &VLine<'_>) -> String {
         if s.space_before && !out.is_empty() && !out.ends_with(' ') {
             out.push(' ');
         }
-        out.push_str(&style_wrap(s));
+        push_styled(&mut out, s);
     }
     out
 }
 
-fn style_wrap(s: &Span) -> String {
+fn push_styled(out: &mut String, s: &Span) {
     let t = s.text.as_str();
     if t.trim().is_empty() {
-        return t.to_string();
+        out.push_str(t);
+        return;
     }
     if s.bold && s.italic {
-        format!("***{t}***")
+        out.push_str("***");
+        out.push_str(t);
+        out.push_str("***");
     } else if s.bold {
-        format!("**{t}**")
+        out.push_str("**");
+        out.push_str(t);
+        out.push_str("**");
     } else if s.italic {
-        format!("*{t}*")
+        out.push('*');
+        out.push_str(t);
+        out.push('*');
     } else {
-        t.to_string()
+        out.push_str(t);
     }
 }
 
@@ -363,51 +441,77 @@ fn is_mono_line(line: &VLine<'_>) -> bool {
 }
 
 fn median_size(spans: &[&Span]) -> f32 {
-    let mut sizes: Vec<f32> = spans
+    let mut items: Vec<(f32, usize)> = spans
         .iter()
         .filter(|s| s.kind == SpanKind::Text && s.font_size > 0.1)
-        .flat_map(|s| std::iter::repeat(s.font_size).take(s.text.len().max(1)))
+        .map(|s| (s.font_size, s.text.len().max(1)))
         .collect();
-    if sizes.is_empty() {
+    if items.is_empty() {
         return 12.0;
     }
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    sizes[sizes.len() / 2]
+    items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    let total: usize = items.iter().map(|(_, n)| n).sum();
+    let mut acc = 0usize;
+    for (size, n) in items {
+        acc += n;
+        if acc * 2 >= total {
+            return size;
+        }
+    }
+    12.0
 }
 
 fn column_gaps(spans: &[&Span]) -> Vec<f32> {
-    let mut xs: Vec<f32> = spans
-        .iter()
-        .filter(|s| s.kind == SpanKind::Text)
-        .map(|s| s.x)
-        .collect();
-    if xs.len() < 6 {
+    let mut min = f32::MAX;
+    let mut max = f32::MIN;
+    let mut n = 0usize;
+    for s in spans {
+        if s.kind != SpanKind::Text {
+            continue;
+        }
+        n += 1;
+        min = min.min(s.x);
+        max = max.max(s.x);
+    }
+    if n < 8 || max - min < 180.0 {
         return Vec::new();
     }
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let min = xs[0];
-    let max = xs[xs.len() - 1];
-    if max - min < 180.0 {
-        return Vec::new();
+    const B: usize = 24;
+    let mut hist = [0u32; B];
+    let width = (max - min).max(1.0);
+    for s in spans {
+        if s.kind != SpanKind::Text {
+            continue;
+        }
+        let i = (((s.x - min) / width) * B as f32) as usize;
+        hist[i.min(B - 1)] += 1;
     }
+    let total = n as u32;
+    let empty = (total / 40).max(2);
     let mut gaps = Vec::new();
-    for w in xs.windows(2) {
-        if w[1] - w[0] > 40.0 {
-            let mid = (w[0] + w[1]) * 0.5;
-            if mid - min > 40.0 && max - mid > 40.0 {
-                gaps.push(mid);
-            }
+    let mut i = 1usize;
+    while i + 1 < B {
+        if hist[i] > empty {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i + 1 < B && hist[i] <= empty {
+            i += 1;
+        }
+        let len = i - start;
+        if len < 2 {
+            continue;
+        }
+        let left: u32 = hist[..start].iter().sum();
+        let right: u32 = hist[i..].iter().sum();
+        if left * 5 >= total && right * 5 >= total {
+            let mid_bucket = start + len / 2;
+            gaps.push(min + width * (mid_bucket as f32 + 0.5) / B as f32);
         }
     }
-    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let mut out: Vec<f32> = Vec::new();
-    for g in gaps {
-        if out.last().map(|p| (g - *p).abs() > 20.0).unwrap_or(true) {
-            out.push(g);
-        }
-    }
-    out.truncate(2);
-    out
+    gaps.truncate(2);
+    gaps
 }
 
 fn running_margin(pages: &[PageLayout], header: bool) -> Vec<String> {
@@ -503,7 +607,12 @@ pub(super) fn plain_line(line: &VLine<'_>) -> String {
         }
         out.push_str(&s.text);
     }
-    out.trim().to_string()
+    let trimmed = out.trim();
+    if trimmed.len() == out.len() {
+        out
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Group consecutive non-blank lines into blocks. A run of blank lines
@@ -566,11 +675,7 @@ fn heading_level(line: &str) -> Option<usize> {
         return Some(level);
     }
 
-    let alpha: String = line.chars().filter(|c| c.is_alphabetic()).collect();
-    if !alpha.is_empty()
-        && alpha.chars().all(|c| c.is_uppercase())
-        && line.split_whitespace().count() <= 12
-    {
+    if is_all_caps_heading(line) {
         return Some(2);
     }
 
@@ -734,6 +839,18 @@ mod tests {
     }
 
     #[test]
+    fn named_section_titles_are_headings() {
+        assert_eq!(
+            format_page("Abstract\n\nBody copy goes here."),
+            "### Abstract\n\nBody copy goes here."
+        );
+        assert_eq!(
+            format_page("Introduction\n\nBody copy goes here."),
+            "# Introduction\n\nBody copy goes here."
+        );
+    }
+
+    #[test]
     fn all_caps_short_line_becomes_h2() {
         let raw = "INTRODUCTION\n\nBody copy goes here.";
         assert_eq!(format_page(raw), "## INTRODUCTION\n\nBody copy goes here.");
@@ -861,6 +978,37 @@ mod tests {
         let left_at = md[0].find('L').unwrap();
         let right_at = md[0].rfind('R').unwrap();
         assert!(left_at < right_at, "{}", md[0]);
+    }
+
+    #[test]
+    fn two_column_prose_is_not_a_table() {
+        let left = [
+            "of tokens, and show that it is possible to train",
+            "state-of-the-art models using publicly available",
+            "datasets exclusively, without resorting to closed",
+            "sources that would prevent a full release.",
+        ];
+        let right = [
+            "that the performance of a 7B model continues to",
+            "improve even after 1T tokens of extra training.",
+            "The focus of this work is to train a series of",
+            "language models that achieve strong results.",
+        ];
+        let mut spans = Vec::new();
+        for i in 0..4 {
+            spans.push(sp(left[i], 20.0, 700.0 - i as f32 * 14.0, 12.0));
+            spans.push(sp(right[i], 320.0, 700.0 - i as f32 * 14.0, 12.0));
+        }
+        let page = PageLayout {
+            text: String::new(),
+            spans,
+            rects: Vec::new(),
+        };
+        let md = format_pages(&[page], &HashMap::new());
+        assert!(!md[0].contains("| --- |"), "{}", md[0]);
+        let l = md[0].find("of tokens").expect(&md[0]);
+        let r = md[0].find("7B model").expect(&md[0]);
+        assert!(l < r, "{}", md[0]);
     }
 
     #[test]

@@ -54,6 +54,9 @@ const TJ_SPACE_THRESHOLD: f32 = 100.0;
 /// graph pre-pass. Real documents rarely nest forms more than a few levels;
 /// this cap keeps adversarial acyclic chains from exhausting the stack.
 const MAX_FORM_DEPTH: usize = 32;
+/// Figure drawings can emit tens of thousands of segments. Table detection
+/// only needs a handful of axis-aligned rules.
+const MAX_PATH_RECTS: usize = 256;
 
 /// Page-local limits keep a branching Form graph from multiplying a small
 /// resource set into unbounded work or output.
@@ -73,6 +76,11 @@ const FORM_EXECUTION_LIMITS: FormExecutionLimits = FormExecutionLimits {
     input_bytes: MAX_FORM_INPUT_BYTES_PER_PAGE,
     output_bytes: MAX_FORM_OUTPUT_BYTES_PER_PAGE,
 };
+
+struct PageExtractCfg {
+    limits: FormExecutionLimits,
+    keep_text: bool,
+}
 
 struct FormBudget {
     limits: FormExecutionLimits,
@@ -99,18 +107,20 @@ impl FormBudget {
         self.limits.output_bytes.saturating_sub(self.output_bytes)
     }
 
-    fn charge_output(&mut self, out: &mut String, added: usize) {
+    fn charge_output(&mut self, out: Option<&mut String>, added: usize) {
         let remaining = self.limits.output_bytes.saturating_sub(self.output_bytes);
         if added <= remaining {
             self.output_bytes += added;
             return;
         }
 
-        let mut new_len = out.len().saturating_sub(added - remaining);
-        while new_len > 0 && !out.is_char_boundary(new_len) {
-            new_len -= 1;
+        if let Some(out) = out {
+            let mut new_len = out.len().saturating_sub(added - remaining);
+            while new_len > 0 && !out.is_char_boundary(new_len) {
+                new_len -= 1;
+            }
+            out.truncate(new_len);
         }
-        out.truncate(new_len);
         self.output_bytes = self.limits.output_bytes;
     }
 }
@@ -262,12 +272,26 @@ struct PageBuilder {
     path_y: f32,
     mcid: Option<u32>,
     mcid_stack: Vec<Option<u32>>,
+    scratch: String,
+    keep_text: bool,
+    last_ws: bool,
+    last_alnum: bool,
+    emitted: usize,
 }
 
 impl PageBuilder {
+    #[cfg(test)]
     fn new(cap: usize) -> Self {
+        Self::create(cap, true)
+    }
+
+    fn create(cap: usize, keep_text: bool) -> Self {
         Self {
-            out: String::with_capacity(cap),
+            out: if keep_text {
+                String::with_capacity(cap)
+            } else {
+                String::new()
+            },
             layout: PageLayout::default(),
             ctm: Matrix::identity(),
             ctm_stack: Vec::new(),
@@ -275,34 +299,50 @@ impl PageBuilder {
             path_y: 0.0,
             mcid: None,
             mcid_stack: Vec::new(),
+            scratch: String::new(),
+            keep_text,
+            last_ws: true,
+            last_alnum: false,
+            emitted: 0,
         }
     }
 
     fn apply(&self, x: f32, y: f32) -> (f32, f32) {
         let m = self.ctm;
+        if m.a == 1.0 && m.b == 0.0 && m.c == 0.0 && m.d == 1.0 && m.e == 0.0 && m.f == 0.0 {
+            return (x, y);
+        }
         (m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f)
     }
 
     fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
         let (x0, y0) = self.apply(x, y);
         let (x1, y1) = self.apply(x + w, y + h);
-        self.layout.rects.push(PathRect {
-            x: x0.min(x1),
-            y: y0.min(y1),
-            w: (x1 - x0).abs(),
-            h: (y1 - y0).abs(),
-        });
+        self.record_rect(x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs());
     }
 
     fn push_segment(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
         let (ax, ay) = self.apply(x1, y1);
         let (bx, by) = self.apply(x2, y2);
-        self.layout.rects.push(PathRect {
-            x: ax.min(bx),
-            y: ay.min(by),
-            w: (bx - ax).abs().max(0.5),
-            h: (by - ay).abs().max(0.5),
-        });
+        let dx = (bx - ax).abs();
+        let dy = (by - ay).abs();
+        // Figures emit dense polylines; only axis-aligned rules feed tables.
+        if dx > 1.5 && dy > 1.5 {
+            return;
+        }
+        self.record_rect(ax.min(bx), ay.min(by), dx.max(0.5), dy.max(0.5));
+    }
+
+    fn record_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if self.layout.rects.len() >= MAX_PATH_RECTS {
+            return;
+        }
+        let rule = (h < 2.5 && w > 16.0) || (w < 2.5 && h > 16.0);
+        let cell = w > 8.0 && h > 8.0 && w < 280.0 && h < 80.0;
+        if !rule && !cell {
+            return;
+        }
+        self.layout.rects.push(PathRect { x, y, w, h });
     }
 }
 
@@ -342,7 +382,32 @@ pub(super) fn extract_page_layout_with_forms<'fonts>(
         forms,
         form_fonts,
         image_filenames,
-        FORM_EXECUTION_LIMITS,
+        PageExtractCfg {
+            limits: FORM_EXECUTION_LIMITS,
+            keep_text: true,
+        },
+    )
+}
+
+pub(super) fn extract_page_layout_fast<'fonts>(
+    content_bytes: &[u8],
+    fonts: &PageFonts<'fonts>,
+    xobjects: &HashMap<Vec<u8>, ObjectId>,
+    forms: &HashMap<ObjectId, FormXObject>,
+    form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
+    image_filenames: &ImageFilenames<'_>,
+) -> PageLayout {
+    extract_page_with_form_limits(
+        content_bytes,
+        fonts,
+        xobjects,
+        forms,
+        form_fonts,
+        image_filenames,
+        PageExtractCfg {
+            limits: FORM_EXECUTION_LIMITS,
+            keep_text: false,
+        },
     )
 }
 
@@ -363,7 +428,10 @@ fn extract_page_text_with_form_limits<'fonts>(
         forms,
         form_fonts,
         image_filenames,
-        limits,
+        PageExtractCfg {
+            limits,
+            keep_text: true,
+        },
     )
     .text
 }
@@ -375,9 +443,16 @@ fn extract_page_with_form_limits<'fonts>(
     forms: &HashMap<ObjectId, FormXObject>,
     form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
     image_filenames: &ImageFilenames<'_>,
-    limits: FormExecutionLimits,
+    cfg: PageExtractCfg,
 ) -> PageLayout {
-    let mut page = PageBuilder::new(content_bytes.len());
+    let mut page = PageBuilder::create(
+        if cfg.keep_text {
+            content_bytes.len()
+        } else {
+            0
+        },
+        cfg.keep_text,
+    );
     let resources = ContentResources { fonts, xobjects };
     let form_context = FormContext {
         forms,
@@ -385,7 +460,7 @@ fn extract_page_with_form_limits<'fonts>(
         images: image_filenames,
     };
     let mut state = TextState::default();
-    let mut form_execution = FormExecution::new(limits);
+    let mut form_execution = FormExecution::new(cfg.limits);
     extract_content_into(
         content_bytes,
         &resources,
@@ -395,9 +470,14 @@ fn extract_page_with_form_limits<'fonts>(
         &mut page,
     );
     let PageBuilder {
-        out, mut layout, ..
+        out,
+        mut layout,
+        keep_text,
+        ..
     } = page;
-    layout.text = out;
+    if keep_text {
+        layout.text = out;
+    }
     layout
 }
 
@@ -446,7 +526,11 @@ fn extract_content_into<'fonts>(
                     page.mcid = page.mcid_stack.pop().flatten();
                 }
                 let charge_output = !form_execution.active.is_empty();
-                let output_start = page.out.len();
+                let output_start = if page.keep_text {
+                    page.out.len()
+                } else {
+                    page.emitted
+                };
                 let charged_start = form_execution.budget.output_bytes;
                 dispatch(
                     op,
@@ -458,14 +542,23 @@ fn extract_content_into<'fonts>(
                     page,
                 );
                 if charge_output {
-                    let added = page.out.len().saturating_sub(output_start);
+                    let added = if page.keep_text {
+                        page.out.len().saturating_sub(output_start)
+                    } else {
+                        page.emitted.saturating_sub(output_start)
+                    };
                     let nested_charge = form_execution
                         .budget
                         .output_bytes
                         .saturating_sub(charged_start);
-                    form_execution
-                        .budget
-                        .charge_output(&mut page.out, added.saturating_sub(nested_charge));
+                    let extra = added.saturating_sub(nested_charge);
+                    if page.keep_text {
+                        form_execution
+                            .budget
+                            .charge_output(Some(&mut page.out), extra);
+                    } else {
+                        form_execution.budget.charge_output(None, extra);
+                    }
                 }
                 if op == b"BI" {
                     skip_inline_image(&mut parser);
@@ -510,6 +603,9 @@ struct TextState<'a> {
     /// consecutive lines on this page. Used to tell a normal line wrap
     /// (≈ this value) from a paragraph break (significantly more).
     typical_line_height: Option<f32>,
+    /// Cached `|line_matrix|` so `Tj`/`TJ` skip `hypot` per show.
+    hx: f32,
+    vx: f32,
 }
 
 impl TextState<'_> {
@@ -521,8 +617,33 @@ impl TextState<'_> {
             bold: caller.bold,
             italic: caller.italic,
             mono: caller.mono,
+            hx: caller.hx,
+            vx: caller.vx,
             ..Self::default()
         }
+    }
+
+    fn hscale(&self) -> f32 {
+        if self.hx > 0.0 {
+            self.hx
+        } else {
+            1.0
+        }
+    }
+
+    fn vscale(&self) -> f32 {
+        if self.vx > 0.0 {
+            self.vx
+        } else {
+            1.0
+        }
+    }
+
+    fn set_line_matrix(&mut self, m: Matrix) {
+        self.hx = m.a.hypot(m.b);
+        self.vx = m.c.hypot(m.d);
+        self.text_matrix = Some(m);
+        self.line_matrix = Some(m);
     }
 }
 
@@ -538,8 +659,7 @@ fn dispatch<'fonts>(
     match op {
         b"BT" => {
             state.in_text_object = true;
-            state.text_matrix = Some(Matrix::identity());
-            state.line_matrix = Some(Matrix::identity());
+            state.set_line_matrix(Matrix::identity());
         }
         b"ET" => {
             state.in_text_object = false;
@@ -577,15 +697,8 @@ fn dispatch<'fonts>(
                     .line_matrix
                     .map(|previous| text_direction_changed(previous, m))
                     .unwrap_or(false);
-                state.text_matrix = Some(m);
-                state.line_matrix = Some(m);
-                position_changed(
-                    state,
-                    m.e,
-                    m.f,
-                    form_execution.output_floor(),
-                    &mut page.out,
-                );
+                state.set_line_matrix(m);
+                position_changed(state, m.e, m.f, form_execution.output_floor(), page);
                 if direction_changed {
                     state.pending_space = true;
                 }
@@ -597,32 +710,18 @@ fn dispatch<'fonts>(
                 if op == b"TD" {
                     state.leading = -ty;
                 }
-                if let Some(line) = state.line_matrix.as_mut() {
+                if let Some(mut line) = state.line_matrix {
                     line.translate(tx, ty);
-                    let new_line = *line;
-                    state.text_matrix = Some(new_line);
-                    position_changed(
-                        state,
-                        new_line.e,
-                        new_line.f,
-                        form_execution.output_floor(),
-                        &mut page.out,
-                    );
+                    state.set_line_matrix(line);
+                    position_changed(state, line.e, line.f, form_execution.output_floor(), page);
                 }
             }
         }
         b"T*" => {
-            if let Some(line) = state.line_matrix.as_mut() {
+            if let Some(mut line) = state.line_matrix {
                 line.translate(0.0, -state.leading);
-                let new_line = *line;
-                state.text_matrix = Some(new_line);
-                position_changed(
-                    state,
-                    new_line.e,
-                    new_line.f,
-                    form_execution.output_floor(),
-                    &mut page.out,
-                );
+                state.set_line_matrix(line);
+                position_changed(state, line.e, line.f, form_execution.output_floor(), page);
             }
         }
         b"Tj" => {
@@ -631,34 +730,20 @@ fn dispatch<'fonts>(
             }
         }
         b"'" => {
-            if let Some(line) = state.line_matrix.as_mut() {
+            if let Some(mut line) = state.line_matrix {
                 line.translate(0.0, -state.leading);
-                let new_line = *line;
-                state.text_matrix = Some(new_line);
-                position_changed(
-                    state,
-                    new_line.e,
-                    new_line.f,
-                    form_execution.output_floor(),
-                    &mut page.out,
-                );
+                state.set_line_matrix(line);
+                position_changed(state, line.e, line.f, form_execution.output_floor(), page);
             }
             if let Some(s) = ops.string.as_deref() {
                 emit(state, s, page);
             }
         }
         b"\"" => {
-            if let Some(line) = state.line_matrix.as_mut() {
+            if let Some(mut line) = state.line_matrix {
                 line.translate(0.0, -state.leading);
-                let new_line = *line;
-                state.text_matrix = Some(new_line);
-                position_changed(
-                    state,
-                    new_line.e,
-                    new_line.f,
-                    form_execution.output_floor(),
-                    &mut page.out,
-                );
+                state.set_line_matrix(line);
+                position_changed(state, line.e, line.f, form_execution.output_floor(), page);
             }
             if let Some(s) = ops.string.as_deref() {
                 emit(state, s, page);
@@ -675,26 +760,53 @@ fn dispatch<'fonts>(
                         return;
                     }
                     let start = page.out.len();
+                    let span_start = page.layout.spans.len();
+                    let prev_alnum = page.last_alnum;
+                    let prev_ws = page.last_ws;
                     if emit_form(id, state, resources, form_context, form_execution, page) {
-                        let previous = page.out[..start].chars().next_back();
-                        let first = page.out[start..].chars().next();
-                        let adjacent_words = previous
-                            .zip(first)
-                            .map(|(left, right)| left.is_alphanumeric() && right.is_alphanumeric())
-                            .unwrap_or(false);
-                        let boundary_is_tight =
-                            previous.map(|ch| !ch.is_whitespace()).unwrap_or(false)
-                                && first.map(|ch| !ch.is_whitespace()).unwrap_or(false);
-                        if boundary_is_tight && (state.pending_space || adjacent_words) {
-                            page.out.insert(start, ' ');
+                        if page.keep_text {
+                            let previous = page.out[..start].chars().next_back();
+                            let first = page.out[start..].chars().next();
+                            let adjacent_words = previous
+                                .zip(first)
+                                .map(|(left, right)| {
+                                    left.is_alphanumeric() && right.is_alphanumeric()
+                                })
+                                .unwrap_or(false);
+                            let boundary_is_tight =
+                                previous.map(|ch| !ch.is_whitespace()).unwrap_or(false)
+                                    && first.map(|ch| !ch.is_whitespace()).unwrap_or(false);
+                            if boundary_is_tight && (state.pending_space || adjacent_words) {
+                                page.out.insert(start, ' ');
+                            }
+                            state.pending_form_word_boundary = page
+                                .out
+                                .chars()
+                                .next_back()
+                                .map(|ch| ch.is_alphanumeric())
+                                .unwrap_or(false);
+                        } else if let Some(first) = page.layout.spans.get_mut(span_start) {
+                            let first_ws = first
+                                .text
+                                .chars()
+                                .next()
+                                .map(|ch| ch.is_whitespace())
+                                .unwrap_or(true);
+                            let first_alnum = first
+                                .text
+                                .chars()
+                                .next()
+                                .map(|ch| ch.is_alphanumeric())
+                                .unwrap_or(false);
+                            if !prev_ws
+                                && !first_ws
+                                && (state.pending_space || (prev_alnum && first_alnum))
+                            {
+                                first.space_before = true;
+                            }
+                            state.pending_form_word_boundary = page.last_alnum;
                         }
                         state.pending_space = false;
-                        state.pending_form_word_boundary = page
-                            .out
-                            .chars()
-                            .next_back()
-                            .map(|ch| ch.is_alphanumeric())
-                            .unwrap_or(false);
                     }
                 }
             }
@@ -765,20 +877,18 @@ fn emit_image_marker(
     form_execution: &FormExecution,
     page: &mut PageBuilder,
 ) -> bool {
-    {
+    let marker_len = IMAGE_MARK.len_utf8() * 2 + filename.len() + 2;
+    if page.keep_text {
         let out = &mut page.out;
         let output_floor = form_execution.output_floor().min(out.len());
         if !form_execution.active.is_empty() {
             let (removable_breaks, missing_breaks) =
                 trailing_break_adjustment(out, 2, output_floor);
-            let marker_len = IMAGE_MARK.len_utf8() * 2;
             let Some(final_len) = out
                 .len()
                 .checked_sub(removable_breaks)
                 .and_then(|len| len.checked_add(missing_breaks))
                 .and_then(|len| len.checked_add(marker_len))
-                .and_then(|len| len.checked_add(filename.len()))
-                .and_then(|len| len.checked_add(2))
             else {
                 return false;
             };
@@ -793,7 +903,14 @@ fn emit_image_marker(
         out.push_str(filename);
         out.push(IMAGE_MARK);
         out.push_str("\n\n");
+    } else if !form_execution.active.is_empty()
+        && marker_len > form_execution.budget.output_remaining()
+    {
+        return false;
     }
+    page.emitted += marker_len;
+    page.last_ws = true;
+    page.last_alnum = false;
     let (x, y) = page.apply(0.0, 0.0);
     page.layout.spans.push(Span {
         text: filename.to_string(),
@@ -841,6 +958,7 @@ fn emit_form<'fonts>(
     }
 
     let start = page.out.len();
+    let emitted_start = page.emitted;
     form_execution.budget.invocations += 1;
     form_execution.budget.input_bytes += form.content.len();
     let mut state = TextState::inherited_for_form(caller_state);
@@ -870,31 +988,42 @@ fn emit_form<'fonts>(
         );
     }
     form_execution.active.pop();
-    page.out
-        .get(start..)
-        .map(|text| text.chars().any(|ch| !ch.is_whitespace()))
-        .unwrap_or(false)
+    if page.keep_text {
+        page.out
+            .get(start..)
+            .map(|text| text.chars().any(|ch| !ch.is_whitespace()))
+            .unwrap_or(false)
+    } else {
+        page.emitted > emitted_start
+    }
 }
 
 fn emit(state: &mut TextState<'_>, bytes: &[u8], page: &mut PageBuilder) {
     let Some(font) = state.font else { return };
 
-    let mut decoded = String::new();
-    font.decode_into(bytes, &mut decoded);
-    if decoded.is_empty() {
+    page.scratch.clear();
+    font.decode_into(bytes, &mut page.scratch);
+    if page.scratch.is_empty() {
         return;
     }
 
-    let added_space =
-        state.pending_space && !ends_with_ascii_whitespace(&page.out) && !page.out.is_empty();
+    let added_space = if page.keep_text {
+        state.pending_space && !ends_with_ascii_whitespace(&page.out) && !page.out.is_empty()
+    } else {
+        state.pending_space && !page.last_ws && page.emitted > 0
+    };
     let form_space = if !added_space && state.pending_form_word_boundary {
-        let previous_is_word = page
-            .out
-            .chars()
-            .next_back()
-            .map(|ch| ch.is_alphanumeric())
-            .unwrap_or(false);
-        let first_is_word = decoded
+        let previous_is_word = if page.keep_text {
+            page.out
+                .chars()
+                .next_back()
+                .map(|ch| ch.is_alphanumeric())
+                .unwrap_or(false)
+        } else {
+            page.last_alnum
+        };
+        let first_is_word = page
+            .scratch
             .chars()
             .next()
             .map(|ch| ch.is_alphanumeric())
@@ -906,35 +1035,81 @@ fn emit(state: &mut TextState<'_>, bytes: &[u8], page: &mut PageBuilder) {
     state.pending_space = false;
     state.pending_form_word_boundary = false;
 
-    if added_space || form_space {
-        page.out.push(' ');
+    if page.keep_text {
+        if added_space || form_space {
+            page.out.push(' ');
+        }
+        page.out.push_str(&page.scratch);
     }
-    page.out.push_str(&decoded);
+    page.emitted += page.scratch.len() + usize::from(added_space || form_space);
+    page.last_ws = ends_with_ascii_whitespace(&page.scratch);
+    page.last_alnum = page
+        .scratch
+        .chars()
+        .next_back()
+        .map(|ch| ch.is_alphanumeric())
+        .unwrap_or(false);
 
-    let (hx, vx) = state
-        .line_matrix
-        .map(|m| (m.a.hypot(m.b), m.c.hypot(m.d)))
-        .unwrap_or((1.0, 1.0));
+    let hx = state.hscale();
+    let vx = state.vscale();
     let font_size = (state.font_size.abs() * vx).max(0.1);
     let raw_x = state.last_x.unwrap_or(0.0);
     let raw_y = state.last_y.unwrap_or(0.0);
     let (x, y) = page.apply(raw_x, raw_y);
-    let width = decoded.len() as f32 * font_size * 0.5 * hx.max(0.1);
-    let mcid = page.mcid;
+    let extra_w = page.scratch.len() as f32 * font_size * 0.5 * hx.max(0.1);
+    let space = added_space || form_space;
+    if merge_span(page, x, y, font_size, extra_w, space, state) {
+        return;
+    }
     page.layout.spans.push(Span {
-        text: decoded,
+        text: std::mem::take(&mut page.scratch),
         x,
         y,
-        width,
+        width: extra_w,
         height: font_size,
         font_size,
         bold: state.bold,
         italic: state.italic,
         mono: state.mono,
         kind: SpanKind::Text,
-        mcid,
-        space_before: added_space || form_space,
+        mcid: page.mcid,
+        space_before: space,
     });
+}
+
+fn merge_span(
+    page: &mut PageBuilder,
+    x: f32,
+    y: f32,
+    font_size: f32,
+    extra_w: f32,
+    space: bool,
+    state: &TextState<'_>,
+) -> bool {
+    let mcid = page.mcid;
+    let Some(last) = page.layout.spans.last_mut() else {
+        return false;
+    };
+    if last.kind != SpanKind::Text
+        || last.bold != state.bold
+        || last.italic != state.italic
+        || last.mono != state.mono
+        || last.mcid != mcid
+        || (last.y - y).abs() > font_size * 0.35
+    {
+        return false;
+    }
+    // Same paint origin (TJ pieces) or a tight continuation on this line.
+    let close = (x - last.x).abs() < 1.0 || x <= last.x + last.width + font_size * 0.35;
+    if !close {
+        return false;
+    }
+    if space && !last.text.ends_with(' ') {
+        last.text.push(' ');
+    }
+    last.text.push_str(&page.scratch);
+    last.width = (x + extra_w - last.x).max(last.width + extra_w);
+    true
 }
 
 fn ends_with_ascii_whitespace(out: &str) -> bool {
@@ -951,7 +1126,7 @@ fn position_changed(
     new_x: f32,
     new_y: f32,
     output_floor: usize,
-    out: &mut String,
+    page: &mut PageBuilder,
 ) {
     if !state.in_text_object {
         state.last_x = Some(new_x);
@@ -963,10 +1138,8 @@ fn position_changed(
     // Some producers set `Tf` to 1 and put the visible point size in `Tm`.
     // Measure the transformed text basis so those normal advances are not
     // mistaken for paragraph-sized jumps or word breaks.
-    let (horizontal_scale, vertical_scale) = state
-        .line_matrix
-        .map(|m| (m.a.hypot(m.b), m.c.hypot(m.d)))
-        .unwrap_or((1.0, 1.0));
+    let horizontal_scale = state.hscale();
+    let vertical_scale = state.vscale();
     let font_size = state.font_size.abs();
     let effective_font_size = (font_size * vertical_scale).max(1.0);
     let line_threshold = effective_font_size * 0.4;
@@ -978,8 +1151,15 @@ fn position_changed(
             Some(typical) => dy > typical * 1.5,
             None => dy > effective_font_size * 2.0,
         };
-        if !out.is_empty() {
-            ensure_trailing_breaks(out, if is_paragraph { 2 } else { 1 }, output_floor);
+        if page.keep_text && !page.out.is_empty() {
+            ensure_trailing_breaks(
+                &mut page.out,
+                if is_paragraph { 2 } else { 1 },
+                output_floor,
+            );
+        }
+        if is_paragraph {
+            page.last_ws = true;
         }
         state.pending_space = false;
         state.pending_form_word_boundary = false;
@@ -1732,7 +1912,7 @@ ET
         let font = PdfFont::default();
         let fonts = font_map(&font);
         let layout = extract_page_layout_with_forms(
-            b"q 2 0 0 2 0 0 cm 1 2 m 4 6 l Q 0 0 1 1 re /Span BMC BT /F1 12 Tf (X) Tj ET EMC",
+            b"q 2 0 0 2 0 0 cm 0 0 m 40 0 l Q 10 20 30 40 re /Span BMC BT /F1 12 Tf (X) Tj ET EMC",
             &fonts,
             &HashMap::new(),
             &HashMap::new(),
@@ -1742,8 +1922,8 @@ ET
         assert!(layout.rects.len() >= 2);
         assert_eq!(layout.spans[0].text, "X");
         assert_eq!(layout.spans[0].mcid, None);
-        // `cm` scaled the `l` segment; `Q` restored identity for `re`.
-        assert!(layout.rects.iter().any(|r| (r.w - 1.0).abs() < 0.1));
+        // `Q` restores identity so the unscaled `re` is recorded as 30×40.
+        assert!(layout.rects.iter().any(|r| (r.w - 30.0).abs() < 0.1));
     }
 
     #[test]

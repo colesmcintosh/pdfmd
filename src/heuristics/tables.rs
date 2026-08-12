@@ -10,8 +10,8 @@ pub(super) fn ruled_table(spans: &[&Span], rects: &[PathRect]) -> Option<(String
     let mut xs = Vec::new();
     let mut ys = Vec::new();
     for r in rects {
-        let line_like = r.w < 2.5 && r.h > 8.0 || r.h < 2.5 && r.w > 8.0;
-        let cell_like = r.w > 8.0 && r.h > 8.0;
+        let line_like = (r.w < 2.5 && r.h > 8.0) || (r.h < 2.5 && r.w > 8.0);
+        let cell_like = r.w > 8.0 && r.h > 8.0 && r.w < 280.0 && r.h < 80.0;
         if line_like || cell_like {
             xs.push(r.x);
             xs.push(r.x + r.w);
@@ -26,6 +26,9 @@ pub(super) fn ruled_table(spans: &[&Span], rects: &[PathRect]) -> Option<(String
     }
     let cols = xs.len() - 1;
     let rows = ys.len() - 1;
+    if cols > 12 || rows > 48 {
+        return None;
+    }
     let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows];
     let mut filled = 0usize;
     for span in spans.iter().filter(|s| s.kind == SpanKind::Text) {
@@ -66,34 +69,76 @@ pub(super) fn borderless_run(lines: &[VLine<'_>]) -> Option<(usize, String)> {
     if lines.len() < 2 {
         return None;
     }
-    let parsed: Vec<Vec<(f32, String)>> = lines.iter().map(split_cells).collect();
-    let n = parsed[0].len();
-    if n < 2 {
+    let first = split_cells(&lines[0]);
+    if !is_table_row(&first) {
         return None;
     }
-    let mut end = 0;
-    for (i, row) in parsed.iter().enumerate() {
-        if row.len() != n {
+    let n = first.len();
+    let mut rows = vec![first];
+    for line in &lines[1..] {
+        let row = split_cells(line);
+        if row.len() != n || !is_table_row(&row) {
             break;
         }
         let aligned = row
             .iter()
-            .zip(parsed[0].iter())
+            .zip(rows[0].iter())
             .all(|(a, b)| (a.0 - b.0).abs() < 18.0);
         if !aligned {
             break;
         }
-        end = i + 1;
+        rows.push(row);
+        if rows.len() >= 48 {
+            break;
+        }
     }
-    if end < 2 {
+    if rows.len() < 2 {
         return None;
     }
-    let grid: Vec<Vec<String>> = parsed[..end]
-        .iter()
-        .map(|row| row.iter().map(|(_, t)| t.clone()).collect())
+    let grid: Vec<Vec<String>> = rows
+        .into_iter()
+        .map(|row| row.into_iter().map(|(_, t)| t).collect())
         .collect();
     let md = render_gfm(&grid)?;
-    Some((end, md))
+    Some((grid.len(), md))
+}
+
+pub(super) fn is_table_prefix(lines: &[VLine<'_>]) -> bool {
+    if lines.len() < 2 {
+        return false;
+    }
+    let a = split_cells(&lines[0]);
+    if !is_table_row(&a) {
+        return false;
+    }
+    let b = split_cells(&lines[1]);
+    b.len() == a.len()
+        && is_table_row(&b)
+        && a.iter()
+            .zip(b.iter())
+            .all(|(l, r)| (l.0 - r.0).abs() < 18.0)
+}
+
+fn is_table_row(row: &[(f32, String)]) -> bool {
+    if row.len() < 2 {
+        return false;
+    }
+    if !row.iter().all(|(_, t)| short_cell(t)) {
+        return false;
+    }
+    if row.len() == 2 {
+        let gap = row[1].0 - row[0].0;
+        // A page-level column gutter with long-ish cells is prose, not a table.
+        if gap > 90.0 && row.iter().any(|(_, t)| t.len() > 20) {
+            return false;
+        }
+    }
+    true
+}
+
+fn short_cell(t: &str) -> bool {
+    let t = t.trim();
+    t.len() <= 48 && t.split_whitespace().count() <= 8
 }
 
 fn split_cells(line: &VLine<'_>) -> Vec<(f32, String)> {

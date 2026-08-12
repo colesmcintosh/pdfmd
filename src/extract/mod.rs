@@ -72,6 +72,14 @@ pub(crate) fn extract_document(
     pdf_bytes: &[u8],
     extract_images: bool,
 ) -> Result<(Vec<PageLayout>, Vec<ExtractedImage>, RoleMap), PdfError> {
+    extract_document_inner(pdf_bytes, extract_images, false)
+}
+
+fn extract_document_inner(
+    pdf_bytes: &[u8],
+    extract_images: bool,
+    keep_text: bool,
+) -> Result<(Vec<PageLayout>, Vec<ExtractedImage>, RoleMap), PdfError> {
     let doc = Document::load(pdf_bytes)?;
     let pages: Vec<ObjectId> = doc.pages().to_vec();
 
@@ -171,6 +179,7 @@ pub(crate) fn extract_document(
                 xobject_refs,
                 &font_cache,
                 &prepared_forms,
+                keep_text,
             )
         });
     let roles = structure::role_map(&doc);
@@ -185,7 +194,7 @@ pub fn extract_text(
     pdf_bytes: &[u8],
     extract_images: bool,
 ) -> Result<(Vec<String>, Vec<ExtractedImage>), PdfError> {
-    let (pages, images, _) = extract_document(pdf_bytes, extract_images)?;
+    let (pages, images, _) = extract_document_inner(pdf_bytes, extract_images, true)?;
     Ok((pages.into_iter().map(|p| p.text).collect(), images))
 }
 
@@ -366,6 +375,7 @@ fn extract_one_page(
     xobject_refs: &HashMap<Vec<u8>, ObjectId>,
     font_cache: &HashMap<ObjectId, PdfFont>,
     forms: &PreparedForms<'_, '_>,
+    keep_text: bool,
 ) -> PageLayout {
     let fonts: PageFonts<'_> = font_refs
         .iter()
@@ -374,14 +384,25 @@ fn extract_one_page(
     let Some(content_bytes) = doc.get_page_content(page_id) else {
         return PageLayout::default();
     };
-    content::extract_page_layout_with_forms(
-        &content_bytes,
-        &fonts,
-        xobject_refs,
-        forms.xobjects,
-        forms.fonts,
-        forms.images,
-    )
+    if keep_text {
+        content::extract_page_layout_with_forms(
+            &content_bytes,
+            &fonts,
+            xobject_refs,
+            forms.xobjects,
+            forms.fonts,
+            forms.images,
+        )
+    } else {
+        content::extract_page_layout_fast(
+            &content_bytes,
+            &fonts,
+            xobject_refs,
+            forms.xobjects,
+            forms.fonts,
+            forms.images,
+        )
+    }
 }
 
 /// Walk up the page tree until we find a `/Resources` dictionary.
@@ -895,11 +916,17 @@ endobj
             fonts: &form_fonts,
             images: &image_names,
         };
-        assert!(
-            extract_one_page(&doc, page, &font_refs, &xobject_refs, &font_cache, &forms)
-                .text
-                .is_empty()
-        );
+        assert!(extract_one_page(
+            &doc,
+            page,
+            &font_refs,
+            &xobject_refs,
+            &font_cache,
+            &forms,
+            true
+        )
+        .text
+        .is_empty());
     }
 
     #[test]
@@ -930,7 +957,15 @@ endobj
             fonts: &form_fonts,
             images: &image_names,
         };
-        let out = extract_one_page(&doc, page, &font_refs, &xobject_refs, &font_cache, &forms);
+        let out = extract_one_page(
+            &doc,
+            page,
+            &font_refs,
+            &xobject_refs,
+            &font_cache,
+            &forms,
+            true,
+        );
         // The `Do` operator emits the rewritten filename through the
         // marker; checking for the substring is enough.
         assert!(out.text.contains("figs/x.jpg"));
