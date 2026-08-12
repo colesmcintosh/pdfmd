@@ -753,10 +753,14 @@ fn position_changed(
     let prev_y = state.last_y.unwrap_or(new_y);
     let dy = (new_y - prev_y).abs();
     // Some producers set `Tf` to 1 and put the visible point size in `Tm`.
-    // Measure the transformed vertical text basis so those normal line
-    // advances are not mistaken for paragraph-sized jumps.
-    let vertical_scale = state.line_matrix.map(|m| m.c.hypot(m.d)).unwrap_or(1.0);
-    let effective_font_size = (state.font_size.abs() * vertical_scale).max(1.0);
+    // Measure the transformed text basis so those normal advances are not
+    // mistaken for paragraph-sized jumps or word breaks.
+    let (horizontal_scale, vertical_scale) = state
+        .line_matrix
+        .map(|m| (m.a.hypot(m.b), m.c.hypot(m.d)))
+        .unwrap_or((1.0, 1.0));
+    let font_size = state.font_size.abs();
+    let effective_font_size = (font_size * vertical_scale).max(1.0);
     let line_threshold = effective_font_size * 0.4;
     if dy > line_threshold {
         // Paragraph break: either we've established a typical line height
@@ -784,7 +788,7 @@ fn position_changed(
         let dx = new_x - prev_x;
         // A forward horizontal jump of more than ~20% of an em is too wide
         // to be intra-glyph kerning; treat it as a deferred word break.
-        if dx > state.font_size.max(1.0) * 0.2 {
+        if dx > (font_size * horizontal_scale).max(1.0) * 0.2 {
             state.pending_space = true;
         }
     }
@@ -1317,6 +1321,39 @@ ET
 ";
         let out = extract_page_text(stream, &fonts, &images);
         assert_eq!(out, "top\nbottom");
+    }
+
+    #[test]
+    fn word_gap_uses_font_size_scaled_by_text_matrix() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        // Same Tf=1 / Tm-scale-12 setup as the line-break test. A 0.1-em
+        // Td is kerning; a 0.3-em Td is a word break. Raw `Tf` would treat
+        // both as spaces because 0.1*12 already exceeds 0.2.
+        let kerning = b"\
+BT
+/F1 1 Tf
+12 0 0 12 0 100 Tm
+(Hello) Tj
+0.1 0 Td
+(World) Tj
+ET
+";
+        assert_eq!(extract_page_text(kerning, &fonts, &images), "HelloWorld");
+        let word_break = b"\
+BT
+/F1 1 Tf
+12 0 0 12 0 100 Tm
+(Hello) Tj
+0.3 0 Td
+(World) Tj
+ET
+";
+        assert_eq!(
+            extract_page_text(word_break, &fonts, &images),
+            "Hello World"
+        );
     }
 
     #[test]
