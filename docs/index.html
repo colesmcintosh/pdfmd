@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdfmd — zero-dependency PDF → Markdown in Rust</title>
+<meta name="description" content="A fast, zero-dependency PDF to Markdown converter written in Rust. The PDF reader, DEFLATE decoder, font handling, and content-stream interpreter are all implemented in one crate.">
+<meta name="color-scheme" content="dark light">
+<link rel="canonical" href="https://colesmcintosh.github.io/pdfmd/">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="pdfmd — zero-dependency PDF → Markdown in Rust">
+<meta property="og:description" content="Parses the object graph, inflates the streams, decodes the fonts, and interprets the content stream itself. Empty [dependencies]. ~4 ms for a 17-page paper.">
+<meta property="og:url" content="https://colesmcintosh.github.io/pdfmd/">
+<meta name="twitter:card" content="summary">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e7501f'/%3E%3Ctext x='16' y='23' font-family='ui-monospace,monospace' font-size='19' font-weight='700' text-anchor='middle' fill='%23fff'%3E%23%3C/text%3E%3C/svg%3E">
+
+<style>
+:root {
+  --bg:         #0d0f12;
+  --bg-raised:  #14171c;
+  --bg-inset:   #0a0c0f;
+  --line:       #262b33;
+  --line-soft:  #1c2027;
+  --fg:         #e8ecf2;
+  --fg-muted:   #98a2b3;
+  --fg-faint:   #6b7484;
+  --accent:     #ff6b35;
+  --accent-dim: #e7501f;
+  --accent-bg:  rgba(255,107,53,.10);
+  --green:      #3fbf7f;
+  --blue:       #62a8ff;
+  --purple:     #b48ef0;
+  --radius:     12px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --maxw: 1080px;
+}
+/* Light palette. Applied when the OS asks for it and the reader has not
+   explicitly picked dark, and again when the toggle picks light outright —
+   an explicit choice has to beat the media query in both directions. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg:         #ffffff;
+    --bg-raised:  #f7f8fa;
+    --bg-inset:   #f2f3f6;
+    --line:       #e2e5ea;
+    --line-soft:  #eceef2;
+    --fg:         #14171c;
+    --fg-muted:   #55606f;
+    --fg-faint:   #838d9c;
+    --accent:     #d1440f;
+    --accent-dim: #b8390a;
+    --accent-bg:  rgba(209,68,15,.07);
+    --green:      #16794a;
+    --blue:       #1f5fbf;
+    --purple:     #7b46c9;
+  }
+}
+:root[data-theme="light"] {
+  --bg:         #ffffff;
+  --bg-raised:  #f7f8fa;
+  --bg-inset:   #f2f3f6;
+  --line:       #e2e5ea;
+  --line-soft:  #eceef2;
+  --fg:         #14171c;
+  --fg-muted:   #55606f;
+  --fg-faint:   #838d9c;
+  --accent:     #d1440f;
+  --accent-dim: #b8390a;
+  --accent-bg:  rgba(209,68,15,.07);
+  --green:      #16794a;
+  --blue:       #1f5fbf;
+  --purple:     #7b46c9;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+a { color: inherit; }
+code, pre, kbd { font-family: var(--mono); }
+h1, h2, h3 { line-height: 1.2; letter-spacing: -0.02em; margin: 0; }
+
+.wrap { width: 100%; max-width: var(--maxw); margin: 0 auto; padding: 0 1.5rem; }
+
+/* ---------- nav ---------- */
+.nav {
+  position: sticky; top: 0; z-index: 50;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(160%) blur(12px);
+  -webkit-backdrop-filter: saturate(160%) blur(12px);
+}
+.nav-in { display: flex; align-items: center; gap: 1.5rem; height: 60px; }
+.brand {
+  font-family: var(--mono); font-weight: 700; font-size: 1.02rem;
+  text-decoration: none; letter-spacing: -0.02em; display: flex; align-items: center; gap: .5rem;
+}
+.brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+.nav-links { display: flex; gap: 1.4rem; margin-left: auto; align-items: center; }
+.nav-links a {
+  color: var(--fg-muted); text-decoration: none; font-size: .9rem;
+  transition: color .15s ease;
+}
+.nav-links a:hover { color: var(--fg); }
+.icon-btn {
+  display: inline-grid; place-items: center; width: 34px; height: 34px;
+  border: 1px solid var(--line); border-radius: 9px; background: transparent;
+  color: var(--fg-muted); cursor: pointer; padding: 0; transition: all .15s ease;
+}
+.icon-btn:hover { color: var(--fg); border-color: var(--fg-faint); }
+.icon-btn svg { width: 17px; height: 17px; }
+@media (max-width: 720px) { .nav-links .hide-sm { display: none; } }
+
+/* ---------- hero ---------- */
+.hero { position: relative; padding: 5.5rem 0 4rem; overflow: hidden; }
+.hero::before {
+  content: ""; position: absolute; inset: -30% 0 auto 50%;
+  width: 900px; height: 700px; transform: translateX(-50%);
+  background: radial-gradient(ellipse at center, var(--accent-bg), transparent 62%);
+  pointer-events: none;
+}
+.hero::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image:
+    linear-gradient(var(--line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 10%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 10%, transparent 70%);
+  opacity: .6;
+}
+.hero .wrap { position: relative; z-index: 1; }
+.eyebrow {
+  display: inline-flex; align-items: center; gap: .55rem;
+  font-family: var(--mono); font-size: .78rem; letter-spacing: .04em;
+  color: var(--accent); background: var(--accent-bg);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  padding: .3rem .7rem; border-radius: 100px; text-decoration: none;
+}
+h1 {
+  font-size: clamp(2.6rem, 7vw, 4.2rem);
+  font-weight: 800; margin: 1.4rem 0 0;
+  font-family: var(--mono); letter-spacing: -0.045em;
+}
+h1 .arrow { color: var(--accent); }
+.tagline {
+  font-size: clamp(1.05rem, 2.4vw, 1.28rem);
+  color: var(--fg-muted); max-width: 41rem; margin: 1.1rem 0 0;
+}
+.tagline strong { color: var(--fg); font-weight: 600; }
+
+.cta { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 2rem; align-items: center; }
+.copybox {
+  display: flex; align-items: center; gap: .75rem; max-width: 100%;
+  background: var(--bg-inset); border: 1px solid var(--line);
+  border-radius: 10px; padding: .62rem .62rem .62rem .95rem;
+  font-family: var(--mono); font-size: .88rem; color: var(--fg);
+}
+.copybox .prompt { color: var(--accent); user-select: none; flex: none; }
+/* The command must be able to shrink below its intrinsic width, or it
+   pushes the page into horizontal scroll on narrow viewports. */
+.copybox code { white-space: nowrap; overflow-x: auto; min-width: 0; flex: 1 1 auto; }
+.copy {
+  border: 1px solid var(--line); background: var(--bg-raised); color: var(--fg-muted);
+  border-radius: 7px; padding: .28rem .5rem; cursor: pointer; font-size: .74rem;
+  font-family: var(--mono); transition: all .15s ease; flex: none;
+}
+.copy:hover { color: var(--fg); border-color: var(--fg-faint); }
+.copy.done { color: var(--green); border-color: var(--green); }
+.btn {
+  display: inline-flex; align-items: center; gap: .5rem;
+  padding: .7rem 1.15rem; border-radius: 10px; text-decoration: none;
+  font-size: .92rem; font-weight: 600; border: 1px solid transparent;
+  transition: all .15s ease;
+}
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-dim); }
+.btn-ghost { border-color: var(--line); color: var(--fg); }
+.btn-ghost:hover { border-color: var(--fg-faint); background: var(--bg-raised); }
+.btn svg { width: 16px; height: 16px; }
+
+/* ---------- stat strip ---------- */
+.stats {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 1px; margin-top: 3.5rem;
+  background: var(--line-soft); border: 1px solid var(--line-soft);
+  border-radius: var(--radius); overflow: hidden;
+}
+.stat { background: var(--bg); padding: 1.15rem 1.25rem; }
+.stat b {
+  display: block; font-family: var(--mono); font-size: 1.5rem;
+  font-weight: 700; letter-spacing: -0.03em;
+}
+.stat span { font-size: .8rem; color: var(--fg-faint); }
+@media (max-width: 640px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+
+/* ---------- sections ---------- */
+section { padding: 4.5rem 0; border-top: 1px solid var(--line-soft); }
+.sec-head { max-width: 38rem; margin-bottom: 2.5rem; }
+.sec-label {
+  font-family: var(--mono); font-size: .76rem; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--accent); margin-bottom: .75rem;
+}
+h2 { font-size: clamp(1.6rem, 3.4vw, 2.05rem); font-weight: 700; }
+.sec-head p { color: var(--fg-muted); margin: .85rem 0 0; }
+
+/* ---------- window / code ---------- */
+.window {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--bg-inset); overflow: hidden;
+}
+.window-bar {
+  display: flex; align-items: center; gap: .6rem;
+  padding: .55rem .9rem; border-bottom: 1px solid var(--line);
+  background: var(--bg-raised);
+}
+.window-bar .lights { display: flex; gap: .38rem; }
+.window-bar .lights i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); display: block; }
+.window-title { font-family: var(--mono); font-size: .78rem; color: var(--fg-faint); }
+.tabs { display: flex; gap: .25rem; margin-left: auto; }
+.tab {
+  font-family: var(--mono); font-size: .76rem; color: var(--fg-faint);
+  background: transparent; border: 1px solid transparent; border-radius: 6px;
+  padding: .2rem .55rem; cursor: pointer; transition: all .15s ease;
+}
+.tab:hover { color: var(--fg-muted); }
+.tab[aria-selected="true"] { color: var(--accent); background: var(--accent-bg); border-color: color-mix(in srgb, var(--accent) 28%, transparent); }
+pre {
+  margin: 0; padding: 1.1rem 1.25rem; overflow-x: auto;
+  font-size: .845rem; line-height: 1.72; tab-size: 2;
+}
+pre code { color: var(--fg); }
+.c-com { color: var(--fg-faint); }
+.c-key { color: var(--purple); }
+.c-str { color: var(--green); }
+.c-fn  { color: var(--blue); }
+.c-flag{ color: var(--accent); }
+.c-dim { color: var(--fg-muted); }
+.c-out { color: var(--fg-muted); }
+.c-h   { color: var(--accent); font-weight: 600; }
+[hidden] { display: none !important; }
+
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; align-items: start; }
+@media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
+
+/* ---------- feature cards ---------- */
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+@media (max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 600px) { .cards { grid-template-columns: 1fr; } }
+.card {
+  border: 1px solid var(--line-soft); border-radius: var(--radius);
+  padding: 1.4rem; background: var(--bg-raised);
+  transition: border-color .18s ease, transform .18s ease;
+}
+.card:hover { border-color: var(--line); transform: translateY(-2px); }
+.card .ico {
+  width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
+  background: var(--accent-bg); color: var(--accent); margin-bottom: .9rem;
+}
+.card .ico svg { width: 18px; height: 18px; }
+.card h3 { font-size: 1rem; font-weight: 650; margin-bottom: .4rem; }
+.card p { margin: 0; font-size: .89rem; color: var(--fg-muted); }
+.card code { font-size: .84rem; color: var(--fg); }
+
+/* ---------- table ---------- */
+.table-scroll { overflow-x: auto; border: 1px solid var(--line-soft); border-radius: var(--radius); }
+table { border-collapse: collapse; width: 100%; font-size: .87rem; min-width: 560px; }
+th, td { text-align: left; padding: .68rem 1rem; border-bottom: 1px solid var(--line-soft); }
+thead th {
+  font-family: var(--mono); font-size: .74rem; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--fg-faint); font-weight: 500; background: var(--bg-raised);
+}
+tbody tr:last-child td { border-bottom: none; }
+tbody tr.total td { font-weight: 700; background: var(--bg-raised); }
+td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td a { color: var(--fg); text-decoration-color: var(--line); text-underline-offset: 3px; }
+td a:hover { color: var(--accent); }
+.win { color: var(--green); font-family: var(--mono); }
+.note { font-size: .84rem; color: var(--fg-faint); margin-top: 1rem; max-width: 46rem; }
+
+/* ---------- architecture ---------- */
+.arch { display: grid; grid-template-columns: 1.05fr .95fr; gap: 1.25rem; align-items: start; }
+@media (max-width: 860px) { .arch { grid-template-columns: 1fr; } }
+.flow { display: flex; flex-direction: column; gap: .5rem; }
+.step {
+  display: flex; gap: .9rem; align-items: flex-start;
+  border: 1px solid var(--line-soft); border-radius: 10px;
+  padding: .8rem 1rem; background: var(--bg-raised);
+}
+.step .n {
+  font-family: var(--mono); font-size: .75rem; color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  background: var(--accent-bg); border-radius: 6px; padding: .05rem .4rem; flex: none; margin-top: .18rem;
+}
+.step h4 { margin: 0; font-size: .93rem; font-weight: 640; }
+.step p { margin: .15rem 0 0; font-size: .85rem; color: var(--fg-muted); }
+.step p code { font-size: .82rem; }
+
+/* ---------- limits ---------- */
+.limits { display: grid; grid-template-columns: repeat(2, 1fr); gap: .75rem 1.5rem; }
+@media (max-width: 700px) { .limits { grid-template-columns: 1fr; } }
+.limit { display: flex; gap: .7rem; font-size: .9rem; color: var(--fg-muted); }
+.limit svg { width: 16px; height: 16px; flex: none; margin-top: .3rem; color: var(--fg-faint); }
+
+/* ---------- footer ---------- */
+footer { border-top: 1px solid var(--line-soft); padding: 2.5rem 0 3.5rem; }
+.foot { display: flex; flex-wrap: wrap; gap: 1rem 2rem; align-items: center; justify-content: space-between; }
+.foot p { margin: 0; font-size: .85rem; color: var(--fg-faint); }
+.foot nav { display: flex; gap: 1.3rem; }
+.foot a { color: var(--fg-muted); font-size: .85rem; text-decoration: none; }
+.foot a:hover { color: var(--fg); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+  html { scroll-behavior: auto; }
+}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-in">
+    <a class="brand" href="#top"><span class="dot"></span>pdfmd</a>
+    <nav class="nav-links">
+      <a href="#install" class="hide-sm">Install</a>
+      <a href="#usage" class="hide-sm">Usage</a>
+      <a href="#performance">Performance</a>
+      <a href="#architecture" class="hide-sm">Architecture</a>
+      <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
+      <button class="icon-btn" id="theme" type="button" aria-label="Toggle color theme" title="Toggle color theme">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 010 18z" fill="currentColor" stroke="none"/></svg>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<div class="hero">
+  <div class="wrap">
+    <a class="eyebrow" href="https://github.com/colesmcintosh/pdfmd/blob/main/Cargo.toml">
+      <span>■</span> <code>[dependencies]</code> is empty
+    </a>
+    <h1>pdf <span class="arrow">→</span> md</h1>
+    <p class="tagline">
+      A fast, zero-dependency PDF → Markdown converter written in Rust.
+      <strong>pdfmd</strong> parses the object graph, inflates the compressed streams,
+      decodes the fonts, and interprets the content-stream operators itself —
+      then recovers headings, lists, and paragraphs with a small set of heuristics.
+    </p>
+
+    <div class="cta">
+      <div class="copybox">
+        <span class="prompt">$</span>
+        <code id="install-cmd">cargo install --git https://github.com/colesmcintosh/pdfmd</code>
+        <button class="copy" type="button" data-copy="#install-cmd">copy</button>
+      </div>
+      <a class="btn btn-primary" href="#usage">Get started</a>
+      <a class="btn btn-ghost" href="https://github.com/colesmcintosh/pdfmd">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 014 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        Source
+      </a>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b>0</b><span>runtime dependencies</span></div>
+      <div class="stat"><b style="color:var(--accent)">4.4 ms</b><span>17-page paper, end to end</span></div>
+      <div class="stat"><b>~600 KB</b><span>release binary</span></div>
+      <div class="stat"><b>100%</b><span>line coverage, 391 tests</span></div>
+    </div>
+  </div>
+</div>
+
+<section id="demo" style="border-top:none; padding-top:1rem;">
+  <div class="wrap">
+    <div class="window">
+      <div class="window-bar">
+        <span class="lights"><i></i><i></i><i></i></span>
+        <span class="window-title">pdfmd</span>
+        <div class="tabs" role="tablist" aria-label="Examples">
+          <button class="tab" role="tab" aria-selected="true" aria-controls="p-cli" id="t-cli">cli</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="p-out" id="t-out">output.md</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="p-lib" id="t-lib">lib.rs</button>
+        </div>
+      </div>
+
+<pre id="p-cli" role="tabpanel" aria-labelledby="t-cli"><code><span class="c-com"># markdown to stdout</span>
+<span class="c-flag">$</span> pdfmd paper.pdf
+
+<span class="c-com"># write to a file, with `---` between PDF pages</span>
+<span class="c-flag">$</span> pdfmd paper.pdf <span class="c-key">--page-breaks</span> <span class="c-key">-o</span> paper.md
+
+<span class="c-com"># pull embedded images out alongside the markdown</span>
+<span class="c-flag">$</span> pdfmd paper.pdf <span class="c-key">--extract-images</span> figs <span class="c-key">-o</span> paper.md
+
+<span class="c-com"># pipe it, or hand it a URL (fetched with curl)</span>
+<span class="c-flag">$</span> cat paper.pdf | pdfmd -
+<span class="c-flag">$</span> pdfmd <span class="c-str">https://arxiv.org/pdf/1706.03762</span>
+
+<span class="c-out">real    0m0.004s</span></code></pre>
+
+<pre id="p-out" role="tabpanel" aria-labelledby="t-out" hidden><code><span class="c-h"># Attention Is All You Need</span>
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit,
+Llion Jones, Aidan N. Gomez, Łukasz Kaiser, Illia Polosukhin
+
+<span class="c-h">## Abstract</span>
+
+The dominant sequence transduction models are based on complex
+recurrent or convolutional neural networks that include an encoder
+and a decoder. <span class="c-dim">[...]</span>
+
+<span class="c-h">## 1 Introduction</span>
+
+<span class="c-dim">-</span> Recurrent models factor computation along symbol positions.
+<span class="c-dim">-</span> Attention mechanisms allow modeling of dependencies without
+  regard to their distance in the sequences.
+
+<span class="c-dim">![](figs/img-001.jpg)</span></code></pre>
+
+<pre id="p-lib" role="tabpanel" aria-labelledby="t-lib" hidden><code><span class="c-key">use</span> pdfmd::{convert_pdf_to_markdown, ConvertOptions};
+
+<span class="c-key">fn</span> <span class="c-fn">main</span>() -&gt; Result&lt;(), Box&lt;<span class="c-key">dyn</span> std::error::Error&gt;&gt; {
+    <span class="c-key">let</span> bytes = std::fs::<span class="c-fn">read</span>(<span class="c-str">"paper.pdf"</span>)?;
+
+    <span class="c-key">let</span> result = <span class="c-fn">convert_pdf_to_markdown</span>(&amp;bytes, &amp;ConvertOptions {
+        include_page_breaks: <span class="c-key">true</span>,
+        image_dir: <span class="c-key">None</span>,   <span class="c-com">// or Some("figs")</span>
+    })?;
+
+    <span class="c-fn">println!</span>(<span class="c-str">"{}"</span>, result.markdown);
+
+    <span class="c-com">// result.images holds any extracted image bytes;</span>
+    <span class="c-com">// the caller decides where they land on disk.</span>
+    Ok(())
+}</code></pre>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label">Why</div>
+      <h2>PDFs carry no semantic structure</h2>
+      <p>
+        Most extraction libraries either hand back one undifferentiated text blob, or stop at
+        a slow, general-purpose parsing layer. pdfmd owns the whole path from bytes to Markdown —
+        which is what keeps it fast, and what leaves room to tune the heuristics for the
+        documents you actually care about.
+      </p>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><path d="M3.3 7L12 12l8.7-5M12 22V12"/></svg></div>
+        <h3>Zero dependencies</h3>
+        <p>The CLI parser, error type, work scheduler, PDF reader, and zlib/DEFLATE decoder all live in this crate. Nothing to audit but the crate itself.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h8l-1 8 10-12h-8z"/></svg></div>
+        <h3>~240 MB/s of PDF</h3>
+        <p>About 3,900 pages/sec. Pages extract in parallel over a <code>std::thread::scope</code> pool, and fonts shared across pages are parsed once into a document-wide cache.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 9h16M9 9v11"/></svg></div>
+        <h3>Structure, not a blob</h3>
+        <p>Headings, list items, and paragraph boundaries are recovered from font sizes, line spacing, and leading glyphs — and the first paragraph is promoted to an H1 title.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V4s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22v-7"/></svg></div>
+        <h3>Real font decoding</h3>
+        <p>ToUnicode CMaps (<code>bfchar</code>/<code>bfrange</code>), WinAnsi / MacRoman / Standard / Symbol encodings, <code>/Differences</code> arrays, and glyph-name → Unicode fallback.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></div>
+        <h3>Image extraction</h3>
+        <p>JPEG and JPEG 2000 streams pass through verbatim; decoded 8-bit gray/RGB/CMYK rasters are re-encoded to PNG and linked inline at their paint position.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
+        <h3>Tested to 100%</h3>
+        <p>391 tests (364 unit, 27 integration) at 100% line coverage and 99.77% region coverage, gated on Linux, macOS, and Windows with <code>-D warnings</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label">Install</div>
+      <h2>One command, no toolchain archaeology</h2>
+      <p>Rust 1.70 or newer. That is the entire prerequisite list.</p>
+    </div>
+
+    <div class="split">
+      <div class="window">
+        <div class="window-bar">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="window-title">install the CLI</span>
+        </div>
+<pre><code><span class="c-com"># from the repository</span>
+<span class="c-flag">$</span> cargo install --git https://github.com/colesmcintosh/pdfmd
+
+<span class="c-com"># or from a local checkout</span>
+<span class="c-flag">$</span> git clone https://github.com/colesmcintosh/pdfmd
+<span class="c-flag">$</span> cd pdfmd &amp;&amp; cargo install --path .
+
+<span class="c-com"># or just build the release binary</span>
+<span class="c-flag">$</span> cargo build --release
+<span class="c-out">   -&gt; ./target/release/pdfmd</span></code></pre>
+      </div>
+
+      <div class="window">
+        <div class="window-bar">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="window-title">use it as a library</span>
+        </div>
+<pre><code><span class="c-com"># Cargo.toml</span>
+[dependencies]
+pdfmd = { git = <span class="c-str">"https://github.com/colesmcintosh/pdfmd"</span> }</code></pre>
+        <div style="padding: 0 1.25rem 1.25rem;">
+          <p class="note" style="margin-top:0">
+            The public surface is small on purpose: <code>convert_pdf_to_markdown</code>,
+            <code>ConvertOptions</code>, <code>ConvertResult</code>, <code>ExtractedImage</code>,
+            and a single error type. Everything flows through <code>pdfmd::Error</code>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="usage">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label">Usage</div>
+      <h2>Four flags, and that is the whole interface</h2>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Flag</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>&lt;INPUT&gt;</code></td><td>A PDF path, an <code>http(s)://</code> URL (fetched via <code>curl</code> on <code>PATH</code>), or <code>-</code> for stdin.</td></tr>
+          <tr><td><code>-o, --output &lt;FILE&gt;</code></td><td>Write Markdown to <code>FILE</code> instead of stdout.</td></tr>
+          <tr><td><code>--page-breaks</code></td><td>Insert a <code>---</code> rule between PDF pages.</td></tr>
+          <tr><td><code>--extract-images &lt;DIR&gt;</code></td><td>Save supported embedded images into <code>DIR</code> and reference them inline.</td></tr>
+          <tr><td><code>-h, --help</code> / <code>-V, --version</code></td><td>Print help or version information.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="performance">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label">Performance</div>
+      <h2>Measured, not asserted</h2>
+      <p>
+        End-to-end CLI benchmark on a 1.05 MB, 17-page arXiv paper — Apple Silicon, release
+        build, <code>hyperfine --warmup 5 --runs 20 -N</code>.
+      </p>
+    </div>
+
+    <div class="stats" style="margin-top:0; margin-bottom:2.5rem;">
+      <div class="stat"><b>3.8 ms</b><span>min</span></div>
+      <div class="stat"><b style="color:var(--accent)">4.4 ms</b><span>mean ± 0.3 ms</span></div>
+      <div class="stat"><b>~240 MB/s</b><span>throughput</span></div>
+      <div class="stat"><b>~3,900</b><span>pages / sec</span></div>
+    </div>
+
+    <h3 style="font-size:1.05rem; margin-bottom:.9rem;">Public corpus — 10 documents, 1,120 pages, 19.6 MB</h3>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Document</th>
+            <th class="num">Pages</th>
+            <th class="num">Baseline</th>
+            <th class="num">Optimized</th>
+            <th class="num">Speedup</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><a href="https://arxiv.org/pdf/1706.03762">Attention Is All You Need</a></td><td class="num">15</td><td class="num">11.48 ms</td><td class="num">10.96 ms</td><td class="num win">1.05x</td></tr>
+          <tr><td><a href="https://arxiv.org/pdf/1810.04805">BERT</a></td><td class="num">16</td><td class="num">4.58 ms</td><td class="num">4.28 ms</td><td class="num win">1.07x</td></tr>
+          <tr><td><a href="https://bitcoin.org/bitcoin.pdf">Bitcoin whitepaper</a></td><td class="num">9</td><td class="num">3.47 ms</td><td class="num">3.40 ms</td><td class="num win">1.02x</td></tr>
+          <tr><td><a href="https://www.irs.gov/pub/irs-pdf/fw9.pdf">IRS Form W-9</a></td><td class="num">6</td><td class="num">8.03 ms</td><td class="num">4.16 ms</td><td class="num win">1.93x</td></tr>
+          <tr><td><a href="https://www.nasa.gov/wp-content/uploads/2018/09/nasa_systems_engineering_handbook_0.pdf">NASA Systems Engineering Handbook</a></td><td class="num">297</td><td class="num">168.68 ms</td><td class="num">91.01 ms</td><td class="num win">1.85x</td></tr>
+          <tr><td><a href="https://nvlpubs.nist.gov/nistpubs/CSWP/NIST.CSWP.29.pdf">NIST Cybersecurity Framework 2.0</a></td><td class="num">32</td><td class="num">13.85 ms</td><td class="num">6.03 ms</td><td class="num win">2.30x</td></tr>
+          <tr><td><a href="https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf">NIST FIPS 180-4</a></td><td class="num">36</td><td class="num">5.50 ms</td><td class="num">4.63 ms</td><td class="num win">1.19x</td></tr>
+          <tr><td><a href="https://www.rfc-editor.org/rfc/rfc9110.pdf">RFC 9110: HTTP Semantics</a></td><td class="num">194</td><td class="num">26.33 ms</td><td class="num">23.91 ms</td><td class="num win">1.10x</td></tr>
+          <tr><td><a href="https://www.govinfo.gov/content/pkg/CDOC-110hdoc50/pdf/CDOC-110hdoc50.pdf">Constitution of the United States</a></td><td class="num">85</td><td class="num">7.67 ms</td><td class="num">6.63 ms</td><td class="num win">1.16x</td></tr>
+          <tr><td><a href="https://www.w3.org/TR/2011/REC-CSS2-20110607/css2.pdf">W3C CSS 2.1</a></td><td class="num">430</td><td class="num">229.52 ms</td><td class="num">240.94 ms</td><td class="num">0.95x</td></tr>
+          <tr class="total"><td>Sum of document means</td><td class="num">1,120</td><td class="num">479.11 ms</td><td class="num">395.96 ms</td><td class="num win">1.21x</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      Each result is the arithmetic mean of 20 measured release-build executions after five
+      warmups; document and binary order were shuffled within paired blocks and output was
+      written to <code>/dev/null</code>. Both binaries produce byte-identical Markdown. Nine
+      documents improve; CSS 2.1 is about 5% slower and remains a useful stress case for the
+      DEFLATE symbol decoder.
+    </p>
+    <p class="note">
+      <strong style="color:var(--fg-muted)">Fidelity.</strong> All 10 corpus documents convert
+      successfully. Against independent Poppler <code>pdftotext</code> output, case-folded
+      Unicode word tokens give 86.6–99.8% recall and 92.8–99.8% precision, with no replacement
+      characters or unexpected control characters. Those numbers measure text fidelity, not
+      semantic Markdown reconstruction.
+    </p>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label">Architecture</div>
+      <h2>Bytes in, Markdown out — every layer in one crate</h2>
+    </div>
+
+    <div class="arch">
+      <div class="window">
+        <div class="window-bar">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="window-title">src/</span>
+        </div>
+<pre><code><span class="c-dim">src/</span>
+├── <span class="c-key">pdf/</span>
+│   ├── deflate.rs        <span class="c-com">zlib + DEFLATE (RFC 1950/1951)</span>
+│   ├── filter.rs         <span class="c-com">filters, PNG predictors</span>
+│   ├── object.rs         <span class="c-com">Object / Dictionary / Stream</span>
+│   ├── object_stream.rs  <span class="c-com">PDF 1.5 object streams</span>
+│   ├── page_tree.rs      <span class="c-com">catalog / page tree</span>
+│   ├── parser.rs         <span class="c-com">byte-level object parser</span>
+│   ├── xref.rs           <span class="c-com">xref tables and streams</span>
+│   └── mod.rs            <span class="c-com">Document facade + cache</span>
+├── <span class="c-key">extract/</span>
+│   ├── encoding.rs       <span class="c-com">byte → glyph name</span>
+│   ├── glyphs.rs         <span class="c-com">glyph name → Unicode</span>
+│   ├── cmap.rs           <span class="c-com">ToUnicode CMap parser</span>
+│   ├── font.rs           <span class="c-com">per-font byte → text</span>
+│   ├── image.rs          <span class="c-com">image XObjects → assets</span>
+│   ├── parser.rs         <span class="c-com">content-stream tokenizer</span>
+│   ├── content.rs        <span class="c-com">text-state machine</span>
+│   └── mod.rs            <span class="c-com">page walking + parallelism</span>
+├── heuristics.rs         <span class="c-com">headings, lists, reflow</span>
+├── lib.rs                <span class="c-com">public API</span>
+├── cli.rs                <span class="c-com">argv parsing + execution</span>
+└── main.rs               <span class="c-com">process entrypoint</span></code></pre>
+      </div>
+
+      <div class="flow">
+        <div class="step">
+          <span class="n">01</span>
+          <div>
+            <h4>Read the object graph</h4>
+            <p>Classic xref tables and PDF 1.5 xref/object streams, resolved through a cached <code>Document</code> facade.</p>
+          </div>
+        </div>
+        <div class="step">
+          <span class="n">02</span>
+          <div>
+            <h4>Inflate the streams</h4>
+            <p>A from-scratch zlib/DEFLATE decoder that borrows straight out of the source bytes — no allocation per Huffman code.</p>
+          </div>
+        </div>
+        <div class="step">
+          <span class="n">03</span>
+          <div>
+            <h4>Decode the fonts</h4>
+            <p>ToUnicode CMaps, standard encodings, and <code>/Differences</code> collapse into one byte → text mapping per font, parsed once and cached document-wide.</p>
+          </div>
+        </div>
+        <div class="step">
+          <span class="n">04</span>
+          <div>
+            <h4>Interpret the content stream</h4>
+            <p>A streaming tokenizer feeds a text-state machine that tracks positions, sizes, and image paint points — pages run in parallel.</p>
+          </div>
+        </div>
+        <div class="step">
+          <span class="n">05</span>
+          <div>
+            <h4>Recover the structure</h4>
+            <p>Heuristics turn positioned glyph runs into headings, list items, and reflowed paragraphs; image sentinels become Markdown links.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="limitations">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label">Honest limits</div>
+      <h2>What it will not do</h2>
+      <p>A converter that claims everything works is lying. These are the known edges.</p>
+    </div>
+    <div class="limits">
+      <div class="limit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v5M12 16h.01"/></svg>
+        <p style="margin:0">Tables, multi-column figure captions, and complex math layout come out as best-effort reflowed text.</p>
+      </div>
+      <div class="limit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v5M12 16h.01"/></svg>
+        <p style="margin:0">Fonts with no <code>ToUnicode</code> CMap, no standard encoding, and no <code>/Differences</code> array will silently drop glyphs.</p>
+      </div>
+      <div class="limit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v5M12 16h.01"/></svg>
+        <p style="margin:0">The heuristics target academic and prose documents. Forms and invoices will not reconstruct well.</p>
+      </div>
+      <div class="limit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v5M12 16h.01"/></svg>
+        <p style="margin:0">Encrypted PDFs and <code>LZWDecode</code> streams are unsupported by design — they return a clean error.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="cta-end" style="text-align:center;">
+  <div class="wrap">
+    <h2 style="max-width:30rem;margin:0 auto;">Point it at a PDF and see what comes out</h2>
+    <div class="cta" style="justify-content:center; margin-top:1.8rem;">
+      <div class="copybox">
+        <span class="prompt">$</span>
+        <code id="try-cmd">pdfmd https://arxiv.org/pdf/1706.03762 -o attention.md</code>
+        <button class="copy" type="button" data-copy="#try-cmd">copy</button>
+      </div>
+      <a class="btn btn-primary" href="https://github.com/colesmcintosh/pdfmd">View on GitHub</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <p>MIT licensed. Built in Rust with an empty <code>[dependencies]</code> table.</p>
+    <nav>
+      <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
+      <a href="https://github.com/colesmcintosh/pdfmd/blob/main/README.md">README</a>
+      <a href="https://github.com/colesmcintosh/pdfmd/issues">Issues</a>
+      <a href="https://github.com/colesmcintosh/pdfmd/blob/main/LICENSE">License</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem("pdfmd-theme"); } catch (e) {}
+  if (stored) root.setAttribute("data-theme", stored);
+
+  document.getElementById("theme").addEventListener("click", function () {
+    // With no explicit choice yet, flip away from whatever the OS is asking for.
+    var current = root.getAttribute("data-theme") ||
+      (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    var next = current === "light" ? "dark" : "light";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("pdfmd-theme", next); } catch (e) {}
+  });
+
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var text = document.querySelector(btn.dataset.copy).textContent;
+      var done = function () {
+        btn.textContent = "copied";
+        btn.classList.add("done");
+        setTimeout(function () {
+          btn.textContent = "copy";
+          btn.classList.remove("done");
+        }, 1400);
+      };
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(done, function () {});
+      }
+    });
+  });
+
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+  tabs.forEach(function (tab, i) {
+    tab.addEventListener("click", function () {
+      tabs.forEach(function (t) {
+        t.setAttribute("aria-selected", String(t === tab));
+        document.getElementById(t.getAttribute("aria-controls")).hidden = t !== tab;
+      });
+    });
+    tab.addEventListener("keydown", function (e) {
+      var d = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+      if (!d) return;
+      e.preventDefault();
+      var next = tabs[(i + d + tabs.length) % tabs.length];
+      next.focus();
+      next.click();
+    });
+  });
+})();
+</script>
+</body>
+</html>

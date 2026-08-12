@@ -8,6 +8,8 @@
 
 A fast, **zero-dependency** PDF → Markdown converter written in Rust.
 
+Website: <https://colesmcintosh.github.io/pdfmd/> (source in [`docs/`](docs/)).
+
 `pdfmd` extracts text directly from a PDF — parsing the object graph,
 inflating compressed streams, decoding fonts, and interpreting the
 content-stream operators itself — then runs a small set of heuristics to
