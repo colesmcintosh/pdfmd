@@ -19,6 +19,8 @@ use std::borrow::Cow;
 pub struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// `/MCID` captured from the last skipped `<< >>` dict, consumed by `BDC`.
+    pub pending_mcid: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -40,7 +42,11 @@ pub enum Token<'a> {
 
 impl<'a> Parser<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+        Self {
+            bytes,
+            pos: 0,
+            pending_mcid: None,
+        }
     }
 
     pub fn next_token(&mut self) -> Token<'a> {
@@ -252,6 +258,7 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_dict(&mut self) {
+        let start = self.pos;
         let mut depth: i32 = 1;
         while depth > 0 && self.pos < self.bytes.len() {
             if self.bytes[self.pos..].starts_with(b"<<") {
@@ -263,6 +270,9 @@ impl<'a> Parser<'a> {
             } else {
                 self.pos += 1;
             }
+        }
+        if let Some(mcid) = find_mcid(&self.bytes[start..self.pos]) {
+            self.pending_mcid = Some(mcid);
         }
     }
 }
@@ -276,6 +286,32 @@ fn is_delim(b: u8) -> bool {
         b,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
     )
+}
+
+fn find_mcid(bytes: &[u8]) -> Option<u32> {
+    let needle = b"/MCID";
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if bytes[i..].starts_with(needle) {
+            let rest = &bytes[i + needle.len()..];
+            let mut j = 0;
+            while j < rest.len() && is_ws(rest[j]) {
+                j += 1;
+            }
+            let mut n = 0u32;
+            let mut any = false;
+            while j < rest.len() && rest[j].is_ascii_digit() {
+                any = true;
+                n = n.saturating_mul(10).saturating_add((rest[j] - b'0') as u32);
+                j += 1;
+            }
+            if any {
+                return Some(n);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_delim_or_ws(b: u8) -> bool {
@@ -487,6 +523,32 @@ mod tests {
         // skip_dict's depth-increment branch when it sees `<<`.
         let toks = ops(b"<</Outer <</Inner 1>> >> 7 Tj");
         assert_eq!(toks, ["num:7", "op:Tj"]);
+    }
+
+    #[test]
+    fn skip_dict_captures_mcid() {
+        let mut p = Parser::new(b"/P << /MCID 7 >> BDC");
+        loop {
+            match p.next_token() {
+                Token::Op(op) if op == b"BDC" => break,
+                Token::Eof => panic!("missing BDC"),
+                _ => {}
+            }
+        }
+        assert_eq!(p.pending_mcid, Some(7));
+    }
+
+    #[test]
+    fn skip_dict_ignores_mcid_without_digits() {
+        let mut p = Parser::new(b"/P << /MCID >> BDC");
+        loop {
+            match p.next_token() {
+                Token::Op(op) if op == b"BDC" => break,
+                Token::Eof => panic!("missing BDC"),
+                _ => {}
+            }
+        }
+        assert_eq!(p.pending_mcid, None);
     }
 
     #[test]
