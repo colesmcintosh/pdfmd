@@ -6,6 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::thread;
 
 use crate::extract::layout::{PageLayout, Span, SpanKind};
 use crate::extract::structure::{Role, RoleMap};
@@ -22,13 +23,44 @@ pub fn format_page(raw: &str) -> String {
 
 /// Format each page from positioned spans. Empty pages stay empty strings.
 pub fn format_pages(pages: &[PageLayout], roles: &RoleMap) -> Vec<String> {
-    let headers = running_margin(pages, true);
-    let footers = running_margin(pages, false);
-    pages
-        .iter()
-        .enumerate()
-        .map(|(i, page)| format_page_layout(page, i, roles, &headers, &footers))
-        .collect()
+    let (headers, footers) = running_margins(pages);
+    let n = pages.len();
+    if n <= 4 {
+        return pages
+            .iter()
+            .enumerate()
+            .map(|(i, page)| format_page_layout(page, i, roles, &headers, &footers))
+            .collect();
+    }
+    let mut out: Vec<Option<String>> = (0..n).map(|_| None).collect();
+    let workers = thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n)
+        .max(1);
+    let chunk = (n + workers - 1) / workers;
+    let headers = &headers;
+    let footers = &footers;
+    thread::scope(|s| {
+        for (i, out_chunk) in out.chunks_mut(chunk).enumerate() {
+            let start = i * chunk;
+            s.spawn(move || {
+                for (j, slot) in out_chunk.iter_mut().enumerate() {
+                    let idx = start + j;
+                    if idx < n {
+                        *slot = Some(format_page_layout(
+                            &pages[idx],
+                            idx,
+                            roles,
+                            headers,
+                            footers,
+                        ));
+                    }
+                }
+            });
+        }
+    });
+    out.into_iter().map(|s| s.unwrap_or_default()).collect()
 }
 
 #[cfg(test)]
@@ -514,38 +546,69 @@ fn column_gaps(spans: &[&Span]) -> Vec<f32> {
     gaps
 }
 
-fn running_margin(pages: &[PageLayout], header: bool) -> Vec<String> {
+fn running_margins(pages: &[PageLayout]) -> (Vec<String>, Vec<String>) {
     if pages.len() < 3 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let mut freq: HashMap<String, usize> = HashMap::new();
+    let mut heads: HashMap<String, usize> = HashMap::new();
+    let mut foots: HashMap<String, usize> = HashMap::new();
     for page in pages {
         let (first, last) = first_last(page);
-        let line = if header { first } else { last };
-        if let Some(t) = line {
+        if let Some(t) = first {
             if !t.is_empty() && t.len() < 80 {
-                *freq.entry(t).or_insert(0) += 1;
+                *heads.entry(t).or_insert(0) += 1;
+            }
+        }
+        if let Some(t) = last {
+            if !t.is_empty() && t.len() < 80 {
+                *foots.entry(t).or_insert(0) += 1;
             }
         }
     }
-    freq.into_iter()
-        .filter(|(_, n)| *n >= 3)
-        .map(|(t, _)| t)
-        .collect()
+    let keep = |freq: HashMap<String, usize>| {
+        freq.into_iter()
+            .filter(|(_, n)| *n >= 3)
+            .map(|(t, _)| t)
+            .collect()
+    };
+    (keep(heads), keep(foots))
 }
 
 fn first_last(page: &PageLayout) -> (Option<String>, Option<String>) {
-    let refs: Vec<&Span> = page
-        .spans
-        .iter()
-        .filter(|s| s.kind == SpanKind::Text)
-        .collect();
-    if refs.is_empty() {
+    let mut max_y = f32::MIN;
+    let mut min_y = f32::MAX;
+    let mut n = 0usize;
+    for s in &page.spans {
+        if s.kind != SpanKind::Text {
+            continue;
+        }
+        n += 1;
+        max_y = max_y.max(s.y);
+        min_y = min_y.min(s.y);
+    }
+    if n == 0 {
         return (None, None);
     }
-    let cols = vec![0usize; refs.len()];
-    let lines = visual_lines(&refs, &cols);
-    (lines.first().map(plain_line), lines.last().map(plain_line))
+    (
+        Some(band_text(&page.spans, max_y)),
+        Some(band_text(&page.spans, min_y)),
+    )
+}
+
+fn band_text(spans: &[Span], y: f32) -> String {
+    let mut band: Vec<&Span> = spans
+        .iter()
+        .filter(|s| s.kind == SpanKind::Text && (s.y - y).abs() < 6.0)
+        .collect();
+    band.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal));
+    let mut out = String::new();
+    for s in band {
+        if s.space_before && !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push_str(&s.text);
+    }
+    out.trim().to_string()
 }
 
 pub(super) struct VLine<'a> {
