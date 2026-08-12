@@ -109,7 +109,7 @@ impl<'a> Document<'a> {
         // out of it. PDF 1.5+ stores most metadata objects this way.
         struct CachedObjectStream {
             decoded: Vec<u8>,
-            entries: Vec<ObjectStreamEntry>,
+            entries: Vec<Option<ObjectStreamEntry>>,
         }
 
         let mut objstm_cache: HashMap<u32, CachedObjectStream> = HashMap::new();
@@ -324,15 +324,16 @@ fn resolve_materialized_length(objects: &HashMap<ObjectId, Object>, id: ObjectId
 }
 
 fn object_stream_candidates(
-    entries: &[ObjectStreamEntry],
+    entries: &[Option<ObjectStreamEntry>],
     expected_number: u32,
     index: usize,
 ) -> (Option<&ObjectStreamEntry>, Option<&ObjectStreamEntry>) {
-    let indexed = entries.get(index);
+    let indexed = entries.get(index).and_then(Option::as_ref);
     let numbered = match indexed {
         Some(entry) if entry.number() == expected_number => Some(entry),
         _ => entries
             .iter()
+            .filter_map(Option::as_ref)
             .find(|entry| entry.number() == expected_number),
     };
     let indexed_fallback = indexed.filter(|entry| {
@@ -1386,10 +1387,12 @@ endobj
         let body = b"10 0 11 4 (hi)(by)";
         let entries = parse_object_stream(&dict, body).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].number(), 10);
-        assert_eq!(entries[0].content(body), b"(hi)");
-        assert_eq!(entries[1].number(), 11);
-        assert_eq!(entries[1].content(body), b"(by)");
+        let first = entries[0].as_ref().unwrap();
+        let second = entries[1].as_ref().unwrap();
+        assert_eq!(first.number(), 10);
+        assert_eq!(first.content(body), b"(hi)");
+        assert_eq!(second.number(), 11);
+        assert_eq!(second.content(body), b"(by)");
     }
 
     #[test]
@@ -2103,15 +2106,37 @@ endobj
 
     #[test]
     fn parse_object_stream_skips_entries_with_bad_offsets() {
-        // Header points obj 2 way past the end of the body. Both entries
-        // fail the start/end bounds check and produce no output, but the
-        // skip-entry branch still gets executed.
+        // Header points obj 2 way past the end of the body. Both slots stay
+        // aligned with /N even though neither offset is usable.
         let mut dict = Dictionary::new();
         dict.insert(b"N".to_vec(), Object::Integer(2));
         dict.insert(b"First".to_vec(), Object::Integer(10));
         let body = b"1 0 2 999 hi";
         let entries = parse_object_stream(&dict, body).unwrap();
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn parse_object_stream_keeps_index_slots_for_bad_offsets() {
+        // A bad first offset must not slide the second object into index 0.
+        let mut dict = Dictionary::new();
+        dict.insert(b"N".to_vec(), Object::Integer(2));
+        dict.insert(b"First".to_vec(), Object::Integer(12));
+        let body = b"10 999 11 0 (hi)";
+        let entries = parse_object_stream(&dict, body).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_none());
+        assert_eq!(entries[1].as_ref().unwrap().number(), 11);
+        assert_eq!(entries[1].as_ref().unwrap().content(body), b"(hi)");
+
+        let (primary, fallback) = object_stream_candidates(&entries, 10, 0);
+        assert!(primary.is_none());
+        assert!(fallback.is_none());
+
+        let (primary, fallback) = object_stream_candidates(&entries, 11, 1);
+        assert_eq!(primary.unwrap().content(body), b"(hi)");
+        assert!(fallback.is_none());
     }
 
     #[test]

@@ -23,7 +23,7 @@ impl ObjectStreamEntry {
 pub(super) fn parse_object_stream(
     dict: &Dictionary,
     decoded: &[u8],
-) -> Result<Vec<ObjectStreamEntry>, PdfError> {
+) -> Result<Vec<Option<ObjectStreamEntry>>, PdfError> {
     let n_raw = dict
         .get(b"N")
         .and_then(Object::as_integer)
@@ -60,25 +60,22 @@ pub(super) fn parse_object_stream(
         let off = read_uint(decoded, &mut p.pos)? as usize;
         headers.push((num, off));
     }
-    let mut out: Vec<ObjectStreamEntry> = Vec::with_capacity(n);
+    // One slot per /N header so xref object-stream indices stay aligned
+    // even when an offset is unusable. Callers treat `None` as a hole.
+    let mut out: Vec<Option<ObjectStreamEntry>> = Vec::with_capacity(n);
     for (i, &(num, off)) in headers.iter().enumerate() {
-        let Some(start) = first.checked_add(off) else {
-            continue;
-        };
-        let Some(end) = headers
-            .get(i + 1)
-            .map(|(_, next_off)| first.checked_add(*next_off))
-            .unwrap_or(Some(decoded.len()))
-        else {
-            continue;
-        };
-        if start <= end && end <= decoded.len() {
-            out.push(ObjectStreamEntry {
+        let entry = first.checked_add(off).and_then(|start| {
+            let end = headers
+                .get(i + 1)
+                .map(|(_, next_off)| first.checked_add(*next_off))
+                .unwrap_or(Some(decoded.len()))?;
+            (start <= end && end <= decoded.len()).then_some(ObjectStreamEntry {
                 number: num,
                 start,
                 end,
-            });
-        }
+            })
+        });
+        out.push(entry);
     }
     Ok(out)
 }
