@@ -227,6 +227,23 @@ impl<'a> Document<'a> {
         &self.pages
     }
 
+    /// Catalog dictionary (`/Type /Catalog`), used to reach `/StructTreeRoot`.
+    pub fn catalog(&self) -> Option<&Dictionary> {
+        let mut fallback = None;
+        for obj in self.objects.values() {
+            let Some(dict) = obj.as_dict() else {
+                continue;
+            };
+            if dict.get(b"Type").and_then(Object::as_name) == Some(b"Catalog".as_slice()) {
+                return Some(dict);
+            }
+            if dict.get(b"StructTreeRoot").is_some() {
+                fallback = Some(dict);
+            }
+        }
+        fallback
+    }
+
     /// Concatenated, filter-decoded bytes of the page's content stream(s).
     pub fn get_page_content(&self, page_id: ObjectId) -> Option<Vec<u8>> {
         let page = self.get_object(page_id)?.as_dict()?;
@@ -940,10 +957,46 @@ endobj
         };
         let obj = doc.get_object(ObjectId(1, 0)).unwrap();
         assert_eq!(doc.deref(obj).as_integer(), Some(7));
+        assert!(doc.catalog().is_none());
+    }
+
+    #[test]
+    fn catalog_prefers_type_catalog_over_struct_tree_fallback() {
+        let mut objs = HashMap::new();
+        let mut catalog = Dictionary::new();
+        catalog.insert(b"Type".to_vec(), Object::Name(b"Catalog".to_vec()));
+        objs.insert(ObjectId(1, 0), Object::Dictionary(catalog));
+        let mut other = Dictionary::new();
+        other.insert(b"StructTreeRoot".to_vec(), Object::Integer(0));
+        objs.insert(ObjectId(2, 0), Object::Dictionary(other));
+        let doc = Document {
+            bytes: b"",
+            objects: objs,
+            pages: vec![],
+        };
+        let cat = doc.catalog().unwrap();
+        assert_eq!(
+            cat.get(b"Type").and_then(Object::as_name),
+            Some(b"Catalog".as_slice())
+        );
 
         // Dangling reference: deref returns the unresolved reference itself.
         let dangling = Object::Reference(ObjectId(999, 0));
         assert!(doc.deref(&dangling).as_reference().is_some());
+    }
+
+    #[test]
+    fn catalog_falls_back_to_struct_tree_root_dict() {
+        let mut objs = HashMap::new();
+        let mut dict = Dictionary::new();
+        dict.insert(b"StructTreeRoot".to_vec(), Object::Integer(0));
+        objs.insert(ObjectId(1, 0), Object::Dictionary(dict));
+        let doc = Document {
+            bytes: b"",
+            objects: objs,
+            pages: vec![],
+        };
+        assert!(doc.catalog().unwrap().get(b"StructTreeRoot").is_some());
     }
 
     #[test]

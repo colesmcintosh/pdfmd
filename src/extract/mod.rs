@@ -11,7 +11,12 @@ mod encoding;
 mod font;
 mod glyphs;
 mod image;
+pub(crate) mod layout;
 mod parser;
+pub(crate) mod structure;
+
+pub use layout::PageLayout;
+pub(crate) use structure::RoleMap;
 
 use content::{page_font_refs, ImageFilenames, PageFonts};
 use font::PdfFont;
@@ -61,17 +66,12 @@ struct PreparedForms<'a, 'fonts> {
     images: &'a ImageFilenames<'a>,
 }
 
-/// Extract the textual content of a PDF document. Pages are returned as
-/// independent strings so callers don't pay for a join/split round trip.
-///
-/// When `extract_images` is true, supported image XObjects are collected
-/// and the returned text carries inline
-/// markers — `\u{0001}filename\u{0001}` — at the position each image was
-/// painted, for the markdown layer to rewrite into `![]()` references.
-pub fn extract_text(
+/// Extract positioned page layouts plus the tagged-PDF role map used by
+/// layout-aware markdown formatting.
+pub(crate) fn extract_document(
     pdf_bytes: &[u8],
     extract_images: bool,
-) -> Result<(Vec<String>, Vec<ExtractedImage>), PdfError> {
+) -> Result<(Vec<PageLayout>, Vec<ExtractedImage>, RoleMap), PdfError> {
     let doc = Document::load(pdf_bytes)?;
     let pages: Vec<ObjectId> = doc.pages().to_vec();
 
@@ -162,19 +162,31 @@ pub fn extract_text(
         .zip(page_xobject_refs_per_page.iter())
         .map(|((page_id, font_refs), xobject_refs)| (*page_id, font_refs, xobject_refs))
         .collect();
-    let page_texts: Vec<String> = parallel_map(&inputs, |(page_id, font_refs, xobject_refs)| {
-        extract_one_page(
-            &doc,
-            *page_id,
-            font_refs,
-            xobject_refs,
-            &font_cache,
-            &prepared_forms,
-        )
-        .unwrap_or_default()
-    });
+    let page_layouts: Vec<PageLayout> =
+        parallel_map(&inputs, |(page_id, font_refs, xobject_refs)| {
+            extract_one_page(
+                &doc,
+                *page_id,
+                font_refs,
+                xobject_refs,
+                &font_cache,
+                &prepared_forms,
+            )
+        });
+    let roles = structure::role_map(&doc);
 
-    Ok((page_texts, images))
+    Ok((page_layouts, images, roles))
+}
+
+/// Extract the textual content of a PDF document. Pages are returned as
+/// independent strings so callers don't pay for a join/split round trip.
+#[cfg(test)]
+pub fn extract_text(
+    pdf_bytes: &[u8],
+    extract_images: bool,
+) -> Result<(Vec<String>, Vec<ExtractedImage>), PdfError> {
+    let (pages, images, _) = extract_document(pdf_bytes, extract_images)?;
+    Ok((pages.into_iter().map(|p| p.text).collect(), images))
 }
 
 /// Walk the XObject resource graph and prepare every reachable Form. The
@@ -354,20 +366,22 @@ fn extract_one_page(
     xobject_refs: &HashMap<Vec<u8>, ObjectId>,
     font_cache: &HashMap<ObjectId, PdfFont>,
     forms: &PreparedForms<'_, '_>,
-) -> Option<String> {
+) -> PageLayout {
     let fonts: PageFonts<'_> = font_refs
         .iter()
         .filter_map(|(name, id)| font_cache.get(id).map(|f| (name.clone(), f)))
         .collect();
-    let content_bytes = doc.get_page_content(page_id)?;
-    Some(content::extract_page_text_with_forms(
+    let Some(content_bytes) = doc.get_page_content(page_id) else {
+        return PageLayout::default();
+    };
+    content::extract_page_layout_with_forms(
         &content_bytes,
         &fonts,
         xobject_refs,
         forms.xobjects,
         forms.fonts,
         forms.images,
-    ))
+    )
 }
 
 /// Walk up the page tree until we find a `/Resources` dictionary.
@@ -859,7 +873,7 @@ endobj
     }
 
     #[test]
-    fn extract_one_page_returns_none_when_page_has_no_content() {
+    fn extract_one_page_returns_empty_when_page_has_no_content() {
         // Page dict without /Contents — get_page_content returns None.
         let pdf = b"\
 %PDF-1.4
@@ -882,7 +896,9 @@ endobj
             images: &image_names,
         };
         assert!(
-            extract_one_page(&doc, page, &font_refs, &xobject_refs, &font_cache, &forms,).is_none()
+            extract_one_page(&doc, page, &font_refs, &xobject_refs, &font_cache, &forms)
+                .text
+                .is_empty()
         );
     }
 
@@ -914,11 +930,10 @@ endobj
             fonts: &form_fonts,
             images: &image_names,
         };
-        let out = extract_one_page(&doc, page, &font_refs, &xobject_refs, &font_cache, &forms)
-            .expect("extract one page");
+        let out = extract_one_page(&doc, page, &font_refs, &xobject_refs, &font_cache, &forms);
         // The `Do` operator emits the rewritten filename through the
         // marker; checking for the substring is enough.
-        assert!(out.contains("figs/x.jpg"));
+        assert!(out.text.contains("figs/x.jpg"));
     }
 
     #[test]

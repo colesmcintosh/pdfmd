@@ -16,6 +16,8 @@ pub struct PdfFont {
     pub kind: FontKind,
     pub to_unicode: Option<CMap>,
     pub encoding: BaseEncoding,
+    /// `/BaseFont` name, used to recover bold/italic/mono without extra maps.
+    pub base_font: Vec<u8>,
     /// Per-byte glyph-name overrides from /Encoding /Differences.
     pub differences: HashMap<u8, String>,
     /// Width of source codes in bytes. Simple fonts always use one-byte
@@ -44,6 +46,9 @@ impl PdfFont {
         };
 
         let mut font = PdfFont::default();
+        if let Some(name) = font_dict.get(b"BaseFont").and_then(Object::as_name) {
+            font.base_font = name.to_vec();
+        }
 
         let subtype = font_dict
             .get(b"Subtype")

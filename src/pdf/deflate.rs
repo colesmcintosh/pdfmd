@@ -120,38 +120,42 @@ fn decode_huffman(
 ) -> Result<(), PdfError> {
     loop {
         let sym = ll.decode(reader)?;
-        if sym < 256 {
-            if out.len() >= MAX_INFLATE_OUTPUT {
-                return Err(PdfError::Deflate(
-                    "inflate output exceeded maximum size".into(),
-                ));
+        match sym.cmp(&256) {
+            std::cmp::Ordering::Less => {
+                if out.len() >= MAX_INFLATE_OUTPUT {
+                    return Err(PdfError::Deflate(
+                        "inflate output exceeded maximum size".into(),
+                    ));
+                }
+                out.push(sym as u8);
             }
-            out.push(sym as u8);
-        } else if sym == 256 {
-            return Ok(());
-        } else {
-            let li = (sym - 257) as usize;
-            if li >= LENGTH_BASE.len() {
-                return Err(PdfError::Deflate(format!(
-                    "invalid literal/length code {sym}"
-                )));
+            std::cmp::Ordering::Equal => return Ok(()),
+            std::cmp::Ordering::Greater => {
+                let li = (sym - 257) as usize;
+                if li >= LENGTH_BASE.len() {
+                    return Err(PdfError::Deflate(format!(
+                        "invalid literal/length code {sym}"
+                    )));
+                }
+                let length =
+                    LENGTH_BASE[li] as usize + reader.read(LENGTH_EXTRA[li] as u32) as usize;
+                // Hdist caps the distance alphabet at 30, same story.
+                let dsym = dist.decode(reader)? as usize;
+                let distance =
+                    DIST_BASE[dsym] as usize + reader.read(DIST_EXTRA[dsym] as u32) as usize;
+                if distance > out.len() {
+                    return Err(PdfError::Deflate(format!(
+                        "distance {distance} out of bounds (have {})",
+                        out.len()
+                    )));
+                }
+                if out.len().saturating_add(length) > MAX_INFLATE_OUTPUT {
+                    return Err(PdfError::Deflate(
+                        "inflate output exceeded maximum size".into(),
+                    ));
+                }
+                copy_match(out, length, distance);
             }
-            let length = LENGTH_BASE[li] as usize + reader.read(LENGTH_EXTRA[li] as u32) as usize;
-            // Hdist caps the distance alphabet at 30, same story.
-            let dsym = dist.decode(reader)? as usize;
-            let distance = DIST_BASE[dsym] as usize + reader.read(DIST_EXTRA[dsym] as u32) as usize;
-            if distance > out.len() {
-                return Err(PdfError::Deflate(format!(
-                    "distance {distance} out of bounds (have {})",
-                    out.len()
-                )));
-            }
-            if out.len().saturating_add(length) > MAX_INFLATE_OUTPUT {
-                return Err(PdfError::Deflate(
-                    "inflate output exceeded maximum size".into(),
-                ));
-            }
-            copy_match(out, length, distance);
         }
     }
 }

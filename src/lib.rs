@@ -11,9 +11,10 @@ mod pdf;
 
 use pdf::PdfError;
 
+use extract::extract_document;
 pub use extract::ExtractedImage;
 
-use heuristics::format_page;
+use heuristics::format_pages;
 
 /// Options controlling a PDF → Markdown conversion.
 #[derive(Default, Clone, Copy)]
@@ -43,11 +44,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Convert the byte contents of a PDF into a Markdown document.
 pub fn convert_pdf_to_markdown(pdf_bytes: &[u8], opts: &ConvertOptions) -> Result<ConvertResult> {
-    let (raw_pages, images) = extract::extract_text(pdf_bytes, opts.image_dir.is_some())?;
+    let (layouts, images, roles) = extract_document(pdf_bytes, opts.image_dir.is_some())?;
 
-    let pages: Vec<String> = raw_pages
-        .iter()
-        .map(|p| format_page(p))
+    let pages: Vec<String> = format_pages(&layouts, &roles)
+        .into_iter()
         .filter(|page| !page.trim().is_empty())
         .collect();
 
