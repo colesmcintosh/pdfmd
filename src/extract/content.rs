@@ -285,14 +285,16 @@ impl PageBuilder {
         Self::create(cap, true)
     }
 
-    fn create(cap: usize, keep_text: bool) -> Self {
+    fn create(content_len: usize, keep_text: bool) -> Self {
+        let mut layout = PageLayout::default();
+        layout.spans.reserve(content_len / 32);
         Self {
             out: if keep_text {
-                String::with_capacity(cap)
+                String::with_capacity(content_len)
             } else {
                 String::new()
             },
-            layout: PageLayout::default(),
+            layout,
             ctm: Matrix::identity(),
             ctm_stack: Vec::new(),
             path_x: 0.0,
@@ -445,14 +447,7 @@ fn extract_page_with_form_limits<'fonts>(
     image_filenames: &ImageFilenames<'_>,
     cfg: PageExtractCfg,
 ) -> PageLayout {
-    let mut page = PageBuilder::create(
-        if cfg.keep_text {
-            content_bytes.len()
-        } else {
-            0
-        },
-        cfg.keep_text,
-    );
+    let mut page = PageBuilder::create(content_bytes.len(), cfg.keep_text);
     let resources = ContentResources { fonts, xobjects };
     let form_context = FormContext {
         forms,
