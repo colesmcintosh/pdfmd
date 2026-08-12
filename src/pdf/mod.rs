@@ -487,6 +487,94 @@ endobj
     }
 
     #[test]
+    fn stale_indirect_stream_length_falls_back_to_endstream_scan() {
+        // Object 5 claims the content stream is empty. Trusting it would
+        // silently drop the page.
+        let mut body = Vec::from(
+            &b"%PDF-1.4\n\
+1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n\
+2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n\
+3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]/Contents 4 0 R>> endobj\n\
+4 0 obj <</Length 5 0 R>>\nstream\nABC\nendstream\nendobj\n\
+5 0 obj 0 endobj\n"[..],
+        );
+        let xref_offset = body.len();
+        let offsets: Vec<usize> = (1..=5)
+            .map(|n| {
+                let needle = format!("{n} 0 obj");
+                find_subslice(&body, needle.as_bytes()).unwrap()
+            })
+            .collect();
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets {
+            xref.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer <</Size 6/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        body.extend_from_slice(xref.as_bytes());
+
+        let doc = Document::load(&body).expect("load");
+        let content = doc.get_page_content(doc.pages()[0]).expect("page content");
+        assert_eq!(content, b"ABC");
+    }
+
+    #[test]
+    fn stale_compressed_stream_length_keeps_scanned_stream() {
+        // Same stale length, but materialized from an object stream, so the
+        // repair pass reparses object 4. It must not replace the body the
+        // first pass recovered by scanning.
+        let mut body = String::from("%PDF-1.5\n");
+        let off1 = body.len();
+        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
+        let off2 = body.len();
+        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
+        let off3 = body.len();
+        body.push_str(
+            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]/Contents 4 0 R>> endobj\n",
+        );
+        let off4 = body.len();
+        body.push_str("4 0 obj <</Length 5 0 R>>\nstream\nABC\nendstream\nendobj\n");
+        let off6 = body.len();
+        body.push_str(
+            "6 0 obj <</Type/ObjStm/N 1/First 4/Length 5>>\nstream\n5 0 0\nendstream\nendobj\n",
+        );
+        let mut bytes = body.into_bytes();
+
+        let xref_offset = bytes.len();
+        let mut xref_data = Vec::new();
+        xref_data.extend_from_slice(&[0, 0, 0, 0]);
+        for offset in [off1, off2, off3, off4] {
+            xref_data.push(1);
+            xref_data.extend_from_slice(&(offset as u16).to_be_bytes());
+            xref_data.push(0);
+        }
+        xref_data.push(2);
+        xref_data.extend_from_slice(&6u16.to_be_bytes());
+        xref_data.push(0);
+        for offset in [off6, xref_offset] {
+            xref_data.push(1);
+            xref_data.extend_from_slice(&(offset as u16).to_be_bytes());
+            xref_data.push(0);
+        }
+
+        bytes.extend_from_slice(
+            format!(
+                "7 0 obj <</Type/XRef/Size 8/Root 1 0 R/W[1 2 1]/Length {}>>\nstream\n",
+                xref_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        let doc = Document::load(&bytes).expect("load");
+        let content = doc.get_page_content(doc.pages()[0]).expect("page content");
+        assert_eq!(content, b"ABC");
+    }
+
+    #[test]
     fn rejects_non_pdf_header() {
         // Comparing on the Display string sidesteps a `match` whose unused
         // arms would otherwise show up as uncovered branches.
