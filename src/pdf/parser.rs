@@ -123,6 +123,17 @@ impl<'a> Parser<'a> {
             .is_some_and(|w| w == kw)
     }
 
+    /// Does the `endstream` keyword sit at `offset`, past the end-of-line
+    /// delimiter that belongs to it? Comments are not skipped: a `%` here is
+    /// stream data, not syntax.
+    fn endstream_at(&self, offset: usize) -> bool {
+        let Some(rest) = self.bytes.get(offset..) else {
+            return false;
+        };
+        let ws = rest.iter().take_while(|&&b| is_ws(b)).count();
+        rest[ws..].starts_with(b"endstream")
+    }
+
     // ---- Numbers and references ------------------------------------------
 
     fn parse_number_or_reference(&mut self) -> Result<Object, PdfError> {
@@ -400,6 +411,24 @@ impl<'a> Parser<'a> {
     /// Parse a complete `N G obj <obj> [stream ... endstream] endobj` block
     /// starting at the current position.
     pub fn parse_indirect_object(&mut self) -> Result<(ObjectId, Object), PdfError> {
+        self.parse_indirect_object_impl(None)
+    }
+
+    /// Parse an indirect object, resolving an indirect stream `/Length` when
+    /// the caller already has an object-location index. The byte-exact length
+    /// avoids an inherently ambiguous `CR LF endstream` boundary when the
+    /// stream data itself ends in `CR`.
+    pub(super) fn parse_indirect_object_with_length_resolver(
+        &mut self,
+        resolve_length: &dyn Fn(ObjectId) -> Option<usize>,
+    ) -> Result<(ObjectId, Object), PdfError> {
+        self.parse_indirect_object_impl(Some(resolve_length))
+    }
+
+    fn parse_indirect_object_impl(
+        &mut self,
+        resolve_length: Option<&dyn Fn(ObjectId) -> Option<usize>>,
+    ) -> Result<(ObjectId, Object), PdfError> {
         self.skip_ws_and_comments();
         // skip_ws_and_comments stops at `bytes.len()`, but `with_pos` lets
         // callers seed pos to something larger — guard the slice arithmetic.
@@ -448,23 +477,35 @@ impl<'a> Parser<'a> {
                 Some(&b'\n') => self.pos += 1,
                 _ => {}
             }
-            let length = stream_length(&dict)?;
-            let (content_start, content_len) = if let Some(len) = length {
-                if len > self.bytes.len().saturating_sub(self.pos) {
-                    return Err(PdfError::BadObject("stream truncated".into()));
+            let (content_start, content_len) = match stream_length(&dict, resolve_length)? {
+                StreamLength::Direct(len) => {
+                    if len > self.bytes.len().saturating_sub(self.pos) {
+                        return Err(PdfError::BadObject("stream truncated".into()));
+                    }
+                    let start = self.pos;
+                    self.pos += len;
+                    (start, len)
                 }
-                let start = self.pos;
-                let end = self.pos + len;
-                self.pos = end;
-                (start, len)
-            } else {
+                // A resolved length lives in a separate object that an
+                // incremental update can leave stale, so take it only when
+                // `endstream` lands where it claims. Otherwise scanning is
+                // the better guess, as it was before the length was
+                // resolvable at all.
+                StreamLength::Resolved(len) if self.endstream_at(self.pos.saturating_add(len)) => {
+                    let start = self.pos;
+                    self.pos += len;
+                    (start, len)
+                }
                 // /Length is an indirect reference we can't resolve at this
-                // layer. Scan forward for the matching `endstream`.
-                let end = find_endstream(&self.bytes[self.pos..])
-                    .ok_or_else(|| PdfError::BadObject("missing endstream".into()))?;
-                let start = self.pos;
-                self.pos += end;
-                (start, end)
+                // layer, or resolved to a value that doesn't hold up. Scan
+                // forward for the matching `endstream`.
+                _ => {
+                    let end = find_endstream(&self.bytes[self.pos..])
+                        .ok_or_else(|| PdfError::BadObject("missing endstream".into()))?;
+                    let start = self.pos;
+                    self.pos += end;
+                    (start, end)
+                }
             };
             self.skip_ws_and_comments();
             if self.starts_with(b"endstream") {
@@ -482,11 +523,27 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Look up `/Length` in a stream dict if it's a direct integer.
-fn stream_length(dict: &Dictionary) -> Result<Option<usize>, PdfError> {
+/// A stream's `/Length`, tagged with how much the parser can trust it.
+enum StreamLength {
+    /// Written in the stream's own dictionary.
+    Direct(usize),
+    /// Read out of a separate object, which may be stale.
+    Resolved(usize),
+    /// Absent, unresolvable, or not an integer.
+    Unknown,
+}
+
+/// Look up `/Length` directly or through the caller's object resolver.
+fn stream_length(
+    dict: &Dictionary,
+    resolve_length: Option<&dyn Fn(ObjectId) -> Option<usize>>,
+) -> Result<StreamLength, PdfError> {
     match dict.get(b"Length") {
-        Some(Object::Integer(n)) if *n >= 0 => Ok(Some(*n as usize)),
-        Some(_) => Ok(None), // indirect; caller falls back to scanning
+        Some(Object::Integer(n)) if *n >= 0 => Ok(StreamLength::Direct(*n as usize)),
+        Some(Object::Reference(id)) => Ok(resolve_length
+            .and_then(|resolve| resolve(*id))
+            .map_or(StreamLength::Unknown, StreamLength::Resolved)),
+        Some(_) => Ok(StreamLength::Unknown), // Caller falls back to scanning.
         None => Err(PdfError::BadObject("stream missing /Length".into())),
     }
 }
@@ -800,6 +857,75 @@ endobj
         let (id, obj) = p.parse_indirect_object().unwrap();
         assert_eq!(id, ObjectId(2, 0));
         assert_eq!(obj.as_stream().unwrap().content(bytes), b"the body");
+    }
+
+    #[test]
+    fn resolved_indirect_length_preserves_terminal_cr_data_byte() {
+        // The four bytes of stream data end in CR; the following LF is the
+        // end-of-line delimiter before `endstream`. Syntax scanning alone
+        // cannot distinguish this from a CRLF delimiter after three bytes.
+        let bytes = b"\
+2 0 obj
+<< /Length 99 0 R >>
+stream
+ABC\r
+endstream
+endobj
+99 0 obj
+4
+endobj
+";
+        let mut p = Parser::new(bytes);
+        let resolve = |id| (id == ObjectId(99, 0)).then_some(4);
+        let (_, obj) = p
+            .parse_indirect_object_with_length_resolver(&resolve)
+            .unwrap();
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"ABC\r");
+    }
+
+    #[test]
+    fn resolved_indirect_length_handles_all_endstream_delimiters_exactly() {
+        for delimiter in [&b"\n"[..], &b"\r"[..], &b"\r\n"[..]] {
+            let mut bytes = Vec::from(&b"2 0 obj <</Length 99 0 R>>\nstream\nABC"[..]);
+            bytes.extend_from_slice(delimiter);
+            bytes.extend_from_slice(b"endstream endobj");
+
+            let mut p = Parser::new(&bytes);
+            let resolve = |id| (id == ObjectId(99, 0)).then_some(3);
+            let (_, obj) = p
+                .parse_indirect_object_with_length_resolver(&resolve)
+                .unwrap();
+            assert_eq!(obj.as_stream().unwrap().content(&bytes), b"ABC");
+        }
+    }
+
+    #[test]
+    fn stale_resolved_length_falls_back_to_endstream_scan() {
+        // An incremental update can rewrite the stream and leave the length
+        // object behind. Both a short and an over-long value must still
+        // recover the body instead of emptying or rejecting the stream.
+        for stale in [0, 3, 99_999, usize::MAX] {
+            let bytes = b"2 0 obj <</Length 99 0 R>>\nstream\nthe body\nendstream endobj";
+            let mut p = Parser::new(bytes);
+            let resolve = |id| (id == ObjectId(99, 0)).then_some(stale);
+            let (_, obj) = p
+                .parse_indirect_object_with_length_resolver(&resolve)
+                .unwrap();
+            assert_eq!(obj.as_stream().unwrap().content(bytes), b"the body");
+        }
+    }
+
+    #[test]
+    fn resolved_length_accepts_padding_before_endstream() {
+        // Writers pad the gap before `endstream`; the keyword only has to be
+        // the next non-whitespace token for the length to be trustworthy.
+        let bytes = b"2 0 obj <</Length 99 0 R>>\nstream\nABC \t\r\n endstream endobj";
+        let mut p = Parser::new(bytes);
+        let resolve = |id| (id == ObjectId(99, 0)).then_some(3);
+        let (_, obj) = p
+            .parse_indirect_object_with_length_resolver(&resolve)
+            .unwrap();
+        assert_eq!(obj.as_stream().unwrap().content(bytes), b"ABC");
     }
 
     #[test]

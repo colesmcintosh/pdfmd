@@ -15,12 +15,29 @@ use std::collections::HashMap;
 use crate::pdf::{Dictionary, Object, ObjectId};
 
 use super::font::PdfFont;
+#[cfg(test)]
 use super::image::PageImages;
 use super::parser::{Parser, Token};
+use super::FormXObject;
 
 /// Map from a page's font-resource name (e.g. `b"F1"`) to a borrowed handle
 /// on the parsed font in the document-wide cache.
 pub type PageFonts<'a> = HashMap<Vec<u8>, &'a PdfFont>;
+
+/// Extracted image filename keyed by the image XObject's object ID. Resource
+/// names remain context-local and resolve through `ContentResources` first.
+pub(super) type ImageFilenames<'a> = HashMap<ObjectId, &'a str>;
+
+struct ContentResources<'a, 'fonts> {
+    fonts: &'a PageFonts<'fonts>,
+    xobjects: &'a HashMap<Vec<u8>, ObjectId>,
+}
+
+struct FormContext<'a, 'fonts> {
+    forms: &'a HashMap<ObjectId, FormXObject>,
+    fonts: &'a HashMap<ObjectId, PageFonts<'fonts>>,
+    images: &'a ImageFilenames<'a>,
+}
 
 /// Sentinel that wraps image-reference filenames in the extracted text.
 /// The markdown layer rewrites `\u{0001}NAME\u{0001}` into `![](DIR/NAME)`.
@@ -31,6 +48,102 @@ pub const IMAGE_MARK: char = '\u{0001}';
 /// rather than a word-break. PDF expresses these values in thousandths of
 /// the current text-space unit, so 100 ≈ a tenth of an em.
 const TJ_SPACE_THRESHOLD: f32 = 100.0;
+
+/// Bound recursive Form XObject invocation independently of the resource
+/// graph pre-pass. Real documents rarely nest forms more than a few levels;
+/// this cap keeps adversarial acyclic chains from exhausting the stack.
+const MAX_FORM_DEPTH: usize = 32;
+
+/// Page-local limits keep a branching Form graph from multiplying a small
+/// resource set into unbounded work or output.
+const MAX_FORM_INVOCATIONS_PER_PAGE: usize = 16_384;
+const MAX_FORM_INPUT_BYTES_PER_PAGE: usize = 64 * 1024 * 1024;
+const MAX_FORM_OUTPUT_BYTES_PER_PAGE: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct FormExecutionLimits {
+    invocations: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+}
+
+const FORM_EXECUTION_LIMITS: FormExecutionLimits = FormExecutionLimits {
+    invocations: MAX_FORM_INVOCATIONS_PER_PAGE,
+    input_bytes: MAX_FORM_INPUT_BYTES_PER_PAGE,
+    output_bytes: MAX_FORM_OUTPUT_BYTES_PER_PAGE,
+};
+
+struct FormBudget {
+    limits: FormExecutionLimits,
+    invocations: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+}
+
+impl FormBudget {
+    fn new(limits: FormExecutionLimits) -> Self {
+        Self {
+            limits,
+            invocations: 0,
+            input_bytes: 0,
+            output_bytes: 0,
+        }
+    }
+
+    fn output_exhausted(&self) -> bool {
+        self.output_bytes >= self.limits.output_bytes
+    }
+
+    fn output_remaining(&self) -> usize {
+        self.limits.output_bytes.saturating_sub(self.output_bytes)
+    }
+
+    fn charge_output(&mut self, out: &mut String, added: usize) {
+        let remaining = self.limits.output_bytes.saturating_sub(self.output_bytes);
+        if added <= remaining {
+            self.output_bytes += added;
+            return;
+        }
+
+        let mut new_len = out.len().saturating_sub(added - remaining);
+        while new_len > 0 && !out.is_char_boundary(new_len) {
+            new_len -= 1;
+        }
+        out.truncate(new_len);
+        self.output_bytes = self.limits.output_bytes;
+    }
+}
+
+struct ActiveForm {
+    id: ObjectId,
+    /// Bytes below this point belong to the caller and must remain untouched.
+    output_floor: usize,
+}
+
+struct FormExecution {
+    active: Vec<ActiveForm>,
+    budget: FormBudget,
+}
+
+impl FormExecution {
+    fn new(limits: FormExecutionLimits) -> Self {
+        Self {
+            active: Vec::new(),
+            budget: FormBudget::new(limits),
+        }
+    }
+
+    fn output_floor(&self) -> usize {
+        self.active
+            .last()
+            .map(|form| form.output_floor)
+            .unwrap_or(0)
+    }
+
+    fn contains(&self, id: ObjectId) -> bool {
+        self.active.iter().any(|form| form.id == id)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Matrix {
@@ -59,6 +172,16 @@ impl Matrix {
         self.e += tx * self.a + ty * self.c;
         self.f += tx * self.b + ty * self.d;
     }
+}
+
+fn text_direction_changed(previous: Matrix, next: Matrix) -> bool {
+    let previous_length = previous.a.hypot(previous.b);
+    let next_length = next.a.hypot(next.b);
+    if previous_length <= f32::EPSILON || next_length <= f32::EPSILON {
+        return false;
+    }
+    let dot = previous.a * next.a + previous.b * next.b;
+    dot < previous_length * next_length * 0.99
 }
 
 /// Operand stack for a single content-stream operator. PDF operators take at
@@ -102,20 +225,99 @@ enum ArrayItem<'a> {
 
 /// Extract the page's text. Newlines mark new lines; pages are returned as
 /// independent strings so the caller can splice page breaks between them.
+#[cfg(test)]
 pub fn extract_page_text(
     content_bytes: &[u8],
     fonts: &PageFonts<'_>,
     images: &PageImages<'_>,
 ) -> String {
-    let mut state: TextState<'_> = TextState::default();
+    let mut xobjects = HashMap::new();
+    let mut image_filenames = ImageFilenames::new();
+    let mut next_object_number = 1u32;
+    for (name, &filename) in images {
+        let id = ObjectId(next_object_number, 0);
+        next_object_number = next_object_number.saturating_add(1);
+        xobjects.insert(name.clone(), id);
+        image_filenames.insert(id, filename);
+    }
+    let forms = HashMap::new();
+    let form_fonts = HashMap::new();
+    extract_page_text_with_forms(
+        content_bytes,
+        fonts,
+        &xobjects,
+        &forms,
+        &form_fonts,
+        &image_filenames,
+    )
+}
+
+/// Extract page text while resolving Form XObjects at each `Do` paint.
+pub(super) fn extract_page_text_with_forms<'fonts>(
+    content_bytes: &[u8],
+    fonts: &PageFonts<'fonts>,
+    xobjects: &HashMap<Vec<u8>, ObjectId>,
+    forms: &HashMap<ObjectId, FormXObject>,
+    form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
+    image_filenames: &ImageFilenames<'_>,
+) -> String {
+    extract_page_text_with_form_limits(
+        content_bytes,
+        fonts,
+        xobjects,
+        forms,
+        form_fonts,
+        image_filenames,
+        FORM_EXECUTION_LIMITS,
+    )
+}
+
+fn extract_page_text_with_form_limits<'fonts>(
+    content_bytes: &[u8],
+    fonts: &PageFonts<'fonts>,
+    xobjects: &HashMap<Vec<u8>, ObjectId>,
+    forms: &HashMap<ObjectId, FormXObject>,
+    form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
+    image_filenames: &ImageFilenames<'_>,
+    limits: FormExecutionLimits,
+) -> String {
     // PDFs almost always emit more bytes than the content stream; preallocate
     // a generous chunk so the inner push loop avoids early growth.
     let mut out = String::with_capacity(content_bytes.len());
+    let resources = ContentResources { fonts, xobjects };
+    let form_context = FormContext {
+        forms,
+        fonts: form_fonts,
+        images: image_filenames,
+    };
+    let mut state = TextState::default();
+    let mut form_execution = FormExecution::new(limits);
+    extract_content_into(
+        content_bytes,
+        &resources,
+        &form_context,
+        &mut state,
+        &mut form_execution,
+        &mut out,
+    );
+    out
+}
 
+fn extract_content_into<'fonts>(
+    content_bytes: &[u8],
+    resources: &ContentResources<'_, 'fonts>,
+    form_context: &FormContext<'_, 'fonts>,
+    state: &mut TextState<'fonts>,
+    form_execution: &mut FormExecution,
+    out: &mut String,
+) {
     let mut parser = Parser::new(content_bytes);
     let mut ops: Operands<'_> = Operands::default();
 
     loop {
+        if !form_execution.active.is_empty() && form_execution.budget.output_exhausted() {
+            break;
+        }
         match parser.next_token() {
             Token::Eof => break,
             Token::Num(n) => ops.push_num(n),
@@ -136,7 +338,28 @@ pub fn extract_page_text(
             // A stray `]` outside an array isn't meaningful; ignore.
             Token::ArrayEnd => {}
             Token::Op(op) => {
-                dispatch(op, &ops, &mut state, fonts, images, &mut out);
+                let charge_output = !form_execution.active.is_empty();
+                let output_start = out.len();
+                let charged_start = form_execution.budget.output_bytes;
+                dispatch(
+                    op,
+                    &ops,
+                    state,
+                    resources,
+                    form_context,
+                    form_execution,
+                    out,
+                );
+                if charge_output {
+                    let added = out.len().saturating_sub(output_start);
+                    let nested_charge = form_execution
+                        .budget
+                        .output_bytes
+                        .saturating_sub(charged_start);
+                    form_execution
+                        .budget
+                        .charge_output(out, added.saturating_sub(nested_charge));
+                }
                 if op == b"BI" {
                     // Inline image dictionary follows; consume name/value
                     // pairs until we see `ID`, then skip the raw bytes.
@@ -146,8 +369,6 @@ pub fn extract_page_text(
             }
         }
     }
-
-    out
 }
 
 fn skip_inline_image(parser: &mut Parser<'_>) {
@@ -176,18 +397,31 @@ struct TextState<'a> {
     last_y: Option<f32>,
     last_x: Option<f32>,
     pending_space: bool,
+    pending_form_word_boundary: bool,
     /// Exponential moving average of the vertical distance between
     /// consecutive lines on this page. Used to tell a normal line wrap
     /// (≈ this value) from a paragraph break (significantly more).
     typical_line_height: Option<f32>,
 }
 
-fn dispatch<'a>(
+impl<'a> TextState<'a> {
+    fn inherited_for_form(caller: &Self) -> Self {
+        Self {
+            font: caller.font,
+            font_size: caller.font_size,
+            leading: caller.leading,
+            ..Self::default()
+        }
+    }
+}
+
+fn dispatch<'ops, 'fonts>(
     op: &[u8],
-    ops: &Operands<'a>,
-    state: &mut TextState<'a>,
-    fonts: &PageFonts<'a>,
-    images: &PageImages<'_>,
+    ops: &Operands<'ops>,
+    state: &mut TextState<'fonts>,
+    resources: &ContentResources<'_, 'fonts>,
+    form_context: &FormContext<'_, 'fonts>,
+    form_execution: &mut FormExecution,
     out: &mut String,
 ) {
     match op {
@@ -201,7 +435,7 @@ fn dispatch<'a>(
         }
         b"Tf" => {
             if let (Some(name), [size, ..]) = (ops.name, ops.nums()) {
-                state.font = fonts.get(name).copied();
+                state.font = resources.fonts.get(name).copied();
                 state.font_size = *size;
             }
         }
@@ -220,9 +454,16 @@ fn dispatch<'a>(
                     e: *e,
                     f: *f,
                 };
+                let direction_changed = state
+                    .line_matrix
+                    .map(|previous| text_direction_changed(previous, m))
+                    .unwrap_or(false);
                 state.text_matrix = Some(m);
                 state.line_matrix = Some(m);
-                position_changed(state, m.e, m.f, out);
+                position_changed(state, m.e, m.f, form_execution.output_floor(), out);
+                if direction_changed {
+                    state.pending_space = true;
+                }
             }
         }
         b"Td" | b"TD" => {
@@ -235,7 +476,13 @@ fn dispatch<'a>(
                     line.translate(tx, ty);
                     let new_line = *line;
                     state.text_matrix = Some(new_line);
-                    position_changed(state, new_line.e, new_line.f, out);
+                    position_changed(
+                        state,
+                        new_line.e,
+                        new_line.f,
+                        form_execution.output_floor(),
+                        out,
+                    );
                 }
             }
         }
@@ -244,7 +491,13 @@ fn dispatch<'a>(
                 line.translate(0.0, -state.leading);
                 let new_line = *line;
                 state.text_matrix = Some(new_line);
-                position_changed(state, new_line.e, new_line.f, out);
+                position_changed(
+                    state,
+                    new_line.e,
+                    new_line.f,
+                    form_execution.output_floor(),
+                    out,
+                );
             }
         }
         b"Tj" => {
@@ -257,7 +510,13 @@ fn dispatch<'a>(
                 line.translate(0.0, -state.leading);
                 let new_line = *line;
                 state.text_matrix = Some(new_line);
-                position_changed(state, new_line.e, new_line.f, out);
+                position_changed(
+                    state,
+                    new_line.e,
+                    new_line.f,
+                    form_execution.output_floor(),
+                    out,
+                );
             }
             if let Some(s) = ops.string.as_deref() {
                 emit(state, s, out);
@@ -268,24 +527,49 @@ fn dispatch<'a>(
                 line.translate(0.0, -state.leading);
                 let new_line = *line;
                 state.text_matrix = Some(new_line);
-                position_changed(state, new_line.e, new_line.f, out);
+                position_changed(
+                    state,
+                    new_line.e,
+                    new_line.f,
+                    form_execution.output_floor(),
+                    out,
+                );
             }
             if let Some(s) = ops.string.as_deref() {
                 emit(state, s, out);
             }
         }
         b"Do" => {
-            // Paint an XObject by its resource name. We only care about
-            // image XObjects we previously chose to extract; everything
-            // else (Form XObjects, unsupported filters) is invisible here.
             if let Some(name) = ops.name {
-                if let Some(filename) = images.get(name) {
-                    state.pending_space = false;
-                    ensure_trailing_breaks(out, 2);
-                    out.push(IMAGE_MARK);
-                    out.push_str(filename);
-                    out.push(IMAGE_MARK);
-                    out.push_str("\n\n");
+                if let Some(id) = resources.xobjects.get(name).copied() {
+                    if let Some(filename) = form_context.images.get(&id) {
+                        if emit_image_marker(filename, form_execution, out) {
+                            state.pending_space = false;
+                            state.pending_form_word_boundary = false;
+                        }
+                        return;
+                    }
+                    let start = out.len();
+                    if emit_form(id, state, resources, form_context, form_execution, out) {
+                        let previous = out[..start].chars().next_back();
+                        let first = out[start..].chars().next();
+                        let adjacent_words = previous
+                            .zip(first)
+                            .map(|(left, right)| left.is_alphanumeric() && right.is_alphanumeric())
+                            .unwrap_or(false);
+                        let boundary_is_tight =
+                            previous.map(|ch| !ch.is_whitespace()).unwrap_or(false)
+                                && first.map(|ch| !ch.is_whitespace()).unwrap_or(false);
+                        if boundary_is_tight && (state.pending_space || adjacent_words) {
+                            out.insert(start, ' ');
+                        }
+                        state.pending_space = false;
+                        state.pending_form_word_boundary = out
+                            .chars()
+                            .next_back()
+                            .map(|ch| ch.is_alphanumeric())
+                            .unwrap_or(false);
+                    }
                 }
             }
         }
@@ -310,6 +594,101 @@ fn dispatch<'a>(
     }
 }
 
+fn emit_image_marker(filename: &str, form_execution: &FormExecution, out: &mut String) -> bool {
+    let output_floor = form_execution.output_floor().min(out.len());
+    if !form_execution.active.is_empty() {
+        // The generic output limiter may truncate an individual operator's
+        // addition. Preflight the exact growth so an image sentinel pair is
+        // either emitted whole or not emitted at all.
+        let (removable_breaks, missing_breaks) = trailing_break_adjustment(out, 2, output_floor);
+        let marker_len = IMAGE_MARK.len_utf8() * 2;
+        let Some(final_len) = out
+            .len()
+            .checked_sub(removable_breaks)
+            .and_then(|len| len.checked_add(missing_breaks))
+            .and_then(|len| len.checked_add(marker_len))
+            .and_then(|len| len.checked_add(filename.len()))
+            .and_then(|len| len.checked_add(2))
+        else {
+            return false;
+        };
+        let added = final_len.saturating_sub(out.len());
+        if added > form_execution.budget.output_remaining() {
+            return false;
+        }
+    }
+
+    ensure_trailing_breaks(out, 2, output_floor);
+    out.push(IMAGE_MARK);
+    out.push_str(filename);
+    out.push(IMAGE_MARK);
+    out.push_str("\n\n");
+    true
+}
+
+fn emit_form<'fonts>(
+    id: ObjectId,
+    caller_state: &TextState<'fonts>,
+    caller_resources: &ContentResources<'_, 'fonts>,
+    form_context: &FormContext<'_, 'fonts>,
+    form_execution: &mut FormExecution,
+    out: &mut String,
+) -> bool {
+    if form_execution.active.len() >= MAX_FORM_DEPTH
+        || form_execution.contains(id)
+        || form_execution.budget.invocations >= form_execution.budget.limits.invocations
+        || form_execution.budget.output_exhausted()
+    {
+        return false;
+    }
+    let Some(form) = form_context.forms.get(&id) else {
+        return false;
+    };
+    if form.content.len()
+        > form_execution
+            .budget
+            .limits
+            .input_bytes
+            .saturating_sub(form_execution.budget.input_bytes)
+    {
+        return false;
+    }
+
+    let start = out.len();
+    form_execution.budget.invocations += 1;
+    form_execution.budget.input_bytes += form.content.len();
+    let mut state = TextState::inherited_for_form(caller_state);
+    form_execution.active.push(ActiveForm {
+        id,
+        output_floor: start,
+    });
+    if let (Some(fonts), Some(xobjects)) = (form_context.fonts.get(&id), form.xobject_refs.as_ref())
+    {
+        let resources = ContentResources { fonts, xobjects };
+        extract_content_into(
+            &form.content,
+            &resources,
+            form_context,
+            &mut state,
+            form_execution,
+            out,
+        );
+    } else {
+        extract_content_into(
+            &form.content,
+            caller_resources,
+            form_context,
+            &mut state,
+            form_execution,
+            out,
+        );
+    }
+    form_execution.active.pop();
+    out.get(start..)
+        .map(|text| text.chars().any(|ch| !ch.is_whitespace()))
+        .unwrap_or(false)
+}
+
 fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
     let Some(font) = state.font else { return };
 
@@ -322,7 +701,9 @@ fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
             true
         };
     let was_pending = state.pending_space;
+    let was_form_boundary_pending = state.pending_form_word_boundary;
     state.pending_space = false;
+    state.pending_form_word_boundary = false;
     let start = out.len();
     font.decode_into(bytes, out);
     if out.len() == start {
@@ -330,6 +711,21 @@ fn emit(state: &mut TextState<'_>, bytes: &[u8], out: &mut String) {
             out.pop();
         }
         state.pending_space = was_pending;
+        state.pending_form_word_boundary = was_form_boundary_pending;
+    } else if was_form_boundary_pending && !added_space {
+        let previous_is_word = out[..start]
+            .chars()
+            .next_back()
+            .map(|ch| ch.is_alphanumeric())
+            .unwrap_or(false);
+        let first_is_word = out[start..]
+            .chars()
+            .next()
+            .map(|ch| ch.is_alphanumeric())
+            .unwrap_or(false);
+        if previous_is_word && first_is_word {
+            out.insert(start, ' ');
+        }
     }
 }
 
@@ -342,7 +738,13 @@ fn ends_with_ascii_whitespace(out: &str) -> bool {
 /// `\n\n` for what looks like a paragraph break); a horizontal change
 /// defers a space until the next glyph is drawn so trailing position-only
 /// operators don't dump stray whitespace.
-fn position_changed(state: &mut TextState<'_>, new_x: f32, new_y: f32, out: &mut String) {
+fn position_changed(
+    state: &mut TextState<'_>,
+    new_x: f32,
+    new_y: f32,
+    output_floor: usize,
+    out: &mut String,
+) {
     if !state.in_text_object {
         state.last_x = Some(new_x);
         state.last_y = Some(new_y);
@@ -350,19 +752,29 @@ fn position_changed(state: &mut TextState<'_>, new_x: f32, new_y: f32, out: &mut
     }
     let prev_y = state.last_y.unwrap_or(new_y);
     let dy = (new_y - prev_y).abs();
-    let line_threshold = state.font_size.max(1.0) * 0.4;
+    // Some producers set `Tf` to 1 and put the visible point size in `Tm`.
+    // Measure the transformed text basis so those normal advances are not
+    // mistaken for paragraph-sized jumps or word breaks.
+    let (horizontal_scale, vertical_scale) = state
+        .line_matrix
+        .map(|m| (m.a.hypot(m.b), m.c.hypot(m.d)))
+        .unwrap_or((1.0, 1.0));
+    let font_size = state.font_size.abs();
+    let effective_font_size = (font_size * vertical_scale).max(1.0);
+    let line_threshold = effective_font_size * 0.4;
     if dy > line_threshold {
         // Paragraph break: either we've established a typical line height
         // for this page and this jump is much larger, OR the vertical
         // distance is more than two font sizes (e.g. column reset).
         let is_paragraph = match state.typical_line_height {
             Some(typical) => dy > typical * 1.5,
-            None => dy > state.font_size.max(1.0) * 2.0,
+            None => dy > effective_font_size * 2.0,
         };
         if !out.is_empty() {
-            ensure_trailing_breaks(out, if is_paragraph { 2 } else { 1 });
+            ensure_trailing_breaks(out, if is_paragraph { 2 } else { 1 }, output_floor);
         }
         state.pending_space = false;
+        state.pending_form_word_boundary = false;
         // Train the EMA on line-height-sized jumps only; column/section
         // resets would otherwise blow the running average.
         if !is_paragraph {
@@ -376,7 +788,7 @@ fn position_changed(state: &mut TextState<'_>, new_x: f32, new_y: f32, out: &mut
         let dx = new_x - prev_x;
         // A forward horizontal jump of more than ~20% of an em is too wide
         // to be intra-glyph kerning; treat it as a deferred word break.
-        if dx > state.font_size.max(1.0) * 0.2 {
+        if dx > (font_size * horizontal_scale).max(1.0) * 0.2 {
             state.pending_space = true;
         }
     }
@@ -384,15 +796,31 @@ fn position_changed(state: &mut TextState<'_>, new_x: f32, new_y: f32, out: &mut
     state.last_y = Some(new_y);
 }
 
-/// Ensure `out` ends with exactly `count` newline characters (collapsing
-/// any existing trailing newlines first).
-fn ensure_trailing_breaks(out: &mut String, count: usize) {
-    while out.ends_with('\n') {
-        out.pop();
-    }
-    for _ in 0..count {
+/// Normalize Form-owned trailing newlines, then ensure the suffix has at
+/// least `count` without modifying caller-owned bytes below `output_floor`.
+fn ensure_trailing_breaks(out: &mut String, count: usize, output_floor: usize) {
+    let (removable, missing) = trailing_break_adjustment(out, count, output_floor);
+    out.truncate(out.len() - removable);
+    for _ in 0..missing {
         out.push('\n');
     }
+}
+
+fn trailing_break_adjustment(out: &str, count: usize, output_floor: usize) -> (usize, usize) {
+    let output_floor = output_floor.min(out.len());
+    let removable = out.as_bytes()[output_floor..]
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\n')
+        .count();
+    let normalized_len = out.len() - removable;
+    let existing = out.as_bytes()[..normalized_len]
+        .iter()
+        .rev()
+        .take(count)
+        .take_while(|&&byte| byte == b'\n')
+        .count();
+    (removable, count - existing)
 }
 
 /// Map a page's `/Resources/Font` entries to their font object IDs without
@@ -430,6 +858,14 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(b"F1".to_vec(), font);
         m
+    }
+
+    fn form(content: &[u8]) -> FormXObject {
+        FormXObject {
+            content: content.to_vec(),
+            font_refs: None,
+            xobject_refs: None,
+        }
     }
 
     #[test]
@@ -527,14 +963,279 @@ ET
     }
 
     #[test]
+    fn form_word_boundary_waits_for_the_next_decoded_character() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let id = ObjectId(1, 0);
+        let xobjects = HashMap::from([(b"Fm".to_vec(), id)]);
+        let forms = HashMap::from([(id, form(b"BT /F1 12 Tf (word) Tj ET"))]);
+        let form_fonts = HashMap::new();
+        let image_filenames = ImageFilenames::new();
+
+        let punctuation = extract_page_text_with_forms(
+            b"/Fm Do BT /F1 12 Tf (!) Tj ET",
+            &fonts,
+            &xobjects,
+            &forms,
+            &form_fonts,
+            &image_filenames,
+        );
+        assert_eq!(punctuation, "word!");
+
+        let alphanumeric = extract_page_text_with_forms(
+            b"/Fm Do BT /F1 12 Tf (\x01) Tj (next) Tj ET",
+            &fonts,
+            &xobjects,
+            &forms,
+            &form_fonts,
+            &image_filenames,
+        );
+        assert_eq!(alphanumeric, "word next");
+    }
+
+    #[test]
+    fn form_execution_budgets_bound_branching_and_output() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let root = ObjectId(1, 0);
+        let branch = ObjectId(2, 0);
+        let leaf = ObjectId(3, 0);
+        let xobjects = HashMap::from([
+            (b"Root".to_vec(), root),
+            (b"Branch".to_vec(), branch),
+            (b"Leaf".to_vec(), leaf),
+        ]);
+        let forms = HashMap::from([
+            (root, form(b"/Branch Do /Branch Do")),
+            (branch, form(b"/Leaf Do /Leaf Do")),
+            (leaf, form(b"BT /F1 12 Tf (x) Tj ET")),
+        ]);
+        let form_fonts = HashMap::new();
+        let image_filenames = ImageFilenames::new();
+
+        let invocation_limited = extract_page_text_with_form_limits(
+            b"/Root Do",
+            &fonts,
+            &xobjects,
+            &forms,
+            &form_fonts,
+            &image_filenames,
+            FormExecutionLimits {
+                invocations: 4,
+                input_bytes: usize::MAX,
+                output_bytes: usize::MAX,
+            },
+        );
+        assert_eq!(invocation_limited, "x x");
+
+        let output_forms = HashMap::from([(leaf, form(b"BT /F1 12 Tf (abcdef) Tj ET"))]);
+        let output_limited = extract_page_text_with_form_limits(
+            b"/Leaf Do /Leaf Do",
+            &fonts,
+            &xobjects,
+            &output_forms,
+            &form_fonts,
+            &image_filenames,
+            FormExecutionLimits {
+                invocations: usize::MAX,
+                input_bytes: usize::MAX,
+                output_bytes: 3,
+            },
+        );
+        assert_eq!(output_limited, "abc");
+
+        let silent = ObjectId(4, 0);
+        let marker = ObjectId(5, 0);
+        let input_xobjects = HashMap::from([
+            (b"Root".to_vec(), root),
+            (b"Silent".to_vec(), silent),
+            (b"Marker".to_vec(), marker),
+        ]);
+        let root_content = b"/Silent Do /Silent Do /Marker Do";
+        let silent_content = b"q Q";
+        let input_forms = HashMap::from([
+            (root, form(root_content)),
+            (silent, form(silent_content)),
+            (marker, form(b"BT /F1 12 Tf (x) Tj ET")),
+        ]);
+        let input_limited = extract_page_text_with_form_limits(
+            b"/Root Do",
+            &fonts,
+            &input_xobjects,
+            &input_forms,
+            &form_fonts,
+            &image_filenames,
+            FormExecutionLimits {
+                invocations: usize::MAX,
+                input_bytes: root_content.len() + silent_content.len() * 2,
+                output_bytes: usize::MAX,
+            },
+        );
+        assert!(input_limited.is_empty());
+    }
+
+    #[test]
+    fn form_image_preserves_caller_breaks_at_its_output_floor() {
+        let form_id = ObjectId(1, 0);
+        let image_id = ObjectId(2, 0);
+        let fonts: PageFonts<'_> = HashMap::new();
+        let xobjects = HashMap::from([(b"Fm".to_vec(), form_id)]);
+        let local_xobjects = HashMap::from([(b"Im".to_vec(), image_id)]);
+        let forms = HashMap::from([(
+            form_id,
+            FormXObject {
+                content: b"/Im Do".to_vec(),
+                font_refs: Some(HashMap::new()),
+                xobject_refs: Some(local_xobjects),
+            },
+        )]);
+        let form_fonts = HashMap::from([(form_id, PageFonts::new())]);
+        let image_filenames = HashMap::from([(image_id, "img-001.jpg")]);
+        let resources = ContentResources {
+            fonts: &fonts,
+            xobjects: &xobjects,
+        };
+        let form_context = FormContext {
+            forms: &forms,
+            fonts: &form_fonts,
+            images: &image_filenames,
+        };
+        let mut state = TextState {
+            pending_space: true,
+            ..TextState::default()
+        };
+        let marker = format!("{mark}img-001.jpg{mark}\n\n", mark = IMAGE_MARK);
+        let mut form_execution = FormExecution::new(FormExecutionLimits {
+            invocations: usize::MAX,
+            input_bytes: usize::MAX,
+            output_bytes: marker.len(),
+        });
+        let mut out = String::from("caller\n\n\n");
+
+        extract_content_into(
+            b"/Fm Do",
+            &resources,
+            &form_context,
+            &mut state,
+            &mut form_execution,
+            &mut out,
+        );
+
+        assert_eq!(out, format!("caller\n\n\n{marker}"));
+        assert!(!state.pending_space);
+        assert!(!state.pending_form_word_boundary);
+    }
+
+    #[test]
+    fn form_image_marker_is_atomic_at_the_output_budget() {
+        let form_id = ObjectId(1, 0);
+        let image_id = ObjectId(2, 0);
+        let fonts: PageFonts<'_> = HashMap::new();
+        let xobjects = HashMap::from([(b"Fm".to_vec(), form_id)]);
+        let forms = HashMap::from([(
+            form_id,
+            FormXObject {
+                content: b"/Im Do".to_vec(),
+                font_refs: Some(HashMap::new()),
+                xobject_refs: Some(HashMap::from([(b"Im".to_vec(), image_id)])),
+            },
+        )]);
+        let form_fonts = HashMap::from([(form_id, PageFonts::new())]);
+        let image_filenames = HashMap::from([(image_id, "img-001.jpg")]);
+        let complete = format!("\n\n{mark}img-001.jpg{mark}\n\n", mark = IMAGE_MARK);
+
+        let too_small = extract_page_text_with_form_limits(
+            b"/Fm Do",
+            &fonts,
+            &xobjects,
+            &forms,
+            &form_fonts,
+            &image_filenames,
+            FormExecutionLimits {
+                invocations: usize::MAX,
+                input_bytes: usize::MAX,
+                output_bytes: complete.len() - 1,
+            },
+        );
+        assert!(too_small.is_empty());
+
+        let exact = extract_page_text_with_form_limits(
+            b"/Fm Do",
+            &fonts,
+            &xobjects,
+            &forms,
+            &form_fonts,
+            &image_filenames,
+            FormExecutionLimits {
+                invocations: usize::MAX,
+                input_bytes: usize::MAX,
+                output_bytes: complete.len(),
+            },
+        );
+        assert_eq!(exact, complete);
+
+        let image_xobjects = HashMap::from([(b"Im".to_vec(), image_id)]);
+        let resources = ContentResources {
+            fonts: &fonts,
+            xobjects: &image_xobjects,
+        };
+        let form_context = FormContext {
+            forms: &forms,
+            fonts: &form_fonts,
+            images: &image_filenames,
+        };
+        let mut state = TextState {
+            pending_space: true,
+            pending_form_word_boundary: true,
+            ..TextState::default()
+        };
+        let mut form_execution = FormExecution::new(FormExecutionLimits {
+            invocations: usize::MAX,
+            input_bytes: usize::MAX,
+            output_bytes: complete.len() - 1,
+        });
+        form_execution.active.push(ActiveForm {
+            id: form_id,
+            output_floor: 0,
+        });
+        let mut out = String::new();
+        extract_content_into(
+            b"/Im Do",
+            &resources,
+            &form_context,
+            &mut state,
+            &mut form_execution,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(state.pending_space);
+        assert!(state.pending_form_word_boundary);
+    }
+
+    #[test]
     fn ensure_trailing_breaks_collapses_existing_newlines() {
         let mut s = String::from("abc\n\n\n");
-        ensure_trailing_breaks(&mut s, 1);
+        ensure_trailing_breaks(&mut s, 1, 0);
         assert_eq!(s, "abc\n");
         // No prior newlines: append the requested number.
         let mut s = String::from("abc");
-        ensure_trailing_breaks(&mut s, 2);
+        ensure_trailing_breaks(&mut s, 2, 0);
         assert_eq!(s, "abc\n\n");
+
+        let mut s = String::from("caller\n\n\n");
+        let output_floor = s.len();
+        ensure_trailing_breaks(&mut s, 2, output_floor);
+        assert_eq!(s, "caller\n\n\n");
+
+        let mut s = String::from("caller\n");
+        let output_floor = s.len();
+        ensure_trailing_breaks(&mut s, 2, output_floor);
+        assert_eq!(s, "caller\n\n");
+
+        let mut s = String::from("caller");
+        let output_floor = s.len();
+        ensure_trailing_breaks(&mut s, 2, output_floor);
+        assert_eq!(s, "caller\n\n");
     }
 
     #[test]
@@ -599,6 +1300,81 @@ ET
 ";
         let out = extract_page_text(stream, &fonts, &images);
         assert!(out.contains("top\nbottom"), "{out:?}");
+    }
+
+    #[test]
+    fn line_break_uses_font_size_scaled_by_text_matrix() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        // Word-generated PDFs commonly select a 1-unit font and scale the
+        // text matrix to the visible 12-point size. A one-em line advance is
+        // a normal wrap, not the 12x paragraph jump implied by raw `Tf`.
+        let stream = b"\
+BT
+/F1 1 Tf
+12 0 0 12 0 100 Tm
+(top) Tj
+0 -1 Td
+(bottom) Tj
+ET
+";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert_eq!(out, "top\nbottom");
+    }
+
+    #[test]
+    fn word_gap_uses_font_size_scaled_by_text_matrix() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        // Same Tf=1 / Tm-scale-12 setup as the line-break test. A 0.1-em
+        // Td is kerning; a 0.3-em Td is a word break. Raw `Tf` would treat
+        // both as spaces because 0.1*12 already exceeds 0.2.
+        let kerning = b"\
+BT
+/F1 1 Tf
+12 0 0 12 0 100 Tm
+(Hello) Tj
+0.1 0 Td
+(World) Tj
+ET
+";
+        assert_eq!(extract_page_text(kerning, &fonts, &images), "HelloWorld");
+        let word_break = b"\
+BT
+/F1 1 Tf
+12 0 0 12 0 100 Tm
+(Hello) Tj
+0.3 0 Td
+(World) Tj
+ET
+";
+        assert_eq!(
+            extract_page_text(word_break, &fonts, &images),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn text_direction_change_preserves_word_boundary() {
+        let font = PdfFont::default();
+        let fonts = font_map(&font);
+        let images = PageImages::new();
+        // A rotated production tag follows an upright footer with a small
+        // page-space delta. It is a distinct text run even though the scaled
+        // vertical threshold correctly does not classify it as a new line.
+        let stream = b"\
+BT
+/F1 1 Tf
+6.5 0 0 6.5 25 20 Tm
+(932) Tj
+0 5 -5 0 22 18 Tm
+(cprice) Tj
+ET
+";
+        let out = extract_page_text(stream, &fonts, &images);
+        assert_eq!(out, "932 cprice");
     }
 
     #[test]
