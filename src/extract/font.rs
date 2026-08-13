@@ -197,55 +197,12 @@ mod tests {
     use super::*;
     use crate::pdf::{Dictionary, Document};
 
-    /// Helper that builds and loads a tiny PDF containing the given
-    /// indirect objects, then hands back the Document.
     fn build_doc(extra_objs: &[(u32, &str)]) -> Document<'static> {
-        let mut body = String::from("%PDF-1.4\n");
-        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
-        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
-        body.push_str(
-            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
-        );
-        for (n, payload) in extra_objs {
-            body.push_str(&format!("{n} 0 obj {payload} endobj\n"));
-        }
-        let xref_offset = body.len();
-        let mut needles: Vec<(u32, usize)> = Vec::new();
-        for n in 1..=3 {
-            let needle = format!("{n} 0 obj");
-            let p = (0..=body.len() - needle.len())
-                .find(|&i| body.as_bytes()[i..i + needle.len()] == *needle.as_bytes())
-                .unwrap();
-            needles.push((n, p));
-        }
-        for (n, _) in extra_objs {
-            let needle = format!("{n} 0 obj");
-            let p = (0..=body.len() - needle.len())
-                .find(|&i| body.as_bytes()[i..i + needle.len()] == *needle.as_bytes())
-                .unwrap();
-            needles.push((*n, p));
-        }
-        needles.sort_by_key(|(n, _)| *n);
-        let max_n = needles.iter().map(|(n, _)| *n).max().unwrap();
-        let mut xref = String::from("xref\n");
-        xref.push_str(&format!("0 {}\n", max_n + 1));
-        xref.push_str("0000000000 65535 f \n");
-        // Walk 1..=max_n, emit `n` entry if present, else free.
-        for n in 1..=max_n {
-            if let Some(off) = needles.iter().find(|(m, _)| *m == n).map(|(_, p)| p) {
-                xref.push_str(&format!("{off:010} 00000 n \n"));
-            } else {
-                xref.push_str("0000000000 00000 f \n");
-            }
-        }
-        xref.push_str(&format!(
-            "trailer <</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
-            max_n + 1
-        ));
-        let mut bytes = body.into_bytes();
-        bytes.extend_from_slice(xref.as_bytes());
-        let bytes = Box::leak(bytes.into_boxed_slice());
-        Document::load(bytes).expect("load")
+        let extra: Vec<(u32, &[u8])> = extra_objs
+            .iter()
+            .map(|(n, payload)| (*n, payload.as_bytes()))
+            .collect();
+        crate::pdf::test_pdf::load_minimal_doc(&extra)
     }
 
     #[test]

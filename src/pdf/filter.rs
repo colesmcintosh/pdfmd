@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use super::deflate;
+use super::syntax::decode_hex;
 use super::{Dictionary, Object, PdfError, Stream};
 
 pub(super) fn decode_filters(stream: &Stream, pdf_bytes: &[u8]) -> Result<Vec<u8>, PdfError> {
@@ -16,13 +17,10 @@ pub(super) fn decode_filters(stream: &Stream, pdf_bytes: &[u8]) -> Result<Vec<u8
     Ok(data.into_owned())
 }
 
-pub(super) fn collect_filters(dict: &Dictionary) -> Vec<Vec<u8>> {
+pub(crate) fn collect_filters(dict: &Dictionary) -> Vec<&[u8]> {
     match dict.get(b"Filter") {
-        Some(Object::Name(n)) => vec![n.clone()],
-        Some(Object::Array(arr)) => arr
-            .iter()
-            .filter_map(|o| o.as_name().map(|n| n.to_vec()))
-            .collect(),
+        Some(Object::Name(n)) => vec![n.as_slice()],
+        Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_name).collect(),
         _ => Vec::new(),
     }
 }
@@ -76,30 +74,7 @@ fn apply_predictor_owned(data: Vec<u8>, parms: &Dictionary) -> Result<Vec<u8>, P
 }
 
 pub(super) fn decode_ascii_hex(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() / 2);
-    let mut nibble: Option<u8> = None;
-    for &b in data {
-        if b == b'>' {
-            break;
-        }
-        let v = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            _ => continue,
-        };
-        match nibble {
-            Some(prev) => {
-                out.push((prev << 4) | v);
-                nibble = None;
-            }
-            None => nibble = Some(v),
-        }
-    }
-    if let Some(prev) = nibble {
-        out.push(prev << 4);
-    }
-    out
+    decode_hex(data)
 }
 
 pub(super) fn decode_ascii85(data: &[u8]) -> Vec<u8> {

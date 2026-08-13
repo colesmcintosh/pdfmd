@@ -12,7 +12,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::pdf::{Dictionary, Object, ObjectId};
+#[cfg(test)]
+use crate::pdf::Object;
+use crate::pdf::{Dictionary, ObjectId};
 
 use super::font::PdfFont;
 #[cfg(test)]
@@ -43,7 +45,7 @@ struct FormContext<'a, 'fonts> {
 /// Sentinel that wraps image-reference filenames in the extracted text.
 /// The markdown layer rewrites `\u{0001}NAME\u{0001}` into `![](DIR/NAME)`.
 /// Chosen because `\u{0001}` never appears in normal PDF text content.
-pub const IMAGE_MARK: char = '\u{0001}';
+pub(crate) const IMAGE_MARK: char = '\u{0001}';
 
 /// Threshold below which a positive `TJ` displacement is treated as kerning
 /// rather than a word-break. PDF expresses these values in thousandths of
@@ -358,24 +360,26 @@ pub(super) fn extract_page_text_with_forms<'fonts>(
     form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
     image_filenames: &ImageFilenames<'_>,
 ) -> String {
-    extract_page_layout_with_forms(
+    extract_page_layout(
         content_bytes,
         fonts,
         xobjects,
         forms,
         form_fonts,
         image_filenames,
+        true,
     )
     .text
 }
 
-pub(super) fn extract_page_layout_with_forms<'fonts>(
+pub(super) fn extract_page_layout<'fonts>(
     content_bytes: &[u8],
     fonts: &PageFonts<'fonts>,
     xobjects: &HashMap<Vec<u8>, ObjectId>,
     forms: &HashMap<ObjectId, FormXObject>,
     form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
     image_filenames: &ImageFilenames<'_>,
+    keep_text: bool,
 ) -> PageLayout {
     extract_page_with_form_limits(
         content_bytes,
@@ -386,29 +390,7 @@ pub(super) fn extract_page_layout_with_forms<'fonts>(
         image_filenames,
         PageExtractCfg {
             limits: FORM_EXECUTION_LIMITS,
-            keep_text: true,
-        },
-    )
-}
-
-pub(super) fn extract_page_layout_fast<'fonts>(
-    content_bytes: &[u8],
-    fonts: &PageFonts<'fonts>,
-    xobjects: &HashMap<Vec<u8>, ObjectId>,
-    forms: &HashMap<ObjectId, FormXObject>,
-    form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
-    image_filenames: &ImageFilenames<'_>,
-) -> PageLayout {
-    extract_page_with_form_limits(
-        content_bytes,
-        fonts,
-        xobjects,
-        forms,
-        form_fonts,
-        image_filenames,
-        PageExtractCfg {
-            limits: FORM_EXECUTION_LIMITS,
-            keep_text: false,
+            keep_text,
         },
     )
 }
@@ -1213,24 +1195,7 @@ pub fn page_font_refs(
     doc: &crate::pdf::Document<'_>,
     resources: &Dictionary,
 ) -> HashMap<Vec<u8>, ObjectId> {
-    let mut out = HashMap::new();
-    let Some(font_dict_obj) = resources.get(b"Font") else {
-        return out;
-    };
-    let font_dict = match font_dict_obj {
-        Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict),
-        Object::Dictionary(d) => Some(d),
-        _ => None,
-    };
-    let Some(font_dict) = font_dict else {
-        return out;
-    };
-    for (name, obj) in font_dict.iter() {
-        if let Some(id) = obj.as_reference() {
-            out.insert(name.to_vec(), id);
-        }
-    }
-    out
+    super::resource_name_refs(doc, resources, b"Font")
 }
 
 #[cfg(test)]
@@ -1885,13 +1850,14 @@ ET
     fn emit_records_positioned_text_and_path_rects() {
         let font = PdfFont::default();
         let fonts = font_map(&font);
-        let layout = extract_page_layout_with_forms(
+        let layout = extract_page_layout(
             b"BT /F1 18 Tf 1 0 0 1 50 700 Tm (Hello) Tj ET 10 20 30 40 re",
             &fonts,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            true,
         );
         assert_eq!(layout.text, "Hello");
         assert_eq!(layout.spans.len(), 1);
@@ -1906,13 +1872,14 @@ ET
     fn graphics_state_and_path_ops_are_recorded() {
         let font = PdfFont::default();
         let fonts = font_map(&font);
-        let layout = extract_page_layout_with_forms(
+        let layout = extract_page_layout(
             b"q 2 0 0 2 0 0 cm 0 0 m 40 0 l Q 10 20 30 40 re /Span BMC BT /F1 12 Tf (X) Tj ET EMC",
             &fonts,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            true,
         );
         assert!(layout.rects.len() >= 2);
         assert_eq!(layout.spans[0].text, "X");
@@ -1925,48 +1892,20 @@ ET
     fn bdc_attaches_mcid_to_span() {
         let font = PdfFont::default();
         let fonts = font_map(&font);
-        let layout = extract_page_layout_with_forms(
+        let layout = extract_page_layout(
             b"BT /F1 12 Tf /P << /MCID 3 >> BDC (Hi) Tj EMC ET",
             &fonts,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            true,
         );
         assert_eq!(layout.spans[0].text, "Hi");
         assert_eq!(layout.spans[0].mcid, Some(3));
     }
 
-    /// Helper for in-test PDF construction. Mirrors the minimal_pdf in
-    /// pdf::tests but parameterised on the body bytes.
     fn build_pdf_with_xref(body: &[u8]) -> Vec<u8> {
-        let mut out = body.to_vec();
-        let xref_offset = out.len();
-        // Scan for `N 0 obj` headers in document order.
-        let mut offsets = Vec::new();
-        let mut n = 1;
-        loop {
-            let needle = format!("{n} 0 obj");
-            let Some(p) = (0..=out.len().saturating_sub(needle.len()))
-                .find(|&i| &out[i..i + needle.len()] == needle.as_bytes())
-            else {
-                break;
-            };
-            offsets.push(p);
-            n += 1;
-        }
-        let count = offsets.len();
-        let mut xref = String::from("xref\n");
-        xref.push_str(&format!("0 {}\n", count + 1));
-        xref.push_str("0000000000 65535 f \n");
-        for off in &offsets {
-            xref.push_str(&format!("{off:010} 00000 n \n"));
-        }
-        xref.push_str(&format!(
-            "trailer <</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
-            count + 1
-        ));
-        out.extend_from_slice(xref.as_bytes());
-        out
+        crate::pdf::test_pdf::build_xref_pdf(body)
     }
 }

@@ -158,33 +158,7 @@ mod tests {
     use crate::pdf::Document;
 
     fn build_xref_pdf(body: &[u8]) -> Vec<u8> {
-        let mut out = body.to_vec();
-        let xref_offset = out.len();
-        let mut found: Vec<(u32, usize)> = Vec::new();
-        for n in 1u32..50 {
-            let needle = format!("{n} 0 obj");
-            if let Some(off) = (0..=out.len().saturating_sub(needle.len()))
-                .find(|&i| out[i..i + needle.len()] == *needle.as_bytes())
-            {
-                found.push((n, off));
-            }
-        }
-        let max = found.iter().map(|(n, _)| *n).max().unwrap_or(0);
-        let mut xref = String::from("xref\n");
-        xref.push_str(&format!("0 {}\n", max + 1));
-        xref.push_str("0000000000 65535 f \n");
-        for n in 1..=max {
-            match found.iter().find(|(m, _)| *m == n) {
-                Some((_, off)) => xref.push_str(&format!("{off:010} 00000 n \n")),
-                None => xref.push_str("0000000000 00000 f \n"),
-            }
-        }
-        xref.push_str(&format!(
-            "trailer <</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
-            max + 1
-        ));
-        out.extend_from_slice(xref.as_bytes());
-        out
+        crate::pdf::test_pdf::build_xref_pdf(body)
     }
 
     #[test]

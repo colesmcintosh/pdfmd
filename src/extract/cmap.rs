@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::pdf::syntax::{hex_digit, is_ws, is_ws_or_delim};
+
 /// Upper bound on the size of a single `beginbfrange` mapping. A malformed
 /// CMap can declare `<0000> <FFFFFFFF>` which expands to ~4 billion entries
 /// — without this cap we'd OOM cloning a `Vec`/`String` per iteration. The
@@ -245,7 +247,7 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
     while i < data.len() {
         let b = data[i];
         match b {
-            b' ' | b'\t' | b'\r' | b'\n' | b'\x0C' => i += 1,
+            _ if is_ws(b) => i += 1,
             b'%' => {
                 // PostScript line comment.
                 while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
@@ -312,14 +314,14 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
             b'/' => {
                 // Name: `/Foo`.
                 i += 1;
-                while i < data.len() && !is_delim(data[i]) {
+                while i < data.len() && !is_ws_or_delim(data[i]) {
                     i += 1;
                 }
                 out.push(Token::Other);
             }
             _ => {
                 let start = i;
-                while i < data.len() && !is_delim(data[i]) {
+                while i < data.len() && !is_ws_or_delim(data[i]) {
                     i += 1;
                 }
                 let word = std::str::from_utf8(&data[start..i])
@@ -334,24 +336,6 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
         }
     }
     out
-}
-
-fn is_delim(b: u8) -> bool {
-    matches!(
-        b,
-        b' ' | b'\t'
-            | b'\r'
-            | b'\n'
-            | b'\x0C'
-            | b'<'
-            | b'>'
-            | b'['
-            | b']'
-            | b'('
-            | b')'
-            | b'/'
-            | b'%'
-    )
 }
 
 fn is_relevant_keyword(s: &str) -> bool {
@@ -370,7 +354,7 @@ fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() / 2);
     let mut nibble: Option<u8> = None;
     for &b in s {
-        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+        if is_ws(b) {
             continue;
         }
         let v = hex_digit(b)?;
@@ -386,15 +370,6 @@ fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
         out.push(prev << 4);
     }
     Some(out)
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

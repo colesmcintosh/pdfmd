@@ -8,11 +8,12 @@
 mod extract;
 mod heuristics;
 mod pdf;
+mod util;
 
 use pdf::PdfError;
 
-use extract::extract_document;
 pub use extract::ExtractedImage;
+use extract::{extract_document, IMAGE_MARK};
 
 use heuristics::format_pages;
 
@@ -80,17 +81,16 @@ fn ensure_trailing_newline(s: &mut String) {
 /// Rewrite each `\u{0001}filename\u{0001}` sentinel emitted by the content
 /// extractor into a Markdown image reference.
 fn rewrite_image_marks(markdown: &mut String, dir: &str) {
-    const MARK: char = '\u{0001}';
-    if !markdown.contains(MARK) {
+    if !markdown.contains(IMAGE_MARK) {
         return;
     }
     let trimmed_dir = dir.trim_end_matches('/');
     let mut out = String::with_capacity(markdown.len());
     let mut rest = markdown.as_str();
-    while let Some(start) = rest.find(MARK) {
+    while let Some(start) = rest.find(IMAGE_MARK) {
         out.push_str(&rest[..start]);
-        let after_open = &rest[start + MARK.len_utf8()..];
-        let Some(end) = after_open.find(MARK) else {
+        let after_open = &rest[start + IMAGE_MARK.len_utf8()..];
+        let Some(end) = after_open.find(IMAGE_MARK) else {
             // Unterminated marker — keep what we have and bail.
             out.push_str(&rest[start..]);
             rest = "";
@@ -98,7 +98,7 @@ fn rewrite_image_marks(markdown: &mut String, dir: &str) {
         };
         let filename = &after_open[..end];
         out.push_str(&format!("![]({trimmed_dir}/{filename})"));
-        rest = &after_open[end + MARK.len_utf8()..];
+        rest = &after_open[end + IMAGE_MARK.len_utf8()..];
     }
     out.push_str(rest);
     *markdown = out;

@@ -15,15 +15,18 @@ mod object;
 mod object_stream;
 mod page_tree;
 mod parser;
+pub(crate) mod syntax;
+#[cfg(test)]
+pub(crate) mod test_pdf;
 mod xref;
 
 pub use object::{Dictionary, Object, ObjectId, Stream};
 
+pub(crate) use filter::collect_filters;
 use filter::decode_filters;
 #[cfg(test)]
 use filter::{
-    apply_filter, apply_predictor, collect_filters, collect_parms, decode_ascii85,
-    decode_ascii_hex, paeth,
+    apply_filter, apply_predictor, collect_parms, decode_ascii85, decode_ascii_hex, paeth,
 };
 use object_stream::{parse_object_stream, ObjectStreamEntry};
 use page_tree::collect_pages;
@@ -370,7 +373,8 @@ mod tests {
     /// content stream. Used to exercise the loader end-to-end without
     /// depending on a real PDF fixture.
     fn minimal_pdf() -> Vec<u8> {
-        let body = b"\
+        super::test_pdf::build_xref_pdf(
+            b"\
 %PDF-1.4
 1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
 2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj
@@ -380,31 +384,12 @@ stream
 BT /F1 12 Tf (Hi) Tj ET
 endstream
 endobj
-";
-        let mut out = body.to_vec();
-        // Build a classic xref pointing at each object.
-        let xref_offset = out.len();
-        // Look up each obj's byte offset in the body.
-        let offsets: Vec<usize> = (1..=4)
-            .map(|n| {
-                let needle = format!("{n} 0 obj");
-                find_subslice(&out, needle.as_bytes()).unwrap()
-            })
-            .collect();
-        let mut xref = String::from("xref\n0 5\n");
-        xref.push_str("0000000000 65535 f \n");
-        for off in &offsets {
-            xref.push_str(&format!("{:010} 00000 n \n", off));
-        }
-        xref.push_str("trailer <</Size 5/Root 1 0 R>>\nstartxref\n");
-        xref.push_str(&format!("{xref_offset}\n"));
-        xref.push_str("%%EOF\n");
-        out.extend_from_slice(xref.as_bytes());
-        out
+",
+        )
     }
 
     fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-        (0..=hay.len().saturating_sub(needle.len())).find(|&i| &hay[i..i + needle.len()] == needle)
+        super::test_pdf::find_bytes(hay, needle)
     }
 
     #[test]
@@ -647,7 +632,7 @@ endobj
         let mut d = Dictionary::new();
         assert!(collect_filters(&d).is_empty());
         d.insert(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
-        assert_eq!(collect_filters(&d), vec![b"FlateDecode".to_vec()]);
+        assert_eq!(collect_filters(&d), vec![&b"FlateDecode"[..]]);
 
         let arr = Object::Array(vec![
             Object::Name(b"ASCIIHexDecode".to_vec()),
@@ -657,7 +642,7 @@ endobj
         d.insert(b"Filter".to_vec(), arr);
         assert_eq!(
             collect_filters(&d),
-            vec![b"ASCIIHexDecode".to_vec(), b"FlateDecode".to_vec()],
+            vec![&b"ASCIIHexDecode"[..], &b"FlateDecode"[..]],
         );
     }
 

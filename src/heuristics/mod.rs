@@ -6,14 +6,12 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::thread;
 
 use crate::extract::layout::{PageLayout, Span, SpanKind};
 use crate::extract::structure::{Role, RoleMap};
+use crate::extract::IMAGE_MARK;
 
 mod tables;
-
-const IMAGE_MARK: char = '\u{0001}';
 
 /// Format a single page of raw text into a Markdown fragment.
 #[cfg(test)]
@@ -32,35 +30,9 @@ pub fn format_pages(pages: &[PageLayout], roles: &RoleMap) -> Vec<String> {
             .map(|(i, page)| format_page_layout(page, i, roles, &headers, &footers))
             .collect();
     }
-    let mut out: Vec<Option<String>> = (0..n).map(|_| None).collect();
-    let workers = thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-        .min(n)
-        .max(1);
-    let chunk = (n + workers - 1) / workers;
-    let headers = &headers;
-    let footers = &footers;
-    thread::scope(|s| {
-        for (i, out_chunk) in out.chunks_mut(chunk).enumerate() {
-            let start = i * chunk;
-            s.spawn(move || {
-                for (j, slot) in out_chunk.iter_mut().enumerate() {
-                    let idx = start + j;
-                    if idx < n {
-                        *slot = Some(format_page_layout(
-                            &pages[idx],
-                            idx,
-                            roles,
-                            headers,
-                            footers,
-                        ));
-                    }
-                }
-            });
-        }
-    });
-    out.into_iter().map(|s| s.unwrap_or_default()).collect()
+    crate::util::parallel_map(pages, |i, page| {
+        format_page_layout(page, i, roles, &headers, &footers)
+    })
 }
 
 #[cfg(test)]
@@ -413,9 +385,7 @@ fn style_line(line: &VLine<'_>) -> String {
     let mut out = String::new();
     for s in &line.spans {
         if s.kind == SpanKind::Image {
-            out.push(IMAGE_MARK);
-            out.push_str(&s.text);
-            out.push(IMAGE_MARK);
+            push_image_mark(&mut out, &s.text);
             continue;
         }
         if s.space_before && !out.is_empty() && !out.ends_with(' ') {
@@ -454,13 +424,17 @@ fn image_block(lines: &[VLine<'_>]) -> String {
     for line in lines {
         for s in &line.spans {
             if s.kind == SpanKind::Image {
-                out.push(IMAGE_MARK);
-                out.push_str(&s.text);
-                out.push(IMAGE_MARK);
+                push_image_mark(&mut out, &s.text);
             }
         }
     }
     out
+}
+
+fn push_image_mark(out: &mut String, filename: &str) {
+    out.push(IMAGE_MARK);
+    out.push_str(filename);
+    out.push(IMAGE_MARK);
 }
 
 fn is_mono_line(line: &VLine<'_>) -> bool {
