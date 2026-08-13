@@ -33,13 +33,13 @@
         <h1>PDF to Markdown, from scratch, in a few milliseconds.</h1>
         <p class="lede">
           <code>pdfmd</code> parses the object graph, inflates streams, decodes fonts,
-          and interprets content operators itself — then recovers headings, lists,
-          and paragraphs. <code>[dependencies]</code> is empty.
+          and interprets content operators itself — then recovers columns, tables,
+          headings, lists, and paragraphs. <code>[dependencies]</code> is empty.
         </p>
         <div class="stats" role="list">
           <div role="listitem"><b>0</b><span>runtime crates</span></div>
           <div role="listitem"><b>4.4&nbsp;ms</b><span>mean, 17-page paper</span></div>
-          <div role="listitem"><b>99.84%</b><span>line coverage</span></div>
+          <div role="listitem"><b>99.04%</b><span>line coverage</span></div>
           <div role="listitem"><b>~700&nbsp;KB</b><span>release binary</span></div>
         </div>
       </section>
@@ -83,8 +83,9 @@ print!("{}", result.markdown);</pre>
         </p>
         <p>
           Pages extract in parallel via <code>std::thread::scope</code>. Fonts are parsed once
-          and cached document-wide. The content-stream tokenizer and DEFLATE decoder
-          borrow operands from the source bytes — no per-operator or per-Huffman allocation.
+          and cached document-wide. Multi-page Markdown formatting uses the same pool.
+          The content-stream tokenizer and DEFLATE decoder borrow operands from the
+          source bytes — no per-operator or per-Huffman allocation.
         </p>
         <div class="table-wrap">
           <table>
@@ -120,8 +121,8 @@ print!("{}", result.markdown);</pre>
         </p>
         <div class="arch" role="img" aria-label="Source layout of the pdfmd crate">src/
 ├── pdf/          xref, objects, streams, DEFLATE, page tree
-├── extract/      fonts, CMaps, content ops, images, PNG
-├── heuristics.rs headings, lists, paragraph reflow
+├── extract/      fonts, CMaps, content ops, layout, tagged PDF, images
+├── heuristics/   columns, tables, headings, lists, emphasis
 ├── lib.rs        convert_pdf_to_markdown
 └── cli.rs        argv parser and execution</div>
       </section>
@@ -129,7 +130,7 @@ print!("{}", result.markdown);</pre>
       <section id="limits">
         <h2>Limitations</h2>
         <ul class="limits">
-          <li>Tables, multi-column captions, and complex math are best-effort reflow.</li>
+          <li>Tables and columns are recovered when the layout is clear; spanned cells, nested tables, and complex math stay best-effort reflow.</li>
           <li>Fonts without a ToUnicode CMap, a standard encoding, or <code>/Differences</code> drop glyphs.</li>
           <li>Heuristics target academic and prose documents, not forms or invoices.</li>
           <li>Encrypted PDFs and <code>LZWDecode</code> streams are unsupported by design.</li>
