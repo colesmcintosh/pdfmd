@@ -30,24 +30,7 @@ pub type PageImages<'a> = HashMap<Vec<u8>, &'a str>;
 /// Walk a page's `/Resources/XObject` dictionary and collect
 /// `name → ObjectId` entries, mirroring `page_font_refs`.
 pub fn page_xobject_refs(doc: &Document<'_>, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
-    let mut out = HashMap::new();
-    let Some(xobj_obj) = resources.get(b"XObject") else {
-        return out;
-    };
-    let xobj_dict = match xobj_obj {
-        Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict),
-        Object::Dictionary(d) => Some(d),
-        _ => None,
-    };
-    let Some(xobj_dict) = xobj_dict else {
-        return out;
-    };
-    for (name, obj) in xobj_dict.iter() {
-        if let Some(id) = obj.as_reference() {
-            out.insert(name.to_vec(), id);
-        }
-    }
-    out
+    super::resource_name_refs(doc, resources, b"XObject")
 }
 
 /// If the object is an image XObject in a supported representation, return its
@@ -62,37 +45,22 @@ pub fn extract_image(doc: &Document<'_>, obj_id: ObjectId) -> Option<(&'static s
         return None;
     }
 
-    let filters = filter_names(dict);
-    if let Some(last) = filters.last().copied() {
-        if last == "DCTDecode" || last == "DCT" {
+    let filters = crate::pdf::collect_filters(dict);
+    if let Some(&last) = filters.last() {
+        if last == b"DCTDecode" || last == b"DCT" || last == b"JPXDecode" {
             let bytes = if filters.len() == 1 {
                 doc.stream_content(stream).to_vec()
             } else {
                 doc.decode_stream(stream).ok()?
             };
-            return Some(("jpg", bytes));
-        }
-        if last == "JPXDecode" {
-            let bytes = if filters.len() == 1 {
-                doc.stream_content(stream).to_vec()
-            } else {
-                doc.decode_stream(stream).ok()?
-            };
-            return Some(("jp2", bytes));
+            let ext = if last == b"JPXDecode" { "jp2" } else { "jpg" };
+            return Some((ext, bytes));
         }
     }
 
     let pixels = doc.decode_stream(stream).ok()?;
     let png = encode_raster_png(dict, &pixels)?;
     Some(("png", png))
-}
-
-fn filter_names(dict: &Dictionary) -> Vec<&str> {
-    match dict.get(b"Filter") {
-        Some(Object::Name(n)) => std::str::from_utf8(n).map(|s| vec![s]).unwrap_or_default(),
-        Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_name_str).collect(),
-        _ => Vec::new(),
-    }
 }
 
 fn encode_raster_png(dict: &Dictionary, data: &[u8]) -> Option<Vec<u8>> {
@@ -189,51 +157,13 @@ mod tests {
     use super::*;
     use crate::pdf::Document;
 
-    /// Build and load a PDF whose extra indirect objects come from `defs`.
     fn build_doc(defs: &[(u32, &str)]) -> Document<'static> {
-        let mut body = String::from("%PDF-1.4\n");
         let defs: Vec<(u32, &[u8])> = defs.iter().map(|(n, raw)| (*n, raw.as_bytes())).collect();
-        build_doc_from_body(&mut body, &defs)
+        crate::pdf::test_pdf::load_minimal_doc(&defs)
     }
 
     fn build_doc_bytes(defs: &[(u32, &[u8])]) -> Document<'static> {
-        let mut body = String::from("%PDF-1.4\n");
-        build_doc_from_body(&mut body, defs)
-    }
-
-    fn build_doc_from_body(body: &mut String, defs: &[(u32, &[u8])]) -> Document<'static> {
-        body.push_str("1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n");
-        body.push_str("2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> endobj\n");
-        body.push_str(
-            "3 0 obj <</Type/Page/Parent 2 0 R/Resources<<>>/MediaBox[0 0 1 1]>> endobj\n",
-        );
-        let mut body = body.as_bytes().to_vec();
-        for (n, raw) in defs {
-            body.extend_from_slice(format!("{n} 0 obj ").as_bytes());
-            body.extend_from_slice(raw);
-            body.extend_from_slice(b" endobj\n");
-        }
-        let xref_offset = body.len();
-        let max = defs.iter().map(|(n, _)| *n).max().unwrap_or(3).max(3);
-        let mut xref = String::from("xref\n");
-        xref.push_str(&format!("0 {}\n", max + 1));
-        xref.push_str("0000000000 65535 f \n");
-        for n in 1..=max {
-            let needle = format!("{n} 0 obj");
-            match (0..=body.len() - needle.len())
-                .find(|&i| body[i..i + needle.len()] == *needle.as_bytes())
-            {
-                Some(off) => xref.push_str(&format!("{off:010} 00000 n \n")),
-                None => xref.push_str("0000000000 00000 f \n"),
-            }
-        }
-        xref.push_str(&format!(
-            "trailer <</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
-            max + 1
-        ));
-        body.extend_from_slice(xref.as_bytes());
-        let bytes = Box::leak(body.into_boxed_slice());
-        Document::load(bytes).expect("load")
+        crate::pdf::test_pdf::load_minimal_doc(defs)
     }
 
     #[test]

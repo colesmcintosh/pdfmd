@@ -5,6 +5,7 @@
 //! /Filter chain on demand.
 
 use super::object::{Dictionary, Object, ObjectId, Stream};
+use super::syntax::{hex_digit, is_ws, is_ws_or_delim, skip_ws_and_comments as skip_ws_comments};
 use super::PdfError;
 
 /// Cap on container nesting depth. Real PDFs nest a handful of levels at
@@ -46,21 +47,7 @@ impl<'a> Parser<'a> {
     // ---- Whitespace / comments -------------------------------------------
 
     pub fn skip_ws_and_comments(&mut self) {
-        loop {
-            while self.pos < self.bytes.len() && is_ws(self.bytes[self.pos]) {
-                self.pos += 1;
-            }
-            if self.pos < self.bytes.len() && self.bytes[self.pos] == b'%' {
-                while self.pos < self.bytes.len()
-                    && self.bytes[self.pos] != b'\n'
-                    && self.bytes[self.pos] != b'\r'
-                {
-                    self.pos += 1;
-                }
-            } else {
-                return;
-            }
-        }
+        skip_ws_comments(self.bytes, &mut self.pos);
     }
 
     fn skip_inline_ws(&mut self) {
@@ -587,30 +574,6 @@ fn parse_u32(bytes: &[u8]) -> Result<u32, PdfError> {
             .ok_or_else(|| PdfError::BadObject("integer overflow".into()))?;
     }
     Ok(v)
-}
-
-fn is_ws(b: u8) -> bool {
-    matches!(b, 0x00 | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
-}
-
-fn is_delim(b: u8) -> bool {
-    matches!(
-        b,
-        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-    )
-}
-
-fn is_ws_or_delim(b: u8) -> bool {
-    is_ws(b) || is_delim(b)
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

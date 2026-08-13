@@ -1,7 +1,6 @@
 //! From-scratch PDF text extractor.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::thread;
 
 use crate::pdf::{Dictionary, Document, Object, ObjectId, PdfError};
 
@@ -15,6 +14,7 @@ pub(crate) mod layout;
 mod parser;
 pub(crate) mod structure;
 
+pub(crate) use content::IMAGE_MARK;
 pub use layout::PageLayout;
 pub(crate) use structure::RoleMap;
 
@@ -128,7 +128,7 @@ fn extract_document_inner(
         .into_iter()
         .collect();
     let font_cache: HashMap<ObjectId, PdfFont> =
-        parallel_map(&unique_ids, |&id| (id, PdfFont::from_object(&doc, id)))
+        crate::util::parallel_map(&unique_ids, |_, &id| (id, PdfFont::from_object(&doc, id)))
             .into_iter()
             .collect();
 
@@ -171,7 +171,7 @@ fn extract_document_inner(
         .map(|((page_id, font_refs), xobject_refs)| (*page_id, font_refs, xobject_refs))
         .collect();
     let page_layouts: Vec<PageLayout> =
-        parallel_map(&inputs, |(page_id, font_refs, xobject_refs)| {
+        crate::util::parallel_map(&inputs, |_, (page_id, font_refs, xobject_refs)| {
             extract_one_page(
                 &doc,
                 *page_id,
@@ -275,15 +275,7 @@ fn retain_form_candidate(
     visited: &HashSet<ObjectId>,
     pending: &mut BTreeSet<ObjectId>,
 ) {
-    if visited.contains(&id)
-        || pending.contains(&id)
-        || doc
-            .get_object(id)
-            .and_then(Object::as_stream)
-            .and_then(|stream| stream.dict.get(b"Subtype"))
-            .and_then(Object::as_name)
-            != Some(b"Form".as_slice())
-    {
+    if visited.contains(&id) || pending.contains(&id) || xobject_subtype(doc, id) != Some(b"Form") {
         return;
     }
 
@@ -361,11 +353,43 @@ fn retain_image_candidate(
 }
 
 fn is_image_xobject(doc: &Document<'_>, id: ObjectId) -> bool {
+    xobject_subtype(doc, id) == Some(b"Image")
+}
+
+fn xobject_subtype<'a>(doc: &'a Document<'a>, id: ObjectId) -> Option<&'a [u8]> {
     doc.get_object(id)
         .and_then(Object::as_stream)
         .and_then(|stream| stream.dict.get(b"Subtype"))
         .and_then(Object::as_name)
-        == Some(b"Image".as_slice())
+}
+
+/// `name → ObjectId` map from a `/Resources` sub-dictionary (`/Font`, `/XObject`).
+pub(super) fn resource_name_refs(
+    doc: &Document<'_>,
+    resources: &Dictionary,
+    key: &[u8],
+) -> HashMap<Vec<u8>, ObjectId> {
+    let mut out = HashMap::new();
+    let Some(obj) = resources.get(key) else {
+        return out;
+    };
+    let Some(dict) = dict_from_obj(doc, obj) else {
+        return out;
+    };
+    for (name, value) in dict.iter() {
+        if let Some(id) = value.as_reference() {
+            out.insert(name.to_vec(), id);
+        }
+    }
+    out
+}
+
+fn dict_from_obj<'a>(doc: &'a Document<'a>, obj: &'a Object) -> Option<&'a Dictionary> {
+    match obj {
+        Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict),
+        Object::Dictionary(d) => Some(d),
+        _ => None,
+    }
 }
 
 fn extract_one_page(
@@ -384,25 +408,15 @@ fn extract_one_page(
     let Some(content_bytes) = doc.get_page_content(page_id) else {
         return PageLayout::default();
     };
-    if keep_text {
-        content::extract_page_layout_with_forms(
-            &content_bytes,
-            &fonts,
-            xobject_refs,
-            forms.xobjects,
-            forms.fonts,
-            forms.images,
-        )
-    } else {
-        content::extract_page_layout_fast(
-            &content_bytes,
-            &fonts,
-            xobject_refs,
-            forms.xobjects,
-            forms.fonts,
-            forms.images,
-        )
-    }
+    content::extract_page_layout(
+        &content_bytes,
+        &fonts,
+        xobject_refs,
+        forms.xobjects,
+        forms.fonts,
+        forms.images,
+        keep_text,
+    )
 }
 
 /// Walk up the page tree until we find a `/Resources` dictionary.
@@ -411,54 +425,12 @@ fn page_resources(doc: &Document<'_>, page_id: ObjectId) -> Option<Dictionary> {
     for _ in 0..64 {
         let dict = doc.get_object(current).and_then(Object::as_dict)?;
         if let Some(res) = dict.get(b"Resources") {
-            return match res {
-                Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).cloned(),
-                Object::Dictionary(d) => Some(d.clone()),
-                _ => None,
-            };
+            return dict_from_obj(doc, res).cloned();
         }
         let parent = dict.get(b"Parent").and_then(Object::as_reference)?;
         current = parent;
     }
     None
-}
-
-/// Tiny work-stealing-free parallel map: split into one chunk per worker
-/// thread and `Vec::extend` the partial results in place. Stays
-/// dependency-free and is fast enough that the per-page cost dominates.
-fn parallel_map<T, R, F>(input: &[T], f: F) -> Vec<R>
-where
-    T: Sync,
-    R: Send,
-    F: Fn(&T) -> R + Sync + Send,
-{
-    let len = input.len();
-    if len == 0 {
-        return Vec::new();
-    }
-    // Available_parallelism returns 0 on error; clamp to 1.
-    let workers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1)
-        .min(len);
-    if workers == 1 {
-        return input.iter().map(&f).collect();
-    }
-    let chunk = (len + workers - 1) / workers;
-    // Pre-size the output so each worker can write into its own slice.
-    let mut out: Vec<Option<R>> = (0..len).map(|_| None).collect();
-    thread::scope(|s| {
-        let f = &f;
-        for (in_chunk, out_chunk) in input.chunks(chunk).zip(out.chunks_mut(chunk)) {
-            s.spawn(move || {
-                for (slot, item) in out_chunk.iter_mut().zip(in_chunk) {
-                    *slot = Some(f(item));
-                }
-            });
-        }
-    });
-    out.into_iter().map(Option::unwrap).collect()
 }
 
 #[cfg(test)]
@@ -1090,36 +1062,7 @@ endobj
         assert_eq!(ids, vec![ObjectId(90, 0), ObjectId(92, 0)]);
     }
 
-    /// Builder for in-test PDFs with a classic xref table. Scans the body
-    /// for `N 0 obj` markers and emits offsets for every contiguous id
-    /// it finds, padding the gap with `f` entries.
     fn build_xref_pdf(body: &[u8]) -> Vec<u8> {
-        let mut out = body.to_vec();
-        let xref_offset = out.len();
-        let mut found: Vec<(u32, usize)> = Vec::new();
-        for n in 1u32..200 {
-            let needle = format!("{n} 0 obj");
-            if let Some(off) = (0..=out.len().saturating_sub(needle.len()))
-                .find(|&i| out[i..i + needle.len()] == *needle.as_bytes())
-            {
-                found.push((n, off));
-            }
-        }
-        let max = found.iter().map(|(n, _)| *n).max().unwrap_or(0);
-        let mut xref = String::from("xref\n");
-        xref.push_str(&format!("0 {}\n", max + 1));
-        xref.push_str("0000000000 65535 f \n");
-        for n in 1..=max {
-            match found.iter().find(|(m, _)| *m == n) {
-                Some((_, off)) => xref.push_str(&format!("{off:010} 00000 n \n")),
-                None => xref.push_str("0000000000 00000 f \n"),
-            }
-        }
-        xref.push_str(&format!(
-            "trailer <</Size {}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n",
-            max + 1
-        ));
-        out.extend_from_slice(xref.as_bytes());
-        out
+        crate::pdf::test_pdf::build_xref_pdf(body)
     }
 }

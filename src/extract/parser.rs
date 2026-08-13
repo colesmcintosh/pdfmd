@@ -16,6 +16,10 @@
 
 use std::borrow::Cow;
 
+use crate::pdf::syntax::{
+    decode_hex, is_delim, is_ws, is_ws_or_delim, skip_ws_and_comments as skip_ws_comments,
+};
+
 pub struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -120,31 +124,13 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws_and_comments(&mut self) {
-        loop {
-            while let Some(&b) = self.bytes.get(self.pos) {
-                if is_ws(b) {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
-            if self.bytes.get(self.pos) == Some(&b'%') {
-                while let Some(&b) = self.bytes.get(self.pos) {
-                    if b == b'\n' || b == b'\r' {
-                        break;
-                    }
-                    self.pos += 1;
-                }
-            } else {
-                return;
-            }
-        }
+        skip_ws_comments(self.bytes, &mut self.pos);
     }
 
     fn read_name(&mut self) -> Token<'a> {
         let start = self.pos;
         while let Some(&b) = self.bytes.get(self.pos) {
-            if is_delim_or_ws(b) {
+            if is_ws_or_delim(b) {
                 break;
             }
             self.pos += 1;
@@ -155,7 +141,7 @@ impl<'a> Parser<'a> {
     fn read_keyword(&mut self) -> Token<'a> {
         let start = self.pos;
         while let Some(&b) = self.bytes.get(self.pos) {
-            if is_delim_or_ws(b) {
+            if is_ws_or_delim(b) {
                 break;
             }
             self.pos += 1;
@@ -191,7 +177,7 @@ impl<'a> Parser<'a> {
         // `.`) or the run kept going into letters (e.g. `10x`, which would
         // make the whole thing a single bizarre keyword). Restart as keyword.
         let next = self.bytes.get(self.pos).copied();
-        let at_boundary = next.is_none() || matches!(next, Some(b) if is_delim_or_ws(b));
+        let at_boundary = next.is_none() || matches!(next, Some(b) if is_ws_or_delim(b));
         if !has_digits || !at_boundary {
             self.pos = start;
             return self.read_keyword();
@@ -277,17 +263,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn is_ws(b: u8) -> bool {
-    matches!(b, 0x00 | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
-}
-
-fn is_delim(b: u8) -> bool {
-    matches!(
-        b,
-        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-    )
-}
-
 fn find_mcid(bytes: &[u8]) -> Option<u32> {
     let needle = b"/MCID";
     let mut i = 0;
@@ -312,10 +287,6 @@ fn find_mcid(bytes: &[u8]) -> Option<u32> {
         i += 1;
     }
     None
-}
-
-fn is_delim_or_ws(b: u8) -> bool {
-    is_ws(b) || is_delim(b)
 }
 
 fn unescape_literal(raw: &[u8]) -> Vec<u8> {
@@ -387,31 +358,6 @@ fn unescape_literal(raw: &[u8]) -> Vec<u8> {
             out.push(raw[i]);
             i += 1;
         }
-    }
-    out
-}
-
-fn decode_hex(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len() / 2);
-    let mut nibble: Option<u8> = None;
-    for &b in raw {
-        let v = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            _ => continue,
-        };
-        match nibble {
-            Some(prev) => {
-                out.push((prev << 4) | v);
-                nibble = None;
-            }
-            None => nibble = Some(v),
-        }
-    }
-    if let Some(prev) = nibble {
-        // Per PDF spec a trailing single nibble pads with 0.
-        out.push(prev << 4);
     }
     out
 }
