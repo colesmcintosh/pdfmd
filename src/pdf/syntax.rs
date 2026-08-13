@@ -82,11 +82,11 @@ mod tests {
 
     #[test]
     fn whitespace_and_delimiter_classes() {
-        for b in [0x00, b'\t', b'\n', 0x0C, b'\r', b' '] {
+        for &b in b"\x00\t\n\x0C\r " {
             assert!(is_ws(b), "{b}");
             assert!(is_ws_or_delim(b), "{b}");
         }
-        for b in [b'(', b')', b'<', b'>', b'[', b']', b'{', b'}', b'/', b'%'] {
+        for &b in b"()<>[]{}/%" {
             assert!(is_delim(b), "{b}");
             assert!(is_ws_or_delim(b), "{b}");
         }
