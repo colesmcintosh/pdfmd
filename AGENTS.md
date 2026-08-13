@@ -27,7 +27,7 @@ cargo llvm-cov --summary-only --ignore-filename-regex 'src/bin/'
 ```
 
 Run `fmt`, `clippy`, and `test --all-targets` before pushing. CI runs
-the same trio on Linux, macOS, and Windows.
+that trio on Ubuntu for every PR; macOS and Windows tests run on `main`.
 
 ## Hard rules
 
