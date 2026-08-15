@@ -1,11 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pdfmd — fast, zero-dependency PDF to Markdown</title>
   <meta name="description" content="pdfmd extracts text from PDFs and converts it to Markdown. Written in Rust with zero runtime dependencies.">
   <link rel="canonical" href="https://colesmcintosh.github.io/pdfmd/">
+  <meta name="theme-color" content="#08090b">
   <meta property="og:title" content="pdfmd — fast, zero-dependency PDF to Markdown">
   <meta property="og:description" content="A Rust CLI and library that owns the path from PDF bytes to Markdown. No runtime dependencies.">
   <meta property="og:url" content="https://colesmcintosh.github.io/pdfmd/">
@@ -13,124 +14,271 @@
   <meta name="twitter:card" content="summary">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
+  <script>
+    // Applied before paint so the chosen theme never flashes.
+    try {
+      var t = localStorage.getItem("pdfmd-theme");
+      document.documentElement.dataset.theme =
+        t || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <a class="skip" href="#content">Skip to content</a>
-  <div class="page">
-    <header class="site-header">
-      <a class="wordmark" href="./"><span>pdf</span>md</a>
-      <nav aria-label="Site">
+
+  <header class="site-header">
+    <div class="page header-inner">
+      <a class="wordmark" href="./">
+        <span class="glyph" aria-hidden="true">md</span>
+        <span>pdf<b>md</b></span>
+      </a>
+      <nav class="site-nav" aria-label="Site">
         <a href="#install">Install</a>
         <a href="#usage">Usage</a>
-        <a href="#performance">Performance</a>
+        <a href="#performance">Speed</a>
+        <a class="hide-sm" href="#how">Internals</a>
         <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
+        <button class="icon-btn theme-toggle" type="button" aria-label="Toggle color theme">
+          <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+          <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </button>
       </nav>
-    </header>
+    </div>
+  </header>
 
+  <div class="page">
     <main id="content">
       <section class="hero">
-        <p class="kicker">Rust CLI &amp; library · v0.3.0 · MIT</p>
-        <h1>PDF to Markdown, from scratch, in a few milliseconds.</h1>
-        <p class="lede">
-          <code>pdfmd</code> parses the object graph, inflates streams, decodes fonts,
-          and interprets content operators itself — then recovers columns, tables,
-          headings, lists, and paragraphs. <code>[dependencies]</code> is empty.
+        <p class="badge">
+          <span class="dot" aria-hidden="true"></span>
+          v0.3.0
+          <span class="sep" aria-hidden="true">/</span>
+          Rust CLI &amp; library
+          <span class="sep" aria-hidden="true">/</span>
+          MIT
         </p>
+        <h1>PDF to Markdown in <em>milliseconds</em>.</h1>
+        <p class="lede">
+          <code>pdfmd</code> parses the object graph, inflates streams, decodes fonts and
+          interprets content operators itself — then recovers columns, tables, headings
+          and lists. <code>[dependencies]</code> is empty.
+        </p>
+
+        <div class="cta">
+          <button class="copy-cmd" type="button" data-copy="cargo install --path .">
+            <span class="prompt" aria-hidden="true">$</span>
+            <span>cargo install --path .</span>
+            <span class="label">copy</span>
+          </button>
+          <a class="btn-ghost" href="https://github.com/colesmcintosh/pdfmd">
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38l-.01-1.49c-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48l-.01 2.2c0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+            View source
+          </a>
+        </div>
+
+        <div class="demo" id="demo">
+          <div class="pane">
+            <div class="pane-head"><span>input.pdf</span><span class="tag">1.05 MB · 17 pages</span></div>
+            <div class="pane-body">
+              <div class="sheet" role="img" aria-label="A schematic two-column PDF page with a heading and a table">
+                <i class="t"></i>
+                <div class="cols">
+                  <i style="width:100%"></i><i style="width:92%"></i>
+                  <i style="width:88%"></i><i style="width:97%"></i>
+                  <i style="width:96%"></i><i style="width:74%"></i>
+                  <i style="width:99%"></i><i style="width:93%"></i>
+                  <i style="width:61%"></i><i style="width:90%"></i>
+                </div>
+                <div class="grid" aria-hidden="true">
+                  <i></i><i></i><i></i>
+                  <i></i><i></i><i></i>
+                  <i></i><i></i><i></i>
+                  <i></i><i></i><i></i>
+                </div>
+                <div class="cols">
+                  <i style="width:94%"></i><i style="width:83%"></i>
+                  <i style="width:98%"></i><i style="width:91%"></i>
+                  <i style="width:70%"></i><i style="width:96%"></i>
+                </div>
+              </div>
+              <div class="scan" aria-hidden="true"></div>
+            </div>
+          </div>
+
+          <div class="rail">
+            <span class="arrow" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+            </span>
+            <span class="clock" id="clock">4.4</span>
+            <span class="unit">ms</span>
+            <button class="replay" type="button" id="replay">replay</button>
+          </div>
+
+          <div class="pane">
+            <div class="pane-head"><span>output.md</span><span class="tag">stdout</span></div>
+            <div class="pane-body">
+<pre class="md" aria-label="The Markdown pdfmd produces from that page"><span class="ln h" style="--i:0"># Layout-Aware Extraction</span><span class="ln" style="--i:1"> </span><span class="ln h" style="--i:2">## 1  Two columns, one pass</span><span class="ln" style="--i:3"> </span><span class="ln" style="--i:4">Reading order comes from glyph</span><span class="ln" style="--i:5">positions, not the order bytes</span><span class="ln" style="--i:6">appear in the content stream.</span><span class="ln" style="--i:7"> </span><span class="ln g" style="--i:8">| stage   | alloc | ms  |</span><span class="ln g" style="--i:9">| ------- | ----- | --- |</span><span class="ln g" style="--i:10">| inflate | 1     | 0.9 |</span><span class="ln g" style="--i:11">| glyphs  | 0     | 2.1 |</span><span class="ln" style="--i:12"> </span><span class="ln p" style="--i:13">![](figs/fig-1.png)</span></pre>
+            </div>
+          </div>
+        </div>
+        <p class="demo-note">Illustrative output. The timing is the measured mean below.</p>
+
         <div class="stats" role="list">
           <div role="listitem"><b>0</b><span>runtime crates</span></div>
-          <div role="listitem"><b>4.4&nbsp;ms</b><span>mean, 17-page paper</span></div>
+          <div role="listitem"><b>4.4 ms</b><span>mean, 17-page paper</span></div>
           <div role="listitem"><b>99.04%</b><span>line coverage</span></div>
-          <div role="listitem"><b>~700&nbsp;KB</b><span>release binary</span></div>
+          <div role="listitem"><b>~700 KB</b><span>release binary</span></div>
         </div>
       </section>
 
       <section id="install">
-        <h2>Install</h2>
-        <p>Build from the repository. The release binary lands at <code>./target/release/pdfmd</code>.</p>
-<pre>cargo install --path .
-cargo build --release</pre>
+        <div class="sec-head">
+          <span class="idx">01</span>
+          <h2>Install</h2>
+          <p>One crate, no build scripts</p>
+        </div>
+        <div class="grid-2">
+          <div class="code">
+            <div class="code-head"><span>install the CLI</span>
+              <button class="copy" type="button" data-copy="cargo install --path .">copy</button>
+            </div>
+            <pre><span class="k">cargo</span> install --path .</pre>
+          </div>
+          <div class="code">
+            <div class="code-head"><span>or build in place</span>
+              <button class="copy" type="button" data-copy="cargo build --release">copy</button>
+            </div>
+            <pre><span class="k">cargo</span> build --release  <span class="c"># → ./target/release/pdfmd</span></pre>
+          </div>
+        </div>
       </section>
 
       <section id="usage">
-        <h2>Usage</h2>
-<pre>pdfmd input.pdf                     # markdown to stdout
-pdfmd input.pdf -o output.md        # write to a file
-pdfmd input.pdf --page-breaks       # insert --- between pages
-pdfmd input.pdf --extract-images figs -o out.md
-cat input.pdf | pdfmd -             # read from stdin
-pdfmd https://example.com/x.pdf     # fetched via curl on PATH</pre>
-        <p>
-          Image extraction passes through JPEG and JPEG 2000 streams, and converts
-          decoded 8-bit DeviceGray / DeviceRGB / DeviceCMYK rasters to PNG.
+        <div class="sec-head">
+          <span class="idx">02</span>
+          <h2>Usage</h2>
+          <p>Files, stdin, or a URL</p>
+        </div>
+        <div class="code">
+          <div class="code-head"><span>shell</span>
+            <button class="copy" type="button" data-copy="pdfmd input.pdf">copy</button>
+          </div>
+<pre><span class="k">pdfmd</span> input.pdf                     <span class="c"># markdown to stdout</span>
+<span class="k">pdfmd</span> input.pdf <span class="f">-o</span> output.md        <span class="c"># write to a file</span>
+<span class="k">pdfmd</span> input.pdf <span class="f">--page-breaks</span>       <span class="c"># insert --- between pages</span>
+<span class="k">pdfmd</span> input.pdf <span class="f">--extract-images</span> figs <span class="f">-o</span> out.md
+<span class="k">cat</span> input.pdf | <span class="k">pdfmd</span> <span class="f">-</span>             <span class="c"># read from stdin</span>
+<span class="k">pdfmd</span> <span class="s">https://example.com/x.pdf</span>     <span class="c"># fetched via curl on PATH</span></pre>
+        </div>
+        <p style="margin-top:1rem">
+          Image extraction passes through JPEG and JPEG 2000 streams, and converts decoded
+          8-bit DeviceGray / DeviceRGB / DeviceCMYK rasters to PNG.
         </p>
       </section>
 
       <section id="library">
-        <h2>Library</h2>
-        <p>The same converter is a Rust API with one error type:</p>
-<pre>use pdfmd::{convert_pdf_to_markdown, ConvertOptions};
+        <div class="sec-head">
+          <span class="idx">03</span>
+          <h2>Library</h2>
+          <p>Same converter, one error type</p>
+        </div>
+        <div class="code">
+          <div class="code-head"><span>main.rs</span>
+            <button class="copy" type="button" data-copy="use pdfmd::{convert_pdf_to_markdown, ConvertOptions};">copy</button>
+          </div>
+<pre><span class="k">use</span> pdfmd::{convert_pdf_to_markdown, ConvertOptions};
 
-let result = convert_pdf_to_markdown(&amp;pdf_bytes, &amp;ConvertOptions::default())?;
-print!("{}", result.markdown);</pre>
+<span class="k">let</span> result = convert_pdf_to_markdown(&amp;pdf_bytes, &amp;ConvertOptions::default())?;
+print!(<span class="s">"{}"</span>, result.markdown);</pre>
+        </div>
       </section>
 
       <section id="performance">
-        <h2>Performance</h2>
-        <p>
-          End-to-end CLI on a 1.05&nbsp;MB, 17-page arXiv paper (Apple Silicon, release,
-          <code>hyperfine --warmup 5 --runs 20 -N</code>): min 3.8&nbsp;ms, mean 4.4&nbsp;ms ± 0.3&nbsp;ms,
-          about 3,900 pages/sec.
-        </p>
-        <p>
-          Pages extract in parallel via <code>std::thread::scope</code>. Fonts are parsed once
-          and cached document-wide. Multi-page Markdown formatting uses the same pool.
-          The content-stream tokenizer and DEFLATE decoder borrow operands from the
-          source bytes — no per-operator or per-Huffman allocation.
-        </p>
-        <div class="table-wrap">
-          <table>
-            <caption class="kicker">Published comparison targets (local synthetic PDFs)</caption>
-            <thead>
-              <tr>
-                <th>document</th>
-                <th>other published</th>
-                <th>pdfmd</th>
-                <th>speedup</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td>1 page</td><td>2.0 ms</td><td>0.012 ms</td><td>~167×</td></tr>
-              <tr><td>24 pages</td><td>41.0 ms</td><td>0.118 ms</td><td>~347×</td></tr>
-              <tr><td>60 pages</td><td>123.0 ms</td><td>0.201 ms</td><td>~612×</td></tr>
-              <tr><td>457 pages</td><td>777.0 ms</td><td>0.933 ms</td><td>~833×</td></tr>
-            </tbody>
-          </table>
+        <div class="sec-head">
+          <span class="idx">04</span>
+          <h2>Speed</h2>
+          <p>~3,900 pages/sec</p>
         </div>
         <p>
-          Those rows are throughput targets against other published library numbers,
-          not a claim against those exact corpora or hardware.
+          End-to-end CLI on a 1.05 MB, 17-page arXiv paper (Apple Silicon, release,
+          <code>hyperfine --warmup 5 --runs 20 -N</code>): min 3.8 ms, mean 4.4 ms ± 0.3 ms.
+        </p>
+        <p>
+          Pages extract in parallel via <code>std::thread::scope</code>, fonts are parsed once and
+          cached document-wide, and the content-stream tokenizer and DEFLATE decoder borrow
+          operands straight out of the source bytes — no per-operator or per-Huffman allocation.
+        </p>
+        <div class="perf">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">document</th>
+                  <th scope="col">other published</th>
+                  <th scope="col">pdfmd</th>
+                  <th scope="col" class="bar-cell">speedup</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>1 page</td><td>2.0 ms</td><td class="ours">0.012 ms</td>
+                  <td class="bar-cell"><span class="bar"><span class="track"><span class="fill" style="--w:20%"></span></span><span class="num">167×</span></span></td>
+                </tr>
+                <tr>
+                  <td>24 pages</td><td>41.0 ms</td><td class="ours">0.118 ms</td>
+                  <td class="bar-cell"><span class="bar"><span class="track"><span class="fill" style="--w:42%"></span></span><span class="num">347×</span></span></td>
+                </tr>
+                <tr>
+                  <td>60 pages</td><td>123.0 ms</td><td class="ours">0.201 ms</td>
+                  <td class="bar-cell"><span class="bar"><span class="track"><span class="fill" style="--w:73%"></span></span><span class="num">612×</span></span></td>
+                </tr>
+                <tr>
+                  <td>457 pages</td><td>777.0 ms</td><td class="ours">0.933 ms</td>
+                  <td class="bar-cell"><span class="bar"><span class="track"><span class="fill" style="--w:100%"></span></span><span class="num">833×</span></span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <p class="footnote">
+          Those rows are throughput targets against other published library numbers, not a
+          claim against those exact corpora or hardware.
         </p>
       </section>
 
       <section id="how">
-        <h2>How it works</h2>
-        <p>
-          Every layer lives in this crate: xref and object-stream reading, zlib/DEFLATE,
-          font and ToUnicode CMap handling, the content-stream interpreter, heuristics,
-          and the argv parser.
-        </p>
-        <div class="arch" role="img" aria-label="Source layout of the pdfmd crate">src/
-├── pdf/          xref, objects, streams, DEFLATE, page tree
-├── extract/      fonts, CMaps, content ops, layout, tagged PDF, images
-├── heuristics/   columns, tables, headings, lists, emphasis
-├── lib.rs        convert_pdf_to_markdown
-└── cli.rs        argv parser and execution</div>
+        <div class="sec-head">
+          <span class="idx">05</span>
+          <h2>Internals</h2>
+          <p>Every layer lives in the crate</p>
+        </div>
+        <div class="pipeline" role="img" aria-label="Pipeline: bytes, xref, objects, inflate, fonts, content ops, layout, heuristics, markdown">
+          <span>bytes</span><span class="sep">→</span>
+          <span>xref</span><span class="sep">→</span>
+          <span>objects</span><span class="sep">→</span>
+          <span>inflate</span><span class="sep">→</span>
+          <span>fonts</span><span class="sep">→</span>
+          <span>content ops</span><span class="sep">→</span>
+          <span>layout</span><span class="sep">→</span>
+          <span>heuristics</span><span class="sep">→</span>
+          <span>markdown</span>
+        </div>
+        <div class="arch" role="img" aria-label="Source layout of the pdfmd crate"><b>src/</b>
+├── <b>pdf/</b>          <i>xref, objects, streams, DEFLATE, page tree</i>
+├── <b>extract/</b>      <i>fonts, CMaps, content ops, layout, tagged PDF, images</i>
+├── <b>heuristics/</b>   <i>columns, tables, headings, lists, emphasis</i>
+├── <b>lib.rs</b>        <i>convert_pdf_to_markdown</i>
+└── <b>cli.rs</b>        <i>argv parser and execution</i></div>
       </section>
 
       <section id="limits">
-        <h2>Limitations</h2>
+        <div class="sec-head">
+          <span class="idx">06</span>
+          <h2>Limitations</h2>
+          <p>What it does not try to do</p>
+        </div>
         <ul class="limits">
-          <li>Tables and columns are recovered when the layout is clear; spanned cells, nested tables, and complex math stay best-effort reflow.</li>
+          <li>Tables and columns are recovered when the layout is clear; spanned cells, nested tables and complex math stay best-effort reflow.</li>
           <li>Fonts without a ToUnicode CMap, a standard encoding, or <code>/Differences</code> drop glyphs.</li>
           <li>Heuristics target academic and prose documents, not forms or invoices.</li>
           <li>Encrypted PDFs and <code>LZWDecode</code> streams are unsupported by design.</li>
@@ -140,10 +288,85 @@ print!("{}", result.markdown);</pre>
 
     <footer class="site-footer">
       <span>MIT · Cole McIntosh</span>
-      <span>
-        <a href="https://github.com/colesmcintosh/pdfmd">github.com/colesmcintosh/pdfmd</a>
-      </span>
+      <nav aria-label="Footer">
+        <a href="https://github.com/colesmcintosh/pdfmd">github</a>
+        <a href="https://github.com/colesmcintosh/pdfmd/issues">issues</a>
+        <a href="https://crates.io/crates/pdfmd">crates.io</a>
+      </nav>
     </footer>
   </div>
+
+  <script>
+    (function () {
+      var root = document.documentElement;
+
+      // Theme toggle.
+      var toggle = document.querySelector(".theme-toggle");
+      if (toggle) {
+        toggle.addEventListener("click", function () {
+          var next = root.dataset.theme === "light" ? "dark" : "light";
+          root.dataset.theme = next;
+          try { localStorage.setItem("pdfmd-theme", next); } catch (e) {}
+        });
+      }
+
+      // Hairline under the header only once the page has moved.
+      var header = document.querySelector(".site-header");
+      var onScroll = function () {
+        header.classList.toggle("is-stuck", window.scrollY > 8);
+      };
+      addEventListener("scroll", onScroll, { passive: true });
+      onScroll();
+
+      // Copy buttons.
+      document.querySelectorAll("[data-copy]").forEach(function (btn) {
+        var label = btn.querySelector(".label") || btn;
+        var idle = label.textContent;
+        btn.addEventListener("click", function () {
+          navigator.clipboard.writeText(btn.dataset.copy).then(function () {
+            label.textContent = "copied";
+            btn.classList.add("is-copied");
+            setTimeout(function () {
+              label.textContent = idle;
+              btn.classList.remove("is-copied");
+            }, 1400);
+          }, function () {});
+        });
+      });
+
+      // The convert demo: scan the page, reveal the markdown, count the clock up.
+      var demo = document.getElementById("demo");
+      var clock = document.getElementById("clock");
+      var still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      var timer;
+
+      if (!still) demo.classList.add("is-armed");
+
+      function run() {
+        if (still) { clock.textContent = "4.4"; return; }
+        demo.classList.remove("is-running");
+        void demo.offsetWidth; // restart the CSS animations
+        demo.classList.add("is-running");
+
+        clearInterval(timer);
+        var start = performance.now();
+        timer = setInterval(function () {
+          var t = Math.min((performance.now() - start) / 1150, 1);
+          clock.textContent = (t * 4.4).toFixed(1);
+          if (t === 1) clearInterval(timer);
+        }, 40);
+      }
+
+      document.getElementById("replay").addEventListener("click", run);
+
+      if ("IntersectionObserver" in window) {
+        new IntersectionObserver(function (entries, obs) {
+          if (entries[0].isIntersecting) { run(); obs.disconnect(); }
+        }, { threshold: 0.2 }).observe(demo);
+      } else {
+        run();
+      }
+    })();
+  </script>
 </body>
 </html>

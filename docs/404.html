@@ -1,17 +1,32 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Not found · pdfmd</title>
+  <meta name="theme-color" content="#08090b">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
+  <script>
+    try {
+      var t = localStorage.getItem("pdfmd-theme");
+      document.documentElement.dataset.theme =
+        t || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <main class="page missing">
-    <p class="kicker"><a href="./">pdfmd</a></p>
+    <p class="badge">
+      <span class="dot" aria-hidden="true" style="background:var(--accent);box-shadow:none"></span>
+      404
+    </p>
     <h1>This page isn’t in the document.</h1>
-    <p>The path you asked for doesn’t exist. Head back to the <a href="./">project site</a> or the <a href="https://github.com/colesmcintosh/pdfmd">repository</a>.</p>
+    <p>The path you asked for doesn’t exist — no xref entry, no object, nothing to inflate.</p>
+    <div class="cta">
+      <a class="btn-ghost" href="./">← Back to pdfmd</a>
+      <a class="btn-ghost" href="https://github.com/colesmcintosh/pdfmd">Repository</a>
+    </div>
   </main>
 </body>
 </html>
