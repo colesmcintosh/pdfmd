@@ -49,3 +49,6 @@ cargo run --release --bin profile
 - `src/bin/*` is profiling / comparison only. Don't import it.
 
 Commit subjects: `module: lowercase summary`. Don't push to `main`.
+Fill `.github/PULL_REQUEST_TEMPLATE.md` on every PR. New issues use
+the forms in `.github/ISSUE_TEMPLATE/` — pick bug, feature, or
+performance, and refuse work that needs a crate, encryption, or LZW.

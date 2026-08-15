@@ -1,0 +1,55 @@
+name: Bug
+description: Conversion is wrong, incomplete, or the process errors.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [VISION.md](https://github.com/colesmcintosh/pdfmd/blob/main/VISION.md)
+        and [AGENTS.md](https://github.com/colesmcintosh/pdfmd/blob/main/AGENTS.md)
+        first. Encrypted PDFs and `LZWDecode` are unsupported by design — do not
+        file those as bugs.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Actual Markdown, error message, or crash.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Likely layer
+      options:
+        - pdf (xref, objects, filters, deflate)
+        - extract (fonts, CMaps, content stream, images, layout)
+        - heuristics (columns, tables, headings, lists)
+        - cli
+        - unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Command, options (`--page-breaks`, `--extract-images`), and a reduced input if you can share one. `*.pdf` is gitignored except `tests/fixtures/*.pdf`.
+      placeholder: pdfmd input.pdf -o out.md
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: pdfmd / rustc version
+      placeholder: pdfmd 0.3.0, rustc 1.70+

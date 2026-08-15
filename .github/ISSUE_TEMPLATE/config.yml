@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Agent instructions
+    url: https://github.com/colesmcintosh/pdfmd/blob/main/AGENTS.md
+    about: Read AGENTS.md and VISION.md before opening an issue or PR.
+  - name: Project vision
+    url: https://github.com/colesmcintosh/pdfmd/blob/main/VISION.md
+    about: Zero runtime dependencies. Encrypted PDFs and LZWDecode are non-goals.

@@ -88,7 +88,10 @@ Faster without a crate beats cleaner with a crate.
   are the first-class docs; keep them in sync when behavior changes.
 - Commit subjects use a `module: lowercase summary` prefix —
   e.g. `pdf: cap dictionary entry count to avoid quadratic insert hang`.
-- Don't push to `main`; open a PR.
+- Don't push to `main`; open a PR. Use
+  `.github/PULL_REQUEST_TEMPLATE.md`. File issues with the forms in
+  `.github/ISSUE_TEMPLATE/` (bug, feature, performance). Do not open
+  issues that ask for a runtime crate, encryption, or `LZWDecode`.
 
 ## Gotchas
 
