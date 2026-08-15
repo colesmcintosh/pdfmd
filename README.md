@@ -28,7 +28,8 @@ paper and leaves room to tune the heuristics for the documents you care
 about.
 
 `[dependencies]` is empty. The CLI parser, error type, work scheduler,
-PDF reader, and DEFLATE decoder all live in this crate.
+PDF reader, and DEFLATE decoder all live in this crate. The north star
+is in [`VISION.md`](VISION.md).
 
 ## Install
 
