@@ -1,0 +1,48 @@
+name: Performance
+description: A speed regression, or a way to go faster without adding a crate.
+title: "perf: "
+labels: [performance]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Speed is the product. Read [VISION.md](https://github.com/colesmcintosh/pdfmd/blob/main/VISION.md).
+        A change that needs a crate to go faster is the wrong change.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - Regression (used to be faster)
+        - Opportunity (a hot path we should tighten)
+    validations:
+      required: true
+
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: End-to-end wall time from bytes to Markdown, not a single-stage microbenchmark. Include page count, file size, and how you measured (`hyperfine`, `cargo run --release --bin profile`).
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hot-path
+    attributes:
+      label: Suspected hot path
+      options:
+        - pdf/deflate.rs
+        - extract/parser.rs (content-stream tokenizer)
+        - extract/content.rs
+        - util.rs (parallel_map)
+        - heuristics
+        - unknown / other
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Input shape, allocation suspicion, or a reduced fixture idea.

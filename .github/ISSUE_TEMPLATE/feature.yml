@@ -1,0 +1,39 @@
+name: Feature
+description: A conversion or CLI improvement that fits the zero-dependency vision.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [VISION.md](https://github.com/colesmcintosh/pdfmd/blob/main/VISION.md)
+        first. Features that need a runtime crate, encryption, `LZWDecode`, a
+        plugin system, or a general PDF toolkit will be closed.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is hard or wrong today, with a concrete document shape if you have one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Smallest change that would help. Name the module (`pdf`, `extract`, `heuristics`, `cli`).
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This can be implemented with an empty `[dependencies]` table
+          required: true
+        - label: This is not encryption, `LZWDecode`, rendering, or a new markdown dialect
+          required: true
+        - label: The public API stays `convert_pdf_to_markdown` / `ConvertOptions` / `ConvertResult` / `Error` (or this only adds an option that belongs there)
+          required: true
