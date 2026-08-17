@@ -50,8 +50,7 @@ pub struct ConvertResult {
     pub images: Vec<ExtractedImage>,
 }
 
-/// Top-level error returned from [`convert_pdf_to_markdown`]. Wraps the
-/// from-scratch [`PdfError`] for callers that care to distinguish causes.
+/// Top-level error returned from [`convert_pdf_to_markdown`].
 pub type Error = PdfError;
 /// Convenience alias used throughout the public API.
 pub type Result<T> = std::result::Result<T, Error>;
