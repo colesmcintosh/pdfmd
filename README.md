@@ -55,6 +55,7 @@ pdfmd input.pdf --extract-images figs -o out.md
                                     # and link them inline in out.md
 cat input.pdf | pdfmd -             # read from stdin
 pdfmd https://example.com/x.pdf     # fetched via `curl` on PATH
+pdfmd --help                        # flags and input forms
 ```
 
 Image extraction passes through JPEG (`DCTDecode`) and JPEG 2000
@@ -72,6 +73,7 @@ use pdfmd::{convert_pdf_to_markdown, ConvertOptions};
 
 let result = convert_pdf_to_markdown(&pdf_bytes, &ConvertOptions::default())?;
 print!("{}", result.markdown);
+// result.images is empty unless ConvertOptions::image_dir is set
 ```
 
 ## Markdown reconstruction

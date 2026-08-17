@@ -35,5 +35,5 @@ body:
           required: true
         - label: This is not encryption, `LZWDecode`, rendering, or a new markdown dialect
           required: true
-        - label: The public API stays `convert_pdf_to_markdown` / `ConvertOptions` / `ConvertResult` / `Error` (or this only adds an option that belongs there)
+        - label: The public API stays `convert_pdf_to_markdown` / `ConvertOptions` / `ConvertResult` / `ExtractedImage` / `Error` (or this only adds an option that belongs there)
           required: true

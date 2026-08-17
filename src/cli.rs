@@ -21,8 +21,9 @@ ARGS:
 OPTIONS:
     -o, --output <FILE>             Write Markdown to FILE instead of stdout.
         --page-breaks               Insert `---` between PDF pages.
-        --extract-images <DIR>      Save embedded JPEG / JPEG 2000 images
-                                    into DIR and reference them inline.
+        --extract-images <DIR>      Save supported embedded images into DIR
+                                    (JPEG, JPEG 2000, 8-bit rasters as PNG)
+                                    and reference them inline.
     -h, --help                      Print this help.
     -V, --version                   Print version information.
 ";

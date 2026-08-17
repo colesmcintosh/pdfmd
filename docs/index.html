@@ -35,6 +35,7 @@
       <nav class="site-nav" aria-label="Site">
         <a href="#install">Install</a>
         <a href="#usage">Usage</a>
+        <a href="#markdown">Markdown</a>
         <a href="#performance">Speed</a>
         <a class="hide-sm" href="#how">Internals</a>
         <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
@@ -193,9 +194,24 @@ print!(<span class="s">"{}"</span>, result.markdown);</pre>
         </div>
       </section>
 
-      <section id="performance">
+      <section id="markdown">
         <div class="sec-head">
           <span class="idx">04</span>
+          <h2>Markdown</h2>
+          <p>Layout-aware, still best-effort</p>
+        </div>
+        <ul class="limits">
+          <li>Multi-column pages read left-to-right, then top-to-bottom in each column.</li>
+          <li>GFM tables from ruled path grids and from aligned borderless columns.</li>
+          <li>Headings from tagged-PDF roles, font size, bold, numbered sections, and names such as <code>Abstract</code>.</li>
+          <li>Lists, bold/italic from the font name, monospace as fenced code, running headers stripped.</li>
+          <li>The first paragraph is promoted to <code>#</code> when it is a single-line title.</li>
+        </ul>
+      </section>
+
+      <section id="performance">
+        <div class="sec-head">
+          <span class="idx">05</span>
           <h2>Speed</h2>
           <p>~3,900 pages/sec</p>
         </div>
@@ -248,7 +264,7 @@ print!(<span class="s">"{}"</span>, result.markdown);</pre>
 
       <section id="how">
         <div class="sec-head">
-          <span class="idx">05</span>
+          <span class="idx">06</span>
           <h2>Internals</h2>
           <p>Every layer lives in the crate</p>
         </div>
@@ -273,7 +289,7 @@ print!(<span class="s">"{}"</span>, result.markdown);</pre>
 
       <section id="limits">
         <div class="sec-head">
-          <span class="idx">06</span>
+          <span class="idx">07</span>
           <h2>Limitations</h2>
           <p>What it does not try to do</p>
         </div>
@@ -291,7 +307,7 @@ print!(<span class="s">"{}"</span>, result.markdown);</pre>
       <nav aria-label="Footer">
         <a href="https://github.com/colesmcintosh/pdfmd">github</a>
         <a href="https://github.com/colesmcintosh/pdfmd/issues">issues</a>
-        <a href="https://crates.io/crates/pdfmd">crates.io</a>
+        <a href="https://github.com/colesmcintosh/pdfmd/blob/main/VISION.md">vision</a>
       </nav>
     </footer>
   </div>

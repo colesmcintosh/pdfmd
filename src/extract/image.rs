@@ -16,6 +16,9 @@ use png::encode_png;
 use png::zlib_stored;
 
 /// An image extracted from the PDF, ready to be written to disk.
+///
+/// `filename` is `img-NNN.ext` (`jpg`, `jp2`, or `png`). The caller writes
+/// `bytes` to `image_dir/filename`; the Markdown already references that path.
 pub struct ExtractedImage {
     pub filename: String,
     pub bytes: Vec<u8>,

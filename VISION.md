@@ -69,7 +69,7 @@ If a change needs a crate to go faster, it is the wrong change.
 - Recover more text and better Markdown from academic and prose PDFs
   (columns, GFM tables, headings, lists, emphasis, hyphenation).
 - Keep the public API small: `convert_pdf_to_markdown`, `ConvertOptions`,
-  `ConvertResult`, `Error`.
+  `ConvertResult`, `ExtractedImage`, `Error`.
 - Stay on MSRV 1.70 so the crate builds on older toolchains.
 
 ## What we will not do
