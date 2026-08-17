@@ -1,9 +1,22 @@
-//! Convert PDF documents into Markdown.
+//! Convert PDF documents into Markdown with zero runtime dependencies.
 //!
-//! Text is extracted directly from the PDF (see [`extract`]) and then run
-//! through a small set of heuristics (see [`heuristics`]) to recover
-//! headings, lists, and paragraph boundaries — PDFs carry no semantic
-//! structure of their own.
+//! The crate owns the path from bytes to Markdown: xref and object streams,
+//! DEFLATE, fonts and ToUnicode CMaps, content operators, and layout
+//! heuristics. Positioned spans are reconstructed into columns, GFM tables,
+//! headings, lists, and emphasis. Encrypted PDFs and `LZWDecode` return
+//! [`Error`].
+//!
+//! # Example
+//!
+//! ```no_run
+//! use pdfmd::{convert_pdf_to_markdown, ConvertOptions};
+//!
+//! # fn convert(pdf_bytes: &[u8]) -> pdfmd::Result<()> {
+//! let result = convert_pdf_to_markdown(pdf_bytes, &ConvertOptions::default())?;
+//! print!("{}", result.markdown);
+//! # Ok(())
+//! # }
+//! ```
 
 mod extract;
 mod heuristics;
@@ -37,13 +50,17 @@ pub struct ConvertResult {
     pub images: Vec<ExtractedImage>,
 }
 
-/// Top-level error returned from [`convert_pdf_to_markdown`]. Wraps the
-/// from-scratch [`PdfError`] for callers that care to distinguish causes.
+/// Top-level error returned from [`convert_pdf_to_markdown`].
 pub type Error = PdfError;
 /// Convenience alias used throughout the public API.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Convert the byte contents of a PDF into a Markdown document.
+///
+/// The first paragraph is promoted to `#` when it is a single line and not
+/// already a heading or image. With [`ConvertOptions::image_dir`] set,
+/// supported image XObjects are returned in [`ConvertResult::images`] and
+/// referenced inline as `![](dir/filename)`.
 pub fn convert_pdf_to_markdown(pdf_bytes: &[u8], opts: &ConvertOptions) -> Result<ConvertResult> {
     let (layouts, images, roles) = extract_document(pdf_bytes, opts.image_dir.is_some())?;
 

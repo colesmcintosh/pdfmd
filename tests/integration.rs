@@ -287,7 +287,10 @@ fn cli_help_exits_clean() {
         .output()
         .expect("spawn");
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("USAGE"));
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("USAGE"));
+    assert!(help.contains("JPEG 2000"));
+    assert!(help.contains("PNG"));
 
     let output = Command::new(binary()).arg("-h").output().expect("spawn");
     assert!(output.status.success());
