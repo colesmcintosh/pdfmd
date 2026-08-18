@@ -126,7 +126,16 @@ fn format_page_layout(
             parts.push(md);
         }
     }
-    parts.join("\n\n")
+    join_blocks(parts)
+}
+
+/// Join markdown blocks with a blank line between them, dropping empties.
+fn join_blocks(parts: impl IntoIterator<Item = String>) -> String {
+    parts
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn format_column(
@@ -161,18 +170,12 @@ fn format_column(
                     return table;
                 }
                 let rest_md = format_column_text(&rest, page_idx, roles, median);
-                if rest.iter().any(|s| s.y > bbox[3]) {
-                    return [rest_md, table]
-                        .into_iter()
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                }
-                return [table, rest_md]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                // Text above the table's top edge reads first.
+                return if rest.iter().any(|s| s.y > bbox[3]) {
+                    join_blocks([rest_md, table])
+                } else {
+                    join_blocks([table, rest_md])
+                };
             }
         }
     }
@@ -215,7 +218,7 @@ fn format_column_text(spans: &[&Span], page_idx: usize, roles: &RoleMap, median:
             out.push(block);
         }
     }
-    out.join("\n\n")
+    join_blocks(out)
 }
 
 fn format_line_block(lines: &[VLine<'_>], page_idx: usize, roles: &RoleMap, median: f32) -> String {
@@ -285,12 +288,7 @@ fn heading_for_line(
         if let Some(level) = heading_level(line) {
             return Some(level);
         }
-        if bold
-            && line.len() <= 80
-            && line.split_whitespace().count() <= 10
-            && !line.ends_with('.')
-            && !line.ends_with(',')
-        {
+        if bold && short_title_case(line) {
             return Some(3);
         }
     }
@@ -319,8 +317,13 @@ fn named_section(line: &str) -> Option<usize> {
     }
 }
 
+/// A heading never runs long or trails off in sentence punctuation.
+fn heading_shaped(line: &str) -> bool {
+    line.len() <= 120 && !line.ends_with('.') && !line.ends_with(',')
+}
+
 fn is_all_caps_heading(line: &str) -> bool {
-    if line.len() > 120 || line.ends_with('.') || line.ends_with(',') {
+    if !heading_shaped(line) {
         return false;
     }
     let mut n_alpha = 0usize;
@@ -388,35 +391,28 @@ fn style_line(line: &VLine<'_>) -> String {
             push_image_mark(&mut out, &s.text);
             continue;
         }
-        if s.space_before && !out.is_empty() && !out.ends_with(' ') {
-            out.push(' ');
-        }
-        push_styled(&mut out, s);
+        push_span(&mut out, s, true);
     }
     out
 }
 
-fn push_styled(out: &mut String, s: &Span) {
+/// Append one span, restoring the word break the extractor recorded but did
+/// not emit as a glyph. Emphasis markers are optional so the plain-text
+/// callers (line matching, running-margin detection) share the same joiner.
+fn push_span(out: &mut String, s: &Span, styled: bool) {
+    if s.space_before && !out.is_empty() && !out.ends_with(' ') {
+        out.push(' ');
+    }
     let t = s.text.as_str();
-    if t.trim().is_empty() {
-        out.push_str(t);
-        return;
-    }
-    if s.bold && s.italic {
-        out.push_str("***");
-        out.push_str(t);
-        out.push_str("***");
-    } else if s.bold {
-        out.push_str("**");
-        out.push_str(t);
-        out.push_str("**");
-    } else if s.italic {
-        out.push('*');
-        out.push_str(t);
-        out.push('*');
-    } else {
-        out.push_str(t);
-    }
+    let wrap = match (styled && !t.trim().is_empty(), s.bold, s.italic) {
+        (true, true, true) => "***",
+        (true, true, false) => "**",
+        (true, false, true) => "*",
+        _ => "",
+    };
+    out.push_str(wrap);
+    out.push_str(t);
+    out.push_str(wrap);
 }
 
 fn image_block(lines: &[VLine<'_>]) -> String {
@@ -577,10 +573,7 @@ fn band_text(spans: &[Span], y: f32) -> String {
     band.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal));
     let mut out = String::new();
     for s in band {
-        if s.space_before && !out.is_empty() && !out.ends_with(' ') {
-            out.push(' ');
-        }
-        out.push_str(&s.text);
+        push_span(&mut out, s, false);
     }
     out.trim().to_string()
 }
@@ -636,13 +629,9 @@ fn visual_lines<'a>(spans: &[&'a Span], cols: &[usize]) -> Vec<VLine<'a>> {
 pub(super) fn plain_line(line: &VLine<'_>) -> String {
     let mut out = String::new();
     for s in &line.spans {
-        if s.kind == SpanKind::Image {
-            continue;
+        if s.kind != SpanKind::Image {
+            push_span(&mut out, s, false);
         }
-        if s.space_before && !out.is_empty() && !out.ends_with(' ') {
-            out.push(' ');
-        }
-        out.push_str(&s.text);
     }
     let trimmed = out.trim();
     if trimmed.len() == out.len() {
@@ -652,79 +641,30 @@ pub(super) fn plain_line(line: &VLine<'_>) -> String {
     }
 }
 
-/// Group consecutive non-blank lines into blocks. A run of blank lines
-/// separates one block from the next.
-#[cfg(test)]
-fn group_into_blocks<'a>(lines: &[&'a str]) -> Vec<Vec<&'a str>> {
-    let mut blocks = Vec::new();
-    let mut current = Vec::new();
-
-    for line in lines {
-        if line.is_empty() {
-            if !current.is_empty() {
-                blocks.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(*line);
-        }
-    }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
-    blocks
-}
-
-/// Decide what kind of Markdown element a block represents and render it.
-#[cfg(test)]
-fn format_block(block: Vec<&str>) -> String {
-    if block.is_empty() {
-        return String::new();
-    }
-
-    if block.iter().all(|line| is_list_item(line)) {
-        return block
-            .iter()
-            .map(|line| format_list_item(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-    }
-
-    if block.len() == 1 {
-        let line = block[0];
-        if let Some(level) = heading_level(line) {
-            return format!("{} {}", "#".repeat(level), strip_heading_prefix(line));
-        }
-    }
-
-    block.join(" ")
-}
-
 /// Estimate a heading level (1-6) for a standalone line, or `None` if the
 /// line doesn't look like a heading.
 fn heading_level(line: &str) -> Option<usize> {
-    if line.len() > 120 || line.ends_with('.') || line.ends_with(',') {
+    if !heading_shaped(line) {
         return None;
     }
-
     if let Some(numbering) = match_numbered_heading(line) {
-        let dots = numbering.capture.matches('.').count();
-        let level = (dots + 1).min(6);
-        return Some(level);
+        return Some((numbering.capture.matches('.').count() + 1).min(6));
     }
-
     if is_all_caps_heading(line) {
         return Some(2);
     }
-
-    if line.len() <= 80
-        && line.split_whitespace().count() <= 10
+    if short_title_case(line)
         && line.chars().next().is_some_and(|c| c.is_uppercase())
         && !line.contains(';')
     {
         return Some(3);
     }
-
     None
+}
+
+/// Short enough, and few enough words, to read as a heading rather than prose.
+fn short_title_case(line: &str) -> bool {
+    heading_shaped(line) && line.len() <= 80 && line.split_whitespace().count() <= 10
 }
 
 fn strip_heading_prefix(line: &str) -> String {
@@ -756,37 +696,35 @@ struct Match<'a> {
     match_len: usize,
 }
 
+/// Length of the leading run of ASCII digits.
+fn digit_run(b: &[u8]) -> usize {
+    b.iter().take_while(|c| c.is_ascii_digit()).count()
+}
+
+/// Index past the mandatory whitespace at `i`, or `None` if there is none —
+/// `1.Introduction` is prose, `1. Introduction` is a heading.
+fn after_separator(line: &str, i: usize) -> Option<usize> {
+    let ws = skip_whitespace(line.get(i..)?);
+    (ws > 0).then_some(i + ws)
+}
+
 fn match_numbered_heading(line: &str) -> Option<Match<'_>> {
     let b = line.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
+    let mut i = digit_run(b);
     if i == 0 {
         return None;
     }
-    loop {
-        if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
-            i += 1;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-        } else {
-            break;
-        }
+    // Dotted sub-numbering: `1.2.3`.
+    while i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+        i += 1 + digit_run(&b[i + 1..]);
     }
     let capture_end = i;
-    if i < b.len() && b[i] == b'.' {
+    if b.get(i) == Some(&b'.') {
         i += 1;
-    }
-    let ws_start = i;
-    i += skip_whitespace(&line[i..]);
-    if i == ws_start {
-        return None;
     }
     Some(Match {
         capture: &line[..capture_end],
-        match_len: i,
+        match_len: after_separator(line, i)?,
     })
 }
 
@@ -809,26 +747,13 @@ fn match_bullet(line: &str) -> Option<usize> {
 
 fn match_ordered_list(line: &str) -> Option<Match<'_>> {
     let b = line.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == 0 {
-        return None;
-    }
-    let capture_end = i;
-    if i >= b.len() || (b[i] != b'.' && b[i] != b')') {
-        return None;
-    }
-    i += 1;
-    let ws_start = i;
-    i += skip_whitespace(&line[i..]);
-    if i == ws_start {
+    let capture_end = digit_run(b);
+    if capture_end == 0 || !matches!(b.get(capture_end), Some(b'.' | b')')) {
         return None;
     }
     Some(Match {
         capture: &line[..capture_end],
-        match_len: i,
+        match_len: after_separator(line, capture_end + 1)?,
     })
 }
 
@@ -952,17 +877,6 @@ mod tests {
     #[test]
     fn empty_blocks_produce_no_markdown() {
         assert_eq!(format_page("\n\n"), "");
-    }
-
-    #[test]
-    fn format_block_returns_empty_string_for_empty_block() {
-        assert_eq!(format_block(Vec::new()), "");
-    }
-
-    #[test]
-    fn group_into_blocks_splits_on_blank_lines() {
-        let lines = ["a", "", "b"];
-        assert_eq!(group_into_blocks(&lines), vec![vec!["a"], vec!["b"]]);
     }
 
     #[test]
