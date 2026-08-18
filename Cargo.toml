@@ -12,6 +12,11 @@ homepage = "https://colesmcintosh.github.io/pdfmd/"
 keywords = ["pdf", "markdown", "parser", "converter", "text-extraction"]
 categories = ["command-line-utilities", "parser-implementations", "text-processing"]
 
+# `cdylib` alongside `rlib` so `src/ffi.rs` ships a C ABI for the Python
+# package in `python/`; the rlib is what `cargo test` and Rust callers use.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 # Zero runtime dependencies by design. The PDF reader, zlib/DEFLATE
 # decoder, font/CMap handling, content-stream interpreter, CLI parser,
 # and parallel work-stealer are all implemented in this crate.
