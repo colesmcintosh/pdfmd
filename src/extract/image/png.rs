@@ -101,35 +101,6 @@ fn append_png_scanline_bytes(
     }
 }
 
-#[cfg(test)]
-pub(super) fn zlib_stored(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + (data.len() / 65_535 + 1) * 5 + 6);
-    out.extend_from_slice(&[0x78, 0x01]); // deflate, 32K window, fastest algorithm
-    let mut rest = data;
-    while !rest.is_empty() {
-        let take = rest.len().min(65_535);
-        let final_block = take == rest.len();
-        out.push(if final_block { 1 } else { 0 });
-        let len = take as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(&rest[..take]);
-        rest = &rest[take..];
-    }
-    if data.is_empty() {
-        out.extend_from_slice(&[1, 0, 0, 0xFF, 0xFF]);
-    }
-    out.extend_from_slice(&adler32(data).to_be_bytes());
-    out
-}
-
-#[cfg(test)]
-fn adler32(data: &[u8]) -> u32 {
-    let mut adler = (1u32, 0u32);
-    adler_update(&mut adler, data);
-    (adler.1 << 16) | adler.0
-}
-
 fn adler_push(adler: &mut (u32, u32), byte: u8) {
     const MOD: u32 = 65_521;
     adler.0 += byte as u32;

@@ -81,6 +81,40 @@ pub(crate) fn load_minimal_doc(extra_objs: &[(u32, &[u8])]) -> Document<'static>
     Document::load(bytes).expect("load")
 }
 
+/// [`load_minimal_doc`] for object bodies written as text.
+pub(crate) fn load_minimal_doc_str(extra_objs: &[(u32, &str)]) -> Document<'static> {
+    let bytes: Vec<(u32, &[u8])> = extra_objs.iter().map(|(n, s)| (*n, s.as_bytes())).collect();
+    load_minimal_doc(&bytes)
+}
+
+/// RFC 1950 zlib wrapper around stored (uncompressed) deflate blocks — just
+/// enough to seed `/FlateDecode` payloads without an encoder.
+pub(crate) fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78u8, 0x01]; // deflate, 32K window, fastest algorithm
+    let mut rest = data;
+    loop {
+        let take = rest.len().min(65_535);
+        let final_block = take == rest.len();
+        out.push(u8::from(final_block));
+        let len = take as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(&rest[..take]);
+        rest = &rest[take..];
+        if final_block {
+            break;
+        }
+    }
+    // Adler-32 checksum.
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    out
+}
+
 #[derive(Clone, Copy)]
 enum Row {
     Free,

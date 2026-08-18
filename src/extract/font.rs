@@ -195,20 +195,13 @@ fn follow_stream(doc: &Document<'_>, obj: Option<&Object>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pdf::{Dictionary, Document};
-
-    fn build_doc(extra_objs: &[(u32, &str)]) -> Document<'static> {
-        let extra: Vec<(u32, &[u8])> = extra_objs
-            .iter()
-            .map(|(n, payload)| (*n, payload.as_bytes()))
-            .collect();
-        crate::pdf::test_pdf::load_minimal_doc(&extra)
-    }
+    use crate::pdf::test_pdf::{load_minimal_doc_str, zlib_stored};
+    use crate::pdf::Dictionary;
 
     #[test]
     fn missing_font_object_returns_default() {
         // Object id 99 doesn't exist in the doc.
-        let doc = build_doc(&[]);
+        let doc = load_minimal_doc_str(&[]);
         let font = PdfFont::from_object(&doc, ObjectId(99, 0));
         // Default state.
         assert!(font.to_unicode.is_none());
@@ -221,14 +214,14 @@ mod tests {
         // present, but the helper still emits ids 1..=4 in the xref
         // table by padding 1..=3 with `f` markers. Without this test
         // that padding branch never runs.
-        let doc = build_doc(&[(8, "<</Type/Font/Subtype/Type1/BaseFont/Helv>>")]);
+        let doc = load_minimal_doc_str(&[(8, "<</Type/Font/Subtype/Type1/BaseFont/Helv>>")]);
         let font = PdfFont::from_object(&doc, ObjectId(8, 0));
         assert_eq!(font.kind, FontKind::Simple);
     }
 
     #[test]
     fn type0_font_uses_composite_kind() {
-        let doc = build_doc(&[(4, "<</Type/Font/Subtype/Type0/BaseFont/Foo>>")]);
+        let doc = load_minimal_doc_str(&[(4, "<</Type/Font/Subtype/Type0/BaseFont/Foo>>")]);
         let font = PdfFont::from_object(&doc, ObjectId(4, 0));
         assert_eq!(font.kind, FontKind::Composite);
         // No ToUnicode → composite code width defaults to 2.
@@ -237,7 +230,7 @@ mod tests {
 
     #[test]
     fn font_encoding_name_resolves_to_winansi() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             4,
             "<</Type/Font/Subtype/Type1/BaseFont/Helv/Encoding/WinAnsiEncoding>>",
         )]);
@@ -247,7 +240,7 @@ mod tests {
 
     #[test]
     fn font_encoding_dictionary_with_differences() {
-        let doc = build_doc(&[
+        let doc = load_minimal_doc_str(&[
             (
                 4,
                 "<</Type/Font/Subtype/Type1/BaseFont/Helv/Encoding 5 0 R>>",
@@ -271,7 +264,7 @@ mod tests {
 
     #[test]
     fn decode_into_uses_differences_override() {
-        let doc = build_doc(&[
+        let doc = load_minimal_doc_str(&[
             (4, "<</Type/Font/Subtype/Type1/Encoding 5 0 R>>"),
             (5, "<</Type/Encoding/Differences [65 /fi]>>"),
         ]);
@@ -286,7 +279,7 @@ mod tests {
         // Composite font (no simple_table) with no ToUnicode and no
         // matching glyph: the slow-path's "byte >= 0x20" arm still emits
         // the ASCII character.
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             4,
             "<</Type/Font/Subtype/Type0/Encoding/Identity-H/BaseFont/Foo>>",
         )]);
@@ -300,7 +293,7 @@ mod tests {
 
     #[test]
     fn decode_into_composite_without_cmap_silently_skips() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             4,
             "<</Type/Font/Subtype/Type0/Encoding/Identity-H/BaseFont/Foo>>",
         )]);
@@ -349,7 +342,7 @@ mod tests {
     fn font_encoding_dict_without_differences_skips_parse() {
         // /Encoding is a dict with BaseEncoding set but no /Differences —
         // the parser should pick up the base and leave differences empty.
-        let doc = build_doc(&[
+        let doc = load_minimal_doc_str(&[
             (4, "<</Type/Font/Subtype/Type1/Encoding 5 0 R>>"),
             (5, "<</Type/Encoding/BaseEncoding/WinAnsiEncoding>>"),
         ]);
@@ -360,7 +353,7 @@ mod tests {
 
     #[test]
     fn font_encoding_reference_to_non_dict_is_ignored() {
-        let doc = build_doc(&[
+        let doc = load_minimal_doc_str(&[
             (4, "<</Type/Font/Subtype/Type1/Encoding 5 0 R>>"),
             (5, "42"),
         ]);
@@ -373,7 +366,7 @@ mod tests {
     fn font_encoding_dict_without_base_just_picks_up_differences() {
         // The dict has /Differences but no /BaseEncoding — base stays
         // Standard, differences fill from the array.
-        let doc = build_doc(&[
+        let doc = load_minimal_doc_str(&[
             (4, "<</Type/Font/Subtype/Type1/Encoding 5 0 R>>"),
             (5, "<</Type/Encoding/Differences [65 /Aacute]>>"),
         ]);
@@ -393,7 +386,7 @@ mod tests {
         // codespacerange forces 2-byte source codes, and the bfchar maps
         // <0001> → 'A'.
         let payload = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n1 beginbfchar <0001> <0041> endbfchar\n";
-        let zlib = zlib_compress(payload);
+        let zlib = zlib_stored(payload);
         let zlib_len = zlib.len();
         let mut body = format!(
             "%PDF-1.4
@@ -450,7 +443,7 @@ stream
         // Word-generated PDFs commonly combine those bounds with one-byte
         // bfchar entries.
         let payload = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n1 beginbfchar <41> <0058> endbfchar\n";
-        let zlib = zlib_compress(payload);
+        let zlib = zlib_stored(payload);
         let zlib_len = zlib.len();
         let mut bytes = format!(
             "%PDF-1.4
@@ -490,29 +483,9 @@ stream
         assert_eq!(out, "XB");
     }
 
-    /// Minimal RFC 1950 zlib (stored block only) — used to seed in-test
-    /// `/FlateDecode` payloads without pulling another encoder.
-    fn zlib_compress(data: &[u8]) -> Vec<u8> {
-        let mut out = vec![0x78u8, 0x9C];
-        // Single final stored block: 0x01, LEN(2 LE), NLEN(2 LE).
-        out.push(0x01);
-        let len = data.len() as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(data);
-        // Adler-32 checksum.
-        let (mut a, mut b) = (1u32, 0u32);
-        for &byte in data {
-            a = (a + byte as u32) % 65521;
-            b = (b + a) % 65521;
-        }
-        out.extend_from_slice(&((b << 16) | a).to_be_bytes());
-        out
-    }
-
     #[test]
     fn follow_stream_returns_none_for_non_stream() {
-        let doc = build_doc(&[]);
+        let doc = load_minimal_doc_str(&[]);
         // ToUnicode points at a dict (not a stream) → None.
         let mut d = Dictionary::new();
         d.insert(b"K".to_vec(), Object::Integer(1));

@@ -12,8 +12,6 @@ use crate::pdf::{Dictionary, Document, Object, ObjectId};
 mod png;
 
 use png::encode_png;
-#[cfg(test)]
-use png::zlib_stored;
 
 /// An image extracted from the PDF, ready to be written to disk.
 ///
@@ -158,16 +156,7 @@ fn cmyk_to_rgb(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pdf::Document;
-
-    fn build_doc(defs: &[(u32, &str)]) -> Document<'static> {
-        let defs: Vec<(u32, &[u8])> = defs.iter().map(|(n, raw)| (*n, raw.as_bytes())).collect();
-        crate::pdf::test_pdf::load_minimal_doc(&defs)
-    }
-
-    fn build_doc_bytes(defs: &[(u32, &[u8])]) -> Document<'static> {
-        crate::pdf::test_pdf::load_minimal_doc(defs)
-    }
+    use crate::pdf::test_pdf::{load_minimal_doc, load_minimal_doc_str, zlib_stored};
 
     #[test]
     fn page_xobject_refs_handles_direct_dict() {
@@ -175,14 +164,14 @@ mod tests {
         let mut xobj = Dictionary::new();
         xobj.insert(b"Im1".to_vec(), Object::Reference(ObjectId(7, 0)));
         res.insert(b"XObject".to_vec(), Object::Dictionary(xobj));
-        let doc = build_doc(&[]);
+        let doc = load_minimal_doc_str(&[]);
         let refs = page_xobject_refs(&doc, &res);
         assert_eq!(refs.get(b"Im1".as_slice()), Some(&ObjectId(7, 0)));
     }
 
     #[test]
     fn page_xobject_refs_handles_indirect_dict() {
-        let doc = build_doc(&[(4, "<</Im1 7 0 R>>")]);
+        let doc = load_minimal_doc_str(&[(4, "<</Im1 7 0 R>>")]);
         let mut res = Dictionary::new();
         res.insert(b"XObject".to_vec(), Object::Reference(ObjectId(4, 0)));
         let refs = page_xobject_refs(&doc, &res);
@@ -191,7 +180,7 @@ mod tests {
 
     #[test]
     fn page_xobject_refs_returns_empty_when_missing_or_wrong_shape() {
-        let doc = build_doc(&[]);
+        let doc = load_minimal_doc_str(&[]);
         assert!(page_xobject_refs(&doc, &Dictionary::new()).is_empty());
         let mut res = Dictionary::new();
         res.insert(b"XObject".to_vec(), Object::Integer(0));
@@ -205,7 +194,7 @@ mod tests {
     #[test]
     fn extract_image_passes_through_jpeg() {
         // 5-byte stream pretending to be JPEG bytes.
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Filter/DCTDecode/Length 5>>\nstream\nHELLO\nendstream",
         )]);
@@ -216,7 +205,7 @@ mod tests {
 
     #[test]
     fn extract_image_passes_through_jpx_in_array_filter() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Filter [/JPXDecode]/Length 5>>\nstream\nHELLO\nendstream",
         )]);
@@ -226,7 +215,7 @@ mod tests {
 
     #[test]
     fn extract_image_rejects_form_xobject() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Form/Filter/DCTDecode/Length 0>>\nstream\n\nendstream",
         )]);
@@ -235,7 +224,7 @@ mod tests {
 
     #[test]
     fn extract_image_rejects_unsupported_filter() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Filter/FlateDecode/Length 0>>\nstream\n\nendstream",
         )]);
@@ -244,7 +233,7 @@ mod tests {
 
     #[test]
     fn extract_image_converts_raw_rgb_raster_to_png() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Width 2/Height 1/ColorSpace/DeviceRGB/BitsPerComponent 8/Length 6>>\nstream\nABCDEF\nendstream",
         )]);
@@ -266,7 +255,7 @@ mod tests {
         .into_bytes();
         obj.extend_from_slice(&zlib);
         obj.extend_from_slice(b"\nendstream");
-        let doc = build_doc_bytes(&[(7, &obj)]);
+        let doc = load_minimal_doc(&[(7, &obj)]);
         let (ext, bytes) = extract_image(&doc, ObjectId(7, 0)).unwrap();
         assert_eq!(ext, "png");
         // IHDR color type byte: signature(8) + len(4) + type(4) + IHDR data offset 9.
@@ -275,7 +264,7 @@ mod tests {
 
     #[test]
     fn extract_image_decodes_filter_chain_before_jpeg_passthrough() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Filter [/ASCIIHexDecode /DCTDecode]/Length 5>>\nstream\n4869>\nendstream",
         )]);
@@ -286,7 +275,7 @@ mod tests {
 
     #[test]
     fn extract_image_converts_cmyk_raster_to_rgb_png() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/W 1/H 1/CS/DeviceCMYK/BPC 8/Length 4>>\nstream\nAAAA\nendstream",
         )]);
@@ -297,13 +286,13 @@ mod tests {
 
     #[test]
     fn extract_image_rejects_unsupported_raster_shapes() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Width 1/Height 1/ColorSpace/DeviceRGB/BitsPerComponent 1/Length 1>>\nstream\nA\nendstream",
         )]);
         assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
 
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Width 1/Height 1/ColorSpace/Indexed/BitsPerComponent 8/Length 1>>\nstream\nA\nendstream",
         )]);
@@ -312,7 +301,7 @@ mod tests {
 
     #[test]
     fn extract_image_rejects_invalid_raster_metadata() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Width 2/Height 1/ColorSpace/DeviceRGB/BitsPerComponent 8/Length 3>>\nstream\nABC\nendstream",
         )]);
@@ -352,7 +341,7 @@ mod tests {
 
     #[test]
     fn extract_image_accepts_multi_element_jpx_filter_chain() {
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Filter [/ASCIIHexDecode /JPXDecode]/Length 5>>\nstream\n4869>\nendstream",
         )]);
@@ -363,35 +352,36 @@ mod tests {
 
     #[test]
     fn extract_image_returns_none_for_missing_object() {
-        let doc = build_doc(&[]);
+        let doc = load_minimal_doc_str(&[]);
         assert!(extract_image(&doc, ObjectId(99, 0)).is_none());
     }
 
     #[test]
     fn extract_image_returns_none_when_object_is_not_a_stream() {
         // Object exists but is a plain dictionary, not a stream.
-        let doc = build_doc(&[(7, "<</Subtype/Image>>")]);
+        let doc = load_minimal_doc_str(&[(7, "<</Subtype/Image>>")]);
         assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
     }
 
     #[test]
     fn extract_image_returns_none_without_subtype() {
         // Stream object missing /Subtype — second `?` chain bails.
-        let doc = build_doc(&[(7, "<</Filter/DCTDecode/Length 0>>\nstream\n\nendstream")]);
+        let doc =
+            load_minimal_doc_str(&[(7, "<</Filter/DCTDecode/Length 0>>\nstream\n\nendstream")]);
         assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
     }
 
     #[test]
     fn extract_image_returns_none_without_filter() {
         // Image XObject with no /Filter — the pass-through path requires one.
-        let doc = build_doc(&[(7, "<</Subtype/Image/Length 0>>\nstream\n\nendstream")]);
+        let doc = load_minimal_doc_str(&[(7, "<</Subtype/Image/Length 0>>\nstream\n\nendstream")]);
         assert!(extract_image(&doc, ObjectId(7, 0)).is_none());
     }
 
     #[test]
     fn extract_image_returns_none_when_filter_array_first_is_not_name() {
         // /Filter is a single-element array but the element isn't a Name.
-        let doc = build_doc(&[(
+        let doc = load_minimal_doc_str(&[(
             7,
             "<</Subtype/Image/Filter [42]/Length 0>>\nstream\n\nendstream",
         )]);

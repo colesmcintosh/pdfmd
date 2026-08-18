@@ -112,7 +112,7 @@ fn extract_document_inner(
     // Decode every reachable Form XObject once. Its content is interpreted
     // at each `Do`, but shared decoding and resource discovery stay out of
     // the parallel page hot path.
-    let forms = collect_forms(&doc, &page_xobject_refs_per_page);
+    let forms = collect_forms(&doc, &page_xobject_refs_per_page, FORM_COLLECTION_LIMITS);
 
     // Parse each unique font exactly once, in parallel.
     let unique_ids: Vec<ObjectId> = page_font_refs_per_page
@@ -149,7 +149,12 @@ fn extract_document_inner(
     // Image pre-pass. Only runs when the caller asked for images; otherwise
     // the object-to-filename map stays empty and every image `Do` is ignored.
     let (images, image_filenames) = if extract_images {
-        collect_images(&doc, &page_xobject_refs_per_page, &forms)
+        collect_images(
+            &doc,
+            &page_xobject_refs_per_page,
+            &forms,
+            MAX_FORM_IMAGE_CANDIDATES,
+        )
     } else {
         (Vec::new(), HashMap::new())
     };
@@ -202,13 +207,6 @@ pub fn extract_text(
 /// visited set prevents malformed resource cycles from making this pre-pass
 /// loop forever; invocation cycles are handled separately by the interpreter.
 fn collect_forms(
-    doc: &Document<'_>,
-    page_xobjects: &[HashMap<Vec<u8>, ObjectId>],
-) -> HashMap<ObjectId, FormXObject> {
-    collect_forms_with_limits(doc, page_xobjects, FORM_COLLECTION_LIMITS)
-}
-
-fn collect_forms_with_limits(
     doc: &Document<'_>,
     page_xobjects: &[HashMap<Vec<u8>, ObjectId>],
     limits: FormCollectionLimits,
@@ -278,11 +276,15 @@ fn retain_form_candidate(
     if visited.contains(&id) || pending.contains(&id) || xobject_subtype(doc, id) != Some(b"Form") {
         return;
     }
+    push_bounded(pending, id, visited.len(), limit);
+}
 
+/// Insert `id`, then drop the largest candidate if `seen` plus the queue
+/// exceeds `limit`. HashMap iteration order is unspecified, so keeping the
+/// smallest IDs is what makes a truncated resource walk stable across runs.
+fn push_bounded(pending: &mut BTreeSet<ObjectId>, id: ObjectId, seen: usize, limit: usize) {
     pending.insert(id);
-    if visited.len().saturating_add(pending.len()) > limit {
-        // HashMap iteration order is unspecified. Keeping the smallest IDs
-        // makes a truncated resource walk stable across runs.
+    if seen.saturating_add(pending.len()) > limit {
         pending.pop_last();
     }
 }
@@ -290,14 +292,6 @@ fn retain_form_candidate(
 /// Gather image XObjects reachable from page and Form resource contexts,
 /// extract each object once, and assign deterministic filenames by object ID.
 fn collect_images(
-    doc: &Document<'_>,
-    page_xobjects: &[HashMap<Vec<u8>, ObjectId>],
-    forms: &HashMap<ObjectId, FormXObject>,
-) -> (Vec<ExtractedImage>, HashMap<ObjectId, String>) {
-    collect_images_with_limit(doc, page_xobjects, forms, MAX_FORM_IMAGE_CANDIDATES)
-}
-
-fn collect_images_with_limit(
     doc: &Document<'_>,
     page_xobjects: &[HashMap<Vec<u8>, ObjectId>],
     forms: &HashMap<ObjectId, FormXObject>,
@@ -345,11 +339,7 @@ fn retain_image_candidate(
     if candidates.contains(&id) || !is_image_xobject(doc, id) {
         return;
     }
-
-    candidates.insert(id);
-    if candidates.len() > limit {
-        candidates.pop_last();
-    }
+    push_bounded(candidates, id, 0, limit);
 }
 
 fn is_image_xobject(doc: &Document<'_>, id: ObjectId) -> bool {
@@ -436,6 +426,7 @@ fn page_resources(doc: &Document<'_>, page_id: ObjectId) -> Option<Dictionary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf::test_pdf::build_xref_pdf;
 
     #[test]
     fn extract_text_propagates_document_load_error() {
@@ -647,7 +638,7 @@ endobj
             (b"Middle".to_vec(), ObjectId(9, 0)),
         ])];
 
-        let count_limited = collect_forms_with_limits(
+        let count_limited = collect_forms(
             &doc,
             &page_xobjects,
             FormCollectionLimits {
@@ -660,7 +651,7 @@ endobj
         count_ids.sort_unstable();
         assert_eq!(count_ids, vec![ObjectId(8, 0), ObjectId(9, 0)]);
 
-        let byte_limited = collect_forms_with_limits(
+        let byte_limited = collect_forms(
             &doc,
             &page_xobjects,
             FormCollectionLimits {
@@ -724,7 +715,7 @@ endobj
             (b"Low".to_vec(), ObjectId(9, 0)),
             (b"Image".to_vec(), ObjectId(6, 0)),
         ])];
-        let initial_limited = collect_forms_with_limits(
+        let initial_limited = collect_forms(
             &doc,
             &initial,
             FormCollectionLimits {
@@ -743,7 +734,7 @@ endobj
             (b"Root".to_vec(), ObjectId(8, 0)),
             (b"Sibling".to_vec(), ObjectId(9, 0)),
         ])];
-        let nested_limited = collect_forms_with_limits(
+        let nested_limited = collect_forms(
             &doc,
             &nested,
             FormCollectionLimits {
@@ -966,7 +957,8 @@ endobj
         let bytes = build_xref_pdf(pdf);
         let doc = Document::load(&bytes).unwrap();
         let forms = HashMap::new();
-        let (images, filenames) = collect_images(&doc, &page_xobjects, &forms);
+        let (images, filenames) =
+            collect_images(&doc, &page_xobjects, &forms, MAX_FORM_IMAGE_CANDIDATES);
         assert_eq!(images.len(), 1);
         assert_eq!(
             filenames.get(&ObjectId(99, 0)).map(String::as_str),
@@ -987,7 +979,8 @@ endobj
         let bytes = build_xref_pdf(pdf);
         let doc = Document::load(&bytes).unwrap();
         let forms = HashMap::new();
-        let (images, filenames) = collect_images(&doc, &page_xobjects, &forms);
+        let (images, filenames) =
+            collect_images(&doc, &page_xobjects, &forms, MAX_FORM_IMAGE_CANDIDATES);
         assert!(images.is_empty());
         assert!(filenames.is_empty());
     }
@@ -1009,7 +1002,8 @@ endobj
         let bytes = build_xref_pdf(pdf);
         let doc = Document::load(&bytes).unwrap();
         let forms = HashMap::new();
-        let (images, filenames) = collect_images(&doc, &page_xobjects, &forms);
+        let (images, filenames) =
+            collect_images(&doc, &page_xobjects, &forms, MAX_FORM_IMAGE_CANDIDATES);
         assert!(images.is_empty());
         assert!(filenames.is_empty());
     }
@@ -1053,16 +1047,12 @@ endobj
             },
         )]);
 
-        let (images, filenames) = collect_images_with_limit(&doc, &page_xobjects, &forms, 1);
+        let (images, filenames) = collect_images(&doc, &page_xobjects, &forms, 1);
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].bytes, b"LOW");
         assert_eq!(images[1].bytes, b"HIG");
         let mut ids: Vec<ObjectId> = filenames.keys().copied().collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![ObjectId(90, 0), ObjectId(92, 0)]);
-    }
-
-    fn build_xref_pdf(body: &[u8]) -> Vec<u8> {
-        crate::pdf::test_pdf::build_xref_pdf(body)
     }
 }
