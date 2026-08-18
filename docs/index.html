@@ -192,6 +192,18 @@
 <span class="k">let</span> result = convert_pdf_to_markdown(&amp;pdf_bytes, &amp;ConvertOptions::default())?;
 print!(<span class="s">"{}"</span>, result.markdown);</pre>
         </div>
+        <p class="footnote">The crate also builds a <code>cdylib</code> behind a C ABI, and
+        <code>python/</code> binds it with <code>ctypes</code> — no PyO3, no maturin,
+        no runtime packages.</p>
+        <div class="code">
+          <div class="code-head"><span>convert.py</span>
+            <button class="copy" type="button" data-copy="import pdfmd">copy</button>
+          </div>
+<pre><span class="k">import</span> pdfmd
+
+result = pdfmd.convert_file(<span class="s">"paper.pdf"</span>, image_dir=<span class="s">"figs"</span>)
+print(result.markdown)</pre>
+        </div>
       </section>
 
       <section id="markdown">
@@ -284,7 +296,8 @@ print!(<span class="s">"{}"</span>, result.markdown);</pre>
 ├── <b>extract/</b>      <i>fonts, CMaps, content ops, layout, tagged PDF, images</i>
 ├── <b>heuristics/</b>   <i>columns, tables, headings, lists, emphasis</i>
 ├── <b>lib.rs</b>        <i>convert_pdf_to_markdown</i>
-└── <b>cli.rs</b>        <i>argv parser and execution</i></div>
+├── <b>cli.rs</b>        <i>argv parser and execution</i>
+└── <b>ffi.rs</b>        <i>C ABI behind the python/ ctypes bindings</i></div>
       </section>
 
       <section id="limits">

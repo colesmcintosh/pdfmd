@@ -76,6 +76,54 @@ print!("{}", result.markdown);
 // result.images is empty unless ConvertOptions::image_dir is set
 ```
 
+## Python
+
+The crate also builds a `cdylib` exposing a C ABI (`src/ffi.rs`), and the
+`python/` package binds it with `ctypes` — no PyO3, no maturin, and no
+runtime packages on either side.
+
+```sh
+cargo build --release       # produces target/release/libpdfmd.{so,dylib,dll}
+pip install ./python        # builds the library and ships it in the wheel
+```
+
+```python
+import pdfmd
+
+result = pdfmd.convert_file("paper.pdf", page_breaks=True, image_dir="figs")
+print(result.markdown)
+result.write_images("figs")          # writes each result.images entry
+```
+
+`convert(data, *, page_breaks=False, image_dir=None)` takes `bytes`,
+`bytearray`, or `memoryview`; `convert_file(path, ...)` reads from disk.
+Both return a `ConvertResult` with `.markdown` and `.images`, and raise
+`pdfmd.PdfError` — the one error type, same as the crate — on malformed,
+encrypted, or `LZWDecode` input. `ctypes` releases the GIL for the duration
+of each call, so conversions on separate threads overlap.
+
+Without an installed wheel the bindings fall back to whatever
+`cargo build` last produced in `target/`, so a checkout works as-is:
+
+```sh
+cargo build --release
+python -m unittest discover -s python/tests
+```
+
+Set `PDFMD_LIBRARY` to load a shared library from an explicit path.
+
+Anything that can call C can use the same ABI directly:
+
+```c
+PdfmdResult *r = pdfmd_convert(bytes, len, false, NULL);
+if (r->error) fwrite(r->error, 1, r->error_len, stderr);
+else          fwrite(r->markdown, 1, r->markdown_len, stdout);
+pdfmd_result_free(r);
+```
+
+Buffers are `(pointer, length)` pairs with no implied NUL, and every result
+must be released once with `pdfmd_result_free`.
+
 ## Markdown reconstruction
 
 Conversion walks positioned spans (not a flat text dump) and:
@@ -170,10 +218,12 @@ heuristics and remain best-effort on complex pages.
 
 ## Testing & coverage
 
-457 tests (430 unit + 27 integration). Run them with:
+438 tests (414 unit + 24 integration), plus 17 for the Python bindings.
+Run them with:
 
 ```sh
 cargo test --all-targets
+cargo build --release && python -m unittest discover -s python/tests
 ```
 
 Reproduce the coverage numbers in the badge:
@@ -204,6 +254,7 @@ Current breakdown:
 | `extract/mod.rs`            | 99.53%  | 99.44%  | 100.00%   |
 | `extract/parser.rs`         | 99.49%  | 99.56%  | 100.00%   |
 | `extract/structure.rs`      | 95.83%  | 97.00%  | 100.00%   |
+| `ffi.rs`                    | 95.42%  | 95.57%  | 94.44%    |
 | `heuristics/lines.rs`       | 98.72%  | 97.76%  | 100.00%   |
 | `heuristics/mod.rs`         | 97.93%  | 97.04%  | 100.00%   |
 | `heuristics/tables.rs`      | 97.77%  | 96.24%  | 100.00%   |
@@ -220,7 +271,11 @@ Current breakdown:
 | `pdf/test_pdf.rs`           | 99.46%  | 99.74%  | 100.00%   |
 | `pdf/xref.rs`               | 99.72%  | 99.69%  | 100.00%   |
 | `util.rs`                   | 100.00% | 100.00% | 100.00%   |
-| **total**                   | **99.33%** | **99.03%** | **100.00%** |
+| **total**                   | **99.29%** | **98.99%** | **99.89%**  |
+
+`ffi.rs` reads low only because `--all-targets` also merges the `cdylib`
+copy of the exported symbols, whose counters are never executed;
+`cargo llvm-cov --lib` shows `pdfmd_result_free` covered 7/7.
 
 The badge tracks line coverage. The table also includes llvm-cov region
 coverage, which is stricter about expression-level instrumentation.
@@ -277,6 +332,8 @@ src/
 - The heuristic layer targets academic and prose documents. Forms,
   invoices, and other heavily-structured PDFs will not reconstruct well.
 - Encrypted PDFs and `LZWDecode` streams are not supported.
+- The Python wheel is platform-specific and is not published to PyPI;
+  build it from a checkout with `pip install ./python`.
 
 ## License
 
