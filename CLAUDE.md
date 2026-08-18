@@ -33,7 +33,7 @@ cargo test --all-targets
 ```
 
 If you touched `src/pdf/deflate.rs`, `src/extract/parser.rs`,
-`src/extract/content.rs`, or `src/util.rs`, also run:
+`src/extract/content/`, or `src/util.rs`, also run:
 
 ```sh
 cargo run --release --bin profile

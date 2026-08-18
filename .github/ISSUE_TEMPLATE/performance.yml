@@ -34,7 +34,7 @@ body:
       options:
         - pdf/deflate.rs
         - extract/parser.rs (content-stream tokenizer)
-        - extract/content.rs
+        - extract/content/
         - util.rs (parallel_map)
         - heuristics
         - unknown / other

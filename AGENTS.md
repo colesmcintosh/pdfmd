@@ -72,7 +72,7 @@ and multi-page Markdown formatting extract in parallel via
 `util::parallel_map` (`std::thread::scope`). Don't regress any of these.
 
 If a change touches `src/pdf/deflate.rs`, `src/extract/parser.rs`,
-`src/extract/content.rs`, or `src/util.rs`, benchmark with
+`src/extract/content/`, or `src/util.rs`, benchmark with
 `cargo run --release --bin profile` before calling it done.
 
 Faster without a crate beats cleaner with a crate.

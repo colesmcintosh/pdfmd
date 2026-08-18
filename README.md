@@ -245,7 +245,10 @@ src/
 │   ├── image/
 │   │   └── png.rs        minimal PNG encoder for decoded image rasters
 │   ├── parser.rs         streaming content-stream tokenizer
-│   ├── content.rs        content/Form interpreter and text-state machine
+│   ├── content/
+│   │   ├── forms.rs      Form XObject invocation and output budgets
+│   │   ├── matrix.rs     2×3 affine transform for text and graphics state
+│   │   └── mod.rs        content/Form interpreter and text-state machine
 │   ├── layout.rs         positioned spans, font-style hints, path rects
 │   ├── structure.rs      tagged-PDF structure tree → heading/table/list roles
 │   └── mod.rs            page walking + per-page parallelism
