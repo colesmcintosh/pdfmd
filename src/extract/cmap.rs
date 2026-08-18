@@ -40,27 +40,23 @@ pub fn parse(data: &[u8]) -> CMap {
     let tokens = tokenize(data);
     let mut i = 0;
     while i < tokens.len() {
-        match &tokens[i] {
-            Token::Keyword(kw) if kw == "begincodespacerange" => {
-                i += 1;
-                while i < tokens.len() {
-                    if matches!(&tokens[i], Token::Keyword(k) if k == "endcodespacerange") {
-                        i += 1;
-                        break;
-                    }
+        let Token::Keyword(kw) = &tokens[i] else {
+            i += 1;
+            continue;
+        };
+        i += 1;
+        match kw.as_str() {
+            "begincodespacerange" => {
+                // Only the source-code width matters; the range itself doesn't.
+                while in_block(&tokens, &mut i, "endcodespacerange") {
                     let Some((lo, _)) = take_hex_pair(&tokens, &mut i) else {
                         break;
                     };
                     cmap.code_width = cmap.code_width.max(lo.len());
                 }
             }
-            Token::Keyword(kw) if kw == "beginbfchar" => {
-                i += 1;
-                while i < tokens.len() {
-                    if matches!(&tokens[i], Token::Keyword(k) if k == "endbfchar") {
-                        i += 1;
-                        break;
-                    }
+            "beginbfchar" => {
+                while in_block(&tokens, &mut i, "endbfchar") {
                     let Some((src, dst)) = take_hex_pair(&tokens, &mut i) else {
                         break;
                     };
@@ -70,100 +66,83 @@ pub fn parse(data: &[u8]) -> CMap {
                     }
                 }
             }
-            Token::Keyword(kw) if kw == "beginbfrange" => {
-                i += 1;
-                while i < tokens.len() {
-                    if matches!(&tokens[i], Token::Keyword(k) if k == "endbfrange") {
-                        i += 1;
+            "beginbfrange" => {
+                while in_block(&tokens, &mut i, "endbfrange") {
+                    if !parse_bfrange_entry(&tokens, &mut i, &mut cmap) {
                         break;
-                    }
-                    let Some(lo) = take_hex(&tokens, &mut i) else {
-                        break;
-                    };
-                    let Some(hi) = take_hex(&tokens, &mut i) else {
-                        break;
-                    };
-                    let (Some(lo_code), Some(hi_code)) = (bytes_to_u32(&lo), bytes_to_u32(&hi))
-                    else {
-                        continue;
-                    };
-                    // Reject ranges that would iterate billions of times — a
-                    // malformed CMap could otherwise turn a few bytes of
-                    // input into a DoS.
-                    if hi_code < lo_code || (hi_code as u64 - lo_code as u64) >= MAX_BFRANGE_SIZE {
-                        // Skip the destination payload (Hex or Array) so the
-                        // outer loop resumes at the next operator.
-                        match tokens.get(i) {
-                            Some(Token::Hex(_)) => {
-                                i += 1;
-                            }
-                            Some(Token::ArrayStart) => {
-                                i += 1;
-                                while let Some(tok) = tokens.get(i) {
-                                    i += 1;
-                                    if matches!(tok, Token::ArrayEnd) {
-                                        break;
-                                    }
-                                }
-                            }
-                            _ => {
-                                i += 1;
-                            }
-                        }
-                        continue;
-                    }
-                    match tokens.get(i) {
-                        Some(Token::Hex(dst)) => {
-                            let dst = dst.clone();
-                            i += 1;
-                            // Sequential range: increment the final Unicode
-                            // code point for each source code in [lo, hi].
-                            for (offset, code) in (lo_code..=hi_code).enumerate() {
-                                let mut shifted = dst.clone();
-                                add_to_last_u16(&mut shifted, offset as u32);
-                                if let Some(text) = utf16be_to_string(&shifted) {
-                                    cmap.map.insert(code, text);
-                                }
-                            }
-                        }
-                        Some(Token::ArrayStart) => {
-                            i += 1;
-                            let mut entries: Vec<Vec<u8>> = Vec::new();
-                            while let Some(tok) = tokens.get(i) {
-                                match tok {
-                                    Token::Hex(h) => {
-                                        entries.push(h.clone());
-                                        i += 1;
-                                    }
-                                    Token::ArrayEnd => {
-                                        i += 1;
-                                        break;
-                                    }
-                                    _ => {
-                                        i += 1;
-                                    }
-                                }
-                            }
-                            for (offset, code) in (lo_code..=hi_code).enumerate() {
-                                if let Some(bytes) = entries.get(offset) {
-                                    if let Some(text) = utf16be_to_string(bytes) {
-                                        cmap.map.insert(code, text);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            i += 1;
-                        }
                     }
                 }
             }
-            _ => {
-                i += 1;
-            }
+            _ => {}
         }
     }
     cmap
+}
+
+/// Are we still inside a `begin…`/`end…` block? Consumes the terminator.
+fn in_block(tokens: &[Token], i: &mut usize, end: &str) -> bool {
+    match tokens.get(*i) {
+        None => false,
+        Some(Token::Keyword(k)) if k == end => {
+            *i += 1;
+            false
+        }
+        _ => true,
+    }
+}
+
+/// One `<lo> <hi> <dst>` entry. Returns `false` when the block is malformed
+/// and the caller should stop scanning it.
+fn parse_bfrange_entry(tokens: &[Token], i: &mut usize, cmap: &mut CMap) -> bool {
+    let (Some(lo), Some(hi)) = (take_hex(tokens, i), take_hex(tokens, i)) else {
+        return false;
+    };
+    let (Some(lo_code), Some(hi_code)) = (bytes_to_u32(&lo), bytes_to_u32(&hi)) else {
+        return true;
+    };
+    // Reject ranges that would iterate billions of times — a malformed CMap
+    // could otherwise turn a few bytes of input into a DoS. The destination
+    // payload is still consumed so the caller resumes at the next entry.
+    let oversized = hi_code < lo_code || (hi_code as u64 - lo_code as u64) >= MAX_BFRANGE_SIZE;
+    match tokens.get(*i) {
+        Some(Token::Hex(dst)) => {
+            let dst = dst.clone();
+            *i += 1;
+            // Sequential range: increment the final Unicode code point for
+            // each source code in [lo, hi].
+            if !oversized {
+                for (offset, code) in (lo_code..=hi_code).enumerate() {
+                    let mut shifted = dst.clone();
+                    add_to_last_u16(&mut shifted, offset as u32);
+                    if let Some(text) = utf16be_to_string(&shifted) {
+                        cmap.map.insert(code, text);
+                    }
+                }
+            }
+        }
+        Some(Token::ArrayStart) => {
+            *i += 1;
+            let mut entries: Vec<Vec<u8>> = Vec::new();
+            while let Some(tok) = tokens.get(*i) {
+                *i += 1;
+                match tok {
+                    Token::Hex(h) => entries.push(h.clone()),
+                    Token::ArrayEnd => break,
+                    _ => {}
+                }
+            }
+            if !oversized {
+                for (offset, code) in (lo_code..=hi_code).enumerate() {
+                    let Some(text) = entries.get(offset).and_then(|b| utf16be_to_string(b)) else {
+                        continue;
+                    };
+                    cmap.map.insert(code, text);
+                }
+            }
+        }
+        _ => *i += 1,
+    }
+    true
 }
 
 /// Convenience: consume the next hex string from the token stream.
