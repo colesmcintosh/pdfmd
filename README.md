@@ -102,6 +102,29 @@ Both return a `ConvertResult` with `.markdown` and `.images`, and raise
 encrypted, or `LZWDecode` input. `ctypes` releases the GIL for the duration
 of each call, so conversions on separate threads overlap.
 
+`convert_many` converts a batch on a thread pool and returns the results in
+input order, raising on the first source that fails:
+
+```python
+results = pdfmd.convert_many(["a.pdf", "b.pdf", raw_bytes], workers=8)
+```
+
+Each source is a path or the bytes of a PDF. `workers` defaults to one per
+CPU, capped at the number of sources. A single conversion already fans its
+pages across cores, so the pool buys the most on batches of short
+documents.
+
+An installed wheel also puts a `pdfmd` command on PATH, and the same CLI
+runs from a checkout as `python -m pdfmd`:
+
+```sh
+python -m pdfmd input.pdf -o out.md --page-breaks --extract-images figs
+```
+
+It takes the same flags as the Rust binary over the same library. The one
+difference is URL input, fetched with `urllib` rather than `curl` —
+already in the standard library, so the package stays dependency-free.
+
 Without an installed wheel the bindings fall back to whatever
 `cargo build` last produced in `target/`, so a checkout works as-is:
 
@@ -218,7 +241,7 @@ heuristics and remain best-effort on complex pages.
 
 ## Testing & coverage
 
-438 tests (414 unit + 24 integration), plus 17 for the Python bindings.
+438 tests (414 unit + 24 integration), plus 32 for the Python bindings.
 Run them with:
 
 ```sh
@@ -334,6 +357,9 @@ src/
 - Encrypted PDFs and `LZWDecode` streams are not supported.
 - The Python wheel is platform-specific and is not published to PyPI;
   build it from a checkout with `pip install ./python`.
+- `python -m pdfmd` covers the same flags as the Rust CLI; a `pdfmd`
+  binary from `cargo install` and one from a wheel both answer to that
+  name, so PATH order decides which runs.
 
 ## License
 

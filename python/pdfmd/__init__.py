@@ -6,6 +6,10 @@ Python bindings for the ``pdfmd`` Rust crate, over its C ABI:
     >>> result = pdfmd.convert_file("paper.pdf")
     >>> print(result.markdown)
 
+:func:`convert_many` converts a whole batch on a thread pool, and
+``python -m pdfmd`` (or the ``pdfmd`` script an installed wheel puts on
+PATH) runs the same conversion from a shell.
+
 Images are extracted only when ``image_dir`` is given. That value is the
 directory the Markdown links point at; writing the files is the caller's
 job, either directly or with :meth:`ConvertResult.write_images`.
@@ -13,10 +17,11 @@ job, either directly or with :meth:`ConvertResult.write_images`.
 
 from __future__ import annotations
 
+import concurrent.futures
 import ctypes
 import os
 from pathlib import Path
-from typing import Iterator, List, Optional, Union
+from typing import Iterable, Iterator, List, Optional, Union
 
 from . import _binding
 
@@ -26,11 +31,15 @@ __all__ = [
     "PdfError",
     "convert",
     "convert_file",
+    "convert_many",
     "library_path",
     "__version__",
 ]
 
 StrPath = Union[str, "os.PathLike[str]"]
+Data = Union[bytes, bytearray, memoryview]
+Source = Union[StrPath, Data]
+"""One input to :func:`convert_many`: a path, or the bytes of a PDF."""
 
 
 class PdfError(Exception):
@@ -152,6 +161,48 @@ def convert_file(
     return convert(
         Path(path).read_bytes(), page_breaks=page_breaks, image_dir=image_dir
     )
+
+
+def convert_many(
+    sources: Iterable[Source],
+    *,
+    page_breaks: bool = False,
+    image_dir: Optional[str] = None,
+    workers: Optional[int] = None,
+) -> List[ConvertResult]:
+    """Convert several PDFs at once, returning results in input order.
+
+    Each source is a path or the bytes of a PDF, converted as
+    :func:`convert_file` or :func:`convert` would. The work runs on a
+    thread pool: the shared library releases the GIL for the length of
+    every call, so conversions overlap on all cores instead of queueing
+    behind each other.
+
+    ``workers`` defaults to one per CPU, capped at the number of sources.
+    A single conversion already fans its pages out across cores, so a
+    larger pool mostly helps when the documents are short.
+
+    The first source that fails raises, exactly as converting it alone
+    would; the rest of the batch is abandoned.
+    """
+    if workers is not None and workers < 1:
+        raise ValueError(f"workers must be at least 1, got {workers}")
+
+    items = list(sources)
+    if not items:
+        return []
+
+    def one(source: Source) -> ConvertResult:
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            return convert(source, page_breaks=page_breaks, image_dir=image_dir)
+        return convert_file(source, page_breaks=page_breaks, image_dir=image_dir)
+
+    count = min(len(items), workers or (os.cpu_count() or 1))
+    if count == 1:
+        return [one(item) for item in items]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+        # `map` yields in input order and re-raises the first failure.
+        return list(pool.map(one, items))
 
 
 def _version() -> str:

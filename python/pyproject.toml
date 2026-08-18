@@ -19,6 +19,13 @@ classifiers = [
 # No runtime dependencies: the bindings are `ctypes` over the crate's C ABI.
 dependencies = []
 
+# `python -m pdfmd` works without this; the script is what makes an
+# installed wheel usable from a shell. A `cargo install`ed binary of the
+# same name lives in ~/.cargo/bin, so PATH order picks the winner when
+# both are present — they convert identically.
+[project.scripts]
+pdfmd = "pdfmd.__main__:main"
+
 [project.urls]
 Homepage = "https://colesmcintosh.github.io/pdfmd/"
 Repository = "https://github.com/colesmcintosh/pdfmd"

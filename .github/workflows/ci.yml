@@ -103,3 +103,7 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           python -c "import pdfmd; print(pdfmd.__version__, pdfmd.library_path())"
+      - name: the installed console script converts a PDF
+        run: |
+          pdfmd tests/fixtures/sample.pdf -o "$RUNNER_TEMP/out.md"
+          head -1 "$RUNNER_TEMP/out.md"
