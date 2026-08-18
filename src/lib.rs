@@ -6,6 +6,9 @@
 //! headings, lists, and emphasis. Encrypted PDFs and `LZWDecode` return
 //! [`Error`].
 //!
+//! [`ffi`] exposes the same conversion over a C ABI; the `python/` package
+//! binds it with `ctypes`.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -19,6 +22,7 @@
 //! ```
 
 mod extract;
+pub mod ffi;
 mod heuristics;
 mod pdf;
 mod util;
