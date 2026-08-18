@@ -28,14 +28,17 @@ src/cli.rs        argv parser, file/URL/stdin I/O (no clap)
 src/ffi.rs        C ABI over convert_pdf_to_markdown (cdylib)
 src/util.rs       parallel_map (std::thread::scope worker pool)
 src/bin/          profile.rs, opendataloader.rs — dev harnesses, not shipped
-python/           ctypes bindings over src/ffi.rs, packaging, tests
+python/           ctypes bindings over src/ffi.rs, CLI, packaging, tests
 tests/            integration + CLI + real fixtures only
 ```
 
 Public surface stays small: `convert_pdf_to_markdown`, `ConvertOptions`,
 `ConvertResult`, `ExtractedImage`, `Error` / `Result`, plus the three
 `ffi` entry points (`pdfmd_convert`, `pdfmd_result_free`,
-`pdfmd_version`).
+`pdfmd_version`). The Python package re-exports that same surface as
+`convert`, `convert_file`, `convert_many`, `ConvertResult`, `Image`,
+`PdfError`, and `library_path`, with `pdfmd/__main__.py` as the CLI
+behind `python -m pdfmd` and the wheel's `pdfmd` script.
 
 ## Commands
 
@@ -125,6 +128,10 @@ Faster without a crate beats cleaner with a crate.
   with `pdfmd_result_free`.
 - `python/pdfmd/_binding.py` mirrors the `#[repr(C)]` structs field for
   field. Change one side and you must change the other.
+- `python/pdfmd/__main__.py` mirrors the flags in `src/cli.rs` over the
+  same library. Add a flag to one and add it to the other, or say in the
+  README why it only exists on one side. URL input is the one deliberate
+  split: `curl` in Rust, `urllib` in Python.
 - Coverage under `--all-targets` under-reports `src/ffi.rs`: the cdylib's
   never-executed copy of the exported symbols is merged in. Check the
   module with `cargo llvm-cov --lib`.
@@ -139,4 +146,5 @@ Faster without a crate beats cleaner with a crate.
 | Changing reconstruction of titles | Edit `promote_document_title` in `lib.rs`, not heuristics. |
 | Only the public API or CLI needs a real file | Add to `tests/integration.rs`. Otherwise unit-test beside the code. |
 | Binding another language | Call the C ABI in `src/ffi.rs`. Don't add a binding-generator crate. |
+| Adding to the Python package | Stdlib only, both at build and run time. Test it in `python/tests/`. |
 | Trade-off is speed vs. readability on the hot path | Keep the fast version. Comment *why*. |
