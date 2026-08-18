@@ -17,7 +17,8 @@
 use std::borrow::Cow;
 
 use crate::pdf::syntax::{
-    decode_hex, is_delim, is_ws, is_ws_or_delim, skip_ws_and_comments as skip_ws_comments,
+    decode_hex, is_delim, is_ws, is_ws_or_delim, simple_escape,
+    skip_ws_and_comments as skip_ws_comments,
 };
 
 pub struct Parser<'a> {
@@ -293,70 +294,35 @@ fn unescape_literal(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
-        if raw[i] == b'\\' && i + 1 < raw.len() {
-            let c = raw[i + 1];
-            match c {
-                b'n' => {
-                    out.push(b'\n');
-                    i += 2;
-                }
-                b'r' => {
-                    out.push(b'\r');
-                    i += 2;
-                }
-                b't' => {
-                    out.push(b'\t');
-                    i += 2;
-                }
-                b'b' => {
-                    out.push(0x08);
-                    i += 2;
-                }
-                b'f' => {
-                    out.push(0x0C);
-                    i += 2;
-                }
-                b'\\' => {
-                    out.push(b'\\');
-                    i += 2;
-                }
-                b'(' => {
-                    out.push(b'(');
-                    i += 2;
-                }
-                b')' => {
-                    out.push(b')');
-                    i += 2;
-                }
-                b'\n' => {
-                    // Backslash-newline is a line continuation.
-                    i += 2;
-                }
-                b'\r' => {
-                    i += 2;
-                    if i < raw.len() && raw[i] == b'\n' {
-                        i += 1;
-                    }
-                }
-                b'0'..=b'7' => {
-                    let mut v: u32 = 0;
-                    let mut n = 0;
-                    i += 1;
-                    while n < 3 && i < raw.len() && matches!(raw[i], b'0'..=b'7') {
-                        v = v * 8 + (raw[i] - b'0') as u32;
-                        i += 1;
-                        n += 1;
-                    }
-                    out.push((v & 0xFF) as u8);
-                }
-                _ => {
-                    out.push(c);
-                    i += 2;
-                }
-            }
-        } else {
+        if raw[i] != b'\\' || i + 1 >= raw.len() {
             out.push(raw[i]);
             i += 1;
+            continue;
+        }
+        let c = raw[i + 1];
+        i += 2;
+        if let Some(escaped) = simple_escape(c) {
+            out.push(escaped);
+            continue;
+        }
+        match c {
+            b'\n' => {} // line continuation
+            b'\r' => {
+                if raw.get(i) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b'0'..=b'7' => {
+                let mut v = u32::from(c - b'0');
+                let mut n = 1;
+                while n < 3 && matches!(raw.get(i), Some(b'0'..=b'7')) {
+                    v = v * 8 + u32::from(raw[i] - b'0');
+                    i += 1;
+                    n += 1;
+                }
+                out.push((v & 0xFF) as u8);
+            }
+            _ => out.push(c),
         }
     }
     out

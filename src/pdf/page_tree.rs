@@ -62,3 +62,101 @@ pub(super) fn walk_pages(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(entries: &[(&[u8], Object)]) -> Object {
+        let mut d = Dictionary::new();
+        for (key, value) in entries {
+            d.insert(key.to_vec(), value.clone());
+        }
+        Object::Dictionary(d)
+    }
+
+    fn node(type_: &[u8], kids: &[u32]) -> Object {
+        let refs = kids
+            .iter()
+            .map(|n| Object::Reference(ObjectId(*n, 0)))
+            .collect();
+        dict(&[
+            (b"Type", Object::Name(type_.to_vec())),
+            (b"Kids", Object::Array(refs)),
+        ])
+    }
+
+    fn walk(objects: &[(u32, Object)], root: u32) -> Result<Vec<ObjectId>, PdfError> {
+        let map: HashMap<ObjectId, Object> = objects
+            .iter()
+            .map(|(n, obj)| (ObjectId(*n, 0), obj.clone()))
+            .collect();
+        let mut out = Vec::new();
+        walk_pages(&map, ObjectId(root, 0), &mut out, 0)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn walk_pages_rejects_excessive_depth() {
+        // A self-referential /Pages cycle must bail out via the depth guard.
+        let objects: HashMap<ObjectId, Object> = [(ObjectId(1, 0), node(b"Pages", &[1]))]
+            .into_iter()
+            .collect();
+        let mut out = Vec::new();
+        assert!(walk_pages(&objects, ObjectId(1, 0), &mut out, 65).is_err());
+    }
+
+    #[test]
+    fn walk_pages_returns_empty_for_nodes_without_reachable_leaves() {
+        // Missing node, /Pages without /Kids, /Kids naming a missing node,
+        // and non-reference /Kids entries are all silent no-ops.
+        assert!(walk(&[], 99).unwrap().is_empty());
+        let pages_only = dict(&[(b"Type", Object::Name(b"Pages".to_vec()))]);
+        assert!(walk(&[(1, pages_only)], 1).unwrap().is_empty());
+        assert!(walk(&[(1, node(b"Pages", &[999]))], 1).unwrap().is_empty());
+        let bad_kids = dict(&[
+            (b"Type", Object::Name(b"Pages".to_vec())),
+            (b"Kids", Object::Array(vec![Object::Integer(42)])),
+        ]);
+        assert!(walk(&[(1, bad_kids)], 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn walk_pages_pushes_leaf_when_called_with_type_page_directly() {
+        // A /Pages reference pointing at a /Type Page leaf is unusual but
+        // valid; it should be pushed without recursing.
+        let leaf = dict(&[(b"Type", Object::Name(b"Page".to_vec()))]);
+        assert_eq!(walk(&[(1, leaf)], 1).unwrap(), vec![ObjectId(1, 0)]);
+    }
+
+    #[test]
+    fn walk_pages_collects_pages_in_nested_kid_arrays() {
+        let leaf = dict(&[(b"Type", Object::Name(b"Page".to_vec()))]);
+        let objects = [
+            (1, node(b"Pages", &[2])),
+            (2, node(b"Pages", &[3])),
+            (3, leaf),
+        ];
+        assert_eq!(walk(&objects, 1).unwrap(), vec![ObjectId(3, 0)]);
+    }
+
+    #[test]
+    fn collect_pages_errors_when_the_catalog_chain_is_broken() {
+        let root = (b"Root".as_slice(), Object::Reference(ObjectId(1, 0)));
+        let catalog = dict(&[(b"Type", Object::Name(b"Catalog".to_vec()))]);
+        for (objects, trailer) in [
+            (Vec::new(), Vec::new()),            // no /Root
+            (Vec::new(), vec![root.clone()]),    // /Root names a missing object
+            (vec![(1u32, catalog)], vec![root]), // catalog without /Pages
+        ] {
+            let map: HashMap<ObjectId, Object> = objects
+                .into_iter()
+                .map(|(n, obj)| (ObjectId(n, 0), obj))
+                .collect();
+            let Object::Dictionary(trailer) = dict(&trailer) else {
+                unreachable!()
+            };
+            assert!(collect_pages(&map, &trailer).is_err());
+        }
+    }
+}

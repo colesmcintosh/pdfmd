@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::pdf::syntax::{hex_digit, is_ws, is_ws_or_delim};
+use crate::pdf::syntax::{decode_hex_strict, is_ws, is_ws_or_delim};
 
 /// Upper bound on the size of a single `beginbfrange` mapping. A malformed
 /// CMap can declare `<0000> <FFFFFFFF>` which expands to ~4 billion entries
@@ -270,7 +270,7 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
                 if i < data.len() {
                     i += 1; // skip '>'
                 }
-                if let Some(bytes) = decode_hex(hex) {
+                if let Some(bytes) = decode_hex_strict(hex) {
                     out.push(Token::Hex(bytes));
                 } else {
                     out.push(Token::Other);
@@ -348,28 +348,6 @@ fn is_relevant_keyword(s: &str) -> bool {
             | "beginbfrange"
             | "endbfrange"
     )
-}
-
-fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let mut nibble: Option<u8> = None;
-    for &b in s {
-        if is_ws(b) {
-            continue;
-        }
-        let v = hex_digit(b)?;
-        match nibble {
-            Some(prev) => {
-                out.push((prev << 4) | v);
-                nibble = None;
-            }
-            None => nibble = Some(v),
-        }
-    }
-    if let Some(prev) = nibble {
-        out.push(prev << 4);
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -633,7 +611,6 @@ mod tests {
         let cmap = parse(src);
         // bytes_to_u32(<01>) = 1 → mapping should land for code 1.
         assert!(cmap.lookup(1).is_some());
-        assert_eq!(decode_hex(b"F"), Some(vec![0xF0]));
     }
 
     #[test]

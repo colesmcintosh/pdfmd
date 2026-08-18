@@ -17,28 +17,38 @@ pub enum Object {
     Reference(ObjectId),
 }
 
+/// Generate `Option`-returning accessors for single-variant payloads.
+macro_rules! accessors {
+    ($($(#[$attr:meta])* $name:ident($variant:ident) -> $ret:ty = |$v:ident| $conv:expr;)*) => {
+        $(
+            $(#[$attr])*
+            pub fn $name(&self) -> Option<$ret> {
+                match self {
+                    Object::$variant($v) => Some($conv),
+                    _ => None,
+                }
+            }
+        )*
+    };
+}
+
 impl Object {
-    pub fn as_dict(&self) -> Option<&Dictionary> {
-        if let Object::Dictionary(d) = self {
-            Some(d)
-        } else {
-            None
-        }
+    // `as_string`, `as_real`, `as_boolean`, and `is_null` round out the
+    // variants — they're only consumed by the test suite today, but keeping
+    // them on the public surface lets future callers extract any Object kind
+    // without reaching inside the enum.
+    accessors! {
+        as_dict(Dictionary) -> &Dictionary = |d| d;
+        as_array(Array) -> &[Object] = |a| a;
+        as_name(Name) -> &[u8] = |n| n;
+        as_stream(Stream) -> &Stream = |s| s;
+        as_reference(Reference) -> ObjectId = |id| *id;
+        #[allow(dead_code)]
+        as_string(String) -> &[u8] = |s| s;
+        #[allow(dead_code)]
+        as_boolean(Boolean) -> bool = |b| *b;
     }
-    pub fn as_array(&self) -> Option<&[Object]> {
-        if let Object::Array(a) = self {
-            Some(a)
-        } else {
-            None
-        }
-    }
-    pub fn as_name(&self) -> Option<&[u8]> {
-        if let Object::Name(n) = self {
-            Some(n)
-        } else {
-            None
-        }
-    }
+
     pub fn as_name_str(&self) -> Option<&str> {
         self.as_name().and_then(|n| std::str::from_utf8(n).ok())
     }
@@ -49,46 +59,12 @@ impl Object {
             _ => None,
         }
     }
-    pub fn as_stream(&self) -> Option<&Stream> {
-        if let Object::Stream(s) = self {
-            Some(s)
-        } else {
-            None
-        }
-    }
-    pub fn as_reference(&self) -> Option<ObjectId> {
-        if let Object::Reference(id) = self {
-            Some(*id)
-        } else {
-            None
-        }
-    }
-    // These accessors round out the variants — they're only consumed by
-    // the test suite today, but keeping them on the public surface lets
-    // future callers extract any Object kind without reaching inside the
-    // enum.
-    #[allow(dead_code)]
-    pub fn as_string(&self) -> Option<&[u8]> {
-        if let Object::String(s) = self {
-            Some(s)
-        } else {
-            None
-        }
-    }
     #[allow(dead_code)]
     pub fn as_real(&self) -> Option<f32> {
         match self {
             Object::Real(r) => Some(*r),
             Object::Integer(i) => Some(*i as f32),
             _ => None,
-        }
-    }
-    #[allow(dead_code)]
-    pub fn as_boolean(&self) -> Option<bool> {
-        if let Object::Boolean(b) = self {
-            Some(*b)
-        } else {
-            None
         }
     }
     #[allow(dead_code)]

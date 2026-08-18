@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::filter::decode_filters;
 use super::object::{Dictionary, Object, ObjectId};
 use super::parser::Parser;
+use super::syntax::{skip_line_break, skip_spaces};
 use super::PdfError;
 
 /// Where an object actually lives. Classic xref entries are `Uncompressed`;
@@ -102,9 +103,10 @@ fn read_classic_xref(
             break;
         }
         let first = read_uint(bytes, &mut p.pos)?;
-        skip_inline(bytes, &mut p.pos);
+        skip_spaces(bytes, &mut p.pos);
         let count = read_uint(bytes, &mut p.pos)?;
-        skip_eol(bytes, &mut p.pos);
+        skip_spaces(bytes, &mut p.pos);
+        skip_line_break(bytes, &mut p.pos);
         // Each entry occupies exactly 20 bytes. A malformed file may
         // declare `count` close to u32::MAX; the per-entry truncation
         // check below would still catch it, but only after iterating
@@ -282,24 +284,205 @@ pub(super) fn read_uint(bytes: &[u8], pos: &mut usize) -> Result<u32, PdfError> 
         .map_err(|_| PdfError::BadXref(format!("integer overflow: {s}")))
 }
 
-pub(super) fn skip_inline(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t') {
-        *pos += 1;
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdf::test_pdf::{build_xref_pdf_with, page_tree_objects};
+    use crate::pdf::Document;
 
-pub(super) fn skip_eol(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t') {
-        *pos += 1;
-    }
-    match bytes.get(*pos) {
-        Some(&b'\r') => {
-            *pos += 1;
-            if bytes.get(*pos) == Some(&b'\n') {
-                *pos += 1;
-            }
+    /// A 1-object PDF body whose only indirect object is an xref stream with
+    /// the given `(type, field1, field2)` rows. There is no `/Filter`, so the
+    /// rows are written raw into the stream payload.
+    fn xref_stream_pdf(entries: &[(u8, u64, u32)], extra_dict_entries: &str) -> Vec<u8> {
+        let mut payload: Vec<u8> = Vec::new();
+        for (kind, f1, f2) in entries {
+            payload.push(*kind);
+            payload.extend_from_slice(&(*f1 as u16).to_be_bytes());
+            payload.push(*f2 as u8);
         }
-        Some(&b'\n') => *pos += 1,
-        _ => {}
+        let mut bytes = format!(
+            "1 0 obj <</Type/XRef/Size {}/W [1 2 1]/Length {}{}>>\nstream\n",
+            entries.len(),
+            payload.len(),
+            extra_dict_entries,
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream endobj\n");
+        bytes
+    }
+
+    fn classic_pdf(extra_rows: &[&str], trailer: &str) -> Vec<u8> {
+        let body = format!("%PDF-1.4\n{}", page_tree_objects(""));
+        build_xref_pdf_with(body.as_bytes(), extra_rows, trailer)
+    }
+
+    // ---- startxref ------------------------------------------------------
+
+    #[test]
+    fn find_startxref_locates_offset_or_errors() {
+        assert_eq!(
+            find_startxref(b"trash\nstartxref\n1234\n%%EOF").unwrap(),
+            1234
+        );
+        assert!(find_startxref(b"no marker at all").is_err());
+        assert!(find_startxref(b"startxref\n\n%%EOF").is_err());
+    }
+
+    // ---- Byte helpers ---------------------------------------------------
+
+    #[test]
+    fn be_uint_collapses_byte_run() {
+        assert_eq!(be_uint(&[0x12, 0x34, 0x56]), 0x123456);
+        assert_eq!(be_uint(&[]), 0);
+    }
+
+    #[test]
+    fn read_uint_handles_leading_whitespace_and_errors() {
+        let mut pos = 0;
+        assert_eq!(read_uint(b"  \t  42 next", &mut pos).unwrap(), 42);
+        // No digits: error.
+        let mut pos = 0;
+        assert!(read_uint(b"   ", &mut pos).is_err());
+        // Overflows u32.
+        let mut pos = 0;
+        assert!(read_uint(b"9999999999999", &mut pos).is_err());
+    }
+
+    // ---- Classic xref ---------------------------------------------------
+
+    #[test]
+    fn classic_xref_with_unknown_entry_kind_is_skipped() {
+        // The extra entry uses kind 'x' instead of 'n' or 'f' — the loader
+        // should silently skip it without erroring.
+        let bytes = classic_pdf(&["0000099999 00000 x "], "<</Size {size}/Root 1 0 R>>");
+        assert_eq!(Document::load(&bytes).expect("load").pages().len(), 1);
+    }
+
+    #[test]
+    fn classic_xref_skips_already_known_entries_on_prev_chain() {
+        // /Prev points back at the same table, so every entry in the second
+        // pass is already known and hits the `continue`.
+        let bytes = classic_pdf(&[], "<</Size {size}/Root 1 0 R/Prev {xref}>>");
+        assert_eq!(Document::load(&bytes).expect("load").pages().len(), 1);
+    }
+
+    #[test]
+    fn classic_xref_errors_on_malformed_headers_and_trailers() {
+        for tail in [
+            "xref\n0 BAD\ntrailer <</Size 0/Root 1 0 R>>\nstartxref\n9\n%%EOF\n",
+            "xref\nBAD 1\ntrailer <</Size 0/Root 1 0 R>>\nstartxref\n9\n%%EOF\n",
+            "xref\n0 1\n0000000000 65535 f \ntrailer @@@\nstartxref\n9\n%%EOF\n",
+            "xref\n0 1\n0000000000 65535 f \ntrailer 42\nstartxref\n9\n%%EOF\n",
+            // Entry rows cut short of the mandated 20 bytes each.
+            "xref\n0 5\n0000000000 65535 f \n0000000010 00000 n\nstartxref\n9\n%%EOF\n",
+            // first + count overflows u32.
+            "xref\n4294967295 1\n0000000000 65535 f \ntrailer <</Size 1>>\nstartxref\n9\n%%EOF\n",
+        ] {
+            let bytes = format!("%PDF-1.4\n{tail}");
+            assert!(Document::load(bytes.as_bytes()).is_err(), "{tail}");
+        }
+    }
+
+    #[test]
+    fn load_errors_on_pdf_with_no_root() {
+        let bytes = classic_pdf(&[], "<</Size {size}>>");
+        assert!(Document::load(&bytes).is_err());
+    }
+
+    // ---- Xref streams ---------------------------------------------------
+
+    #[test]
+    fn read_xref_stream_recognises_every_entry_kind() {
+        let entries = &[
+            (0u8, 0u64, 0u32),   // free
+            (1u8, 100u64, 0u32), // uncompressed at offset 100
+            (2u8, 99u64, 3u32),  // compressed: lives in objstm 99, idx 3
+            (5u8, 0u64, 0u32),   // unknown kind — silently skipped
+        ];
+        let bytes = xref_stream_pdf(entries, "");
+        let mut out = BTreeMap::new();
+        let dict = read_xref_stream(&bytes, 0, &mut out).unwrap();
+        assert!(dict.get(b"Type").is_some());
+        // Debug-format comparisons sidestep the dead arms a `matches!`
+        // expansion would introduce.
+        assert_eq!(format!("{:?}", out[&ObjectId(0, 0)]), "Free");
+        assert_eq!(
+            format!("{:?}", out[&ObjectId(1, 0)]),
+            "Uncompressed { offset: 100 }",
+        );
+        assert_eq!(
+            format!("{:?}", out[&ObjectId(2, 0)]),
+            "Compressed { stream_obj: 99, index: 3 }",
+        );
+        assert!(!out.contains_key(&ObjectId(3, 0)));
+    }
+
+    #[test]
+    fn read_xref_stream_honours_index_chunks() {
+        // Two-entry stream describing IDs starting at 10.
+        let bytes = xref_stream_pdf(&[(1, 10, 0), (1, 20, 0)], "/Index [10 2]");
+        let mut out = BTreeMap::new();
+        read_xref_stream(&bytes, 0, &mut out).unwrap();
+        assert!(out.contains_key(&ObjectId(10, 0)));
+        assert!(out.contains_key(&ObjectId(11, 0)));
+    }
+
+    #[test]
+    fn read_xref_stream_existing_entry_wins() {
+        let bytes = xref_stream_pdf(&[(1, 200, 0)], "");
+        let mut out = BTreeMap::new();
+        out.insert(ObjectId(0, 0), XrefEntry::Uncompressed { offset: 999 });
+        read_xref_stream(&bytes, 0, &mut out).unwrap();
+        assert_eq!(
+            format!("{:?}", out[&ObjectId(0, 0)]),
+            "Uncompressed { offset: 999 }",
+        );
+    }
+
+    #[test]
+    fn read_xref_stream_rejects_malformed_streams() {
+        for body in [
+            // /W must have exactly three widths, summing to a non-zero row.
+            b"1 0 obj <</Type/XRef/Size 1/W [1 2]/Length 0>>\nstream\n\nendstream endobj\n".as_slice(),
+            b"1 0 obj <</Type/XRef/Size 1/W [0 0 0]/Length 0>>\nstream\n\nendstream endobj\n",
+            b"1 0 obj <</Type/XRef/Size 1/Length 0>>\nstream\n\nendstream endobj\n",
+            // /Size is required.
+            b"1 0 obj <</Type/XRef/W [1 2 1]/Length 4>>\nstream\n\x01\x00\x10\x00\nendstream endobj\n",
+            // /W = 4 bytes per row and /Size = 2 needs 8 payload bytes.
+            b"1 0 obj <</Type/XRef/Size 2/W [1 2 1]/Length 4>>\nstream\n\x01\x00\x10\x00\nendstream endobj\n",
+            // /Index range wraps u32.
+            b"1 0 obj <</Type/XRef/Size 1/W [1 2 1]/Index [4294967295 2]/Length 8>>\nstream\n\x00\x00\x00\x00\x00\x00\x00\x00\nendstream endobj\n",
+            // Not a stream at all.
+            b"1 0 obj 42 endobj\n",
+            // FlateDecode body that isn't valid zlib.
+            b"1 0 obj <</Type/XRef/Size 1/W [1 2 1]/Filter/FlateDecode/Length 4>>\nstream\nJUNK\nendstream endobj\n",
+        ] {
+            let mut out = BTreeMap::new();
+            assert!(read_xref_stream(body, 0, &mut out).is_err());
+        }
+    }
+
+    #[test]
+    fn xref_stream_with_zero_type_width_defaults_to_one() {
+        // /W [0 2 1] omits the type field — spec says it defaults to 1.
+        let bytes = b"1 0 obj <</Type/XRef/Size 1/W [0 2 1]/Length 3>>\nstream\n\x00\x10\x00\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        read_xref_stream(bytes, 0, &mut out).unwrap();
+        assert_eq!(
+            format!("{:?}", out[&ObjectId(0, 0)]),
+            "Uncompressed { offset: 16 }",
+        );
+    }
+
+    #[test]
+    fn xref_stream_with_odd_index_chunk_breaks_loop() {
+        // /Index has 3 entries (not a multiple of 2) — the trailing single
+        // entry should break the chunk loop.
+        let bytes = b"1 0 obj <</Type/XRef/Size 1/W [1 2 1]/Index [0 1 5]/Length 4>>\nstream\n\x01\x00\x10\x00\nendstream endobj\n";
+        let mut out = BTreeMap::new();
+        read_xref_stream(bytes, 0, &mut out).unwrap();
+        assert!(out.contains_key(&ObjectId(0, 0)));
+        assert!(!out.contains_key(&ObjectId(5, 0)));
     }
 }
