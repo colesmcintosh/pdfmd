@@ -60,6 +60,69 @@ pub(crate) fn decode_hex(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Decode a hex string, rejecting any byte that is neither whitespace nor a
+/// hex digit. An odd final nibble is padded with zero, as in [`decode_hex`].
+pub(crate) fn decode_hex_strict(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() / 2);
+    let mut nibble: Option<u8> = None;
+    for &b in data {
+        if is_ws(b) {
+            continue;
+        }
+        let v = hex_digit(b)?;
+        match nibble {
+            Some(prev) => {
+                out.push((prev << 4) | v);
+                nibble = None;
+            }
+            None => nibble = Some(v),
+        }
+    }
+    if let Some(prev) = nibble {
+        out.push(prev << 4);
+    }
+    Some(out)
+}
+
+/// Body of a single-character string escape (`\n`, `\t`, `\(` …). Octal
+/// escapes, line continuations, and the pass-through case return `None`
+/// because they need the caller's cursor.
+#[inline]
+pub(crate) fn simple_escape(c: u8) -> Option<u8> {
+    Some(match c {
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b't' => b'\t',
+        b'b' => 0x08,
+        b'f' => 0x0C,
+        b'\\' => b'\\',
+        b'(' => b'(',
+        b')' => b')',
+        _ => return None,
+    })
+}
+
+/// Advance `pos` past spaces and tabs — never past an end-of-line marker.
+pub(crate) fn skip_spaces(bytes: &[u8], pos: &mut usize) {
+    while matches!(bytes.get(*pos), Some(b' ' | b'\t')) {
+        *pos += 1;
+    }
+}
+
+/// Advance `pos` past one CR, CRLF, or LF end-of-line marker, if present.
+pub(crate) fn skip_line_break(bytes: &[u8], pos: &mut usize) {
+    match bytes.get(*pos) {
+        Some(b'\r') => {
+            *pos += 1;
+            if bytes.get(*pos) == Some(&b'\n') {
+                *pos += 1;
+            }
+        }
+        Some(b'\n') => *pos += 1,
+        _ => {}
+    }
+}
+
 /// Advance `pos` past whitespace and `%…` comments. Stops at EOF or the next
 /// non-comment token.
 pub(crate) fn skip_ws_and_comments(bytes: &[u8], pos: &mut usize) {
@@ -113,6 +176,53 @@ mod tests {
         assert_eq!(decode_hex(b"deADBeEf"), vec![0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(decode_hex(b"!!"), Vec::<u8>::new());
         assert!(decode_hex(b"").is_empty());
+    }
+
+    #[test]
+    fn decode_hex_strict_rejects_non_hex_bytes() {
+        assert_eq!(decode_hex_strict(b"48 69").unwrap(), b"Hi");
+        assert_eq!(decode_hex_strict(b"4").unwrap(), vec![0x40]);
+        assert_eq!(
+            decode_hex_strict(b"deADBeEf").unwrap(),
+            decode_hex(b"deAD BeEf")
+        );
+        assert!(decode_hex_strict(b"48zz").is_none());
+    }
+
+    #[test]
+    fn simple_escape_covers_the_single_character_forms() {
+        for (input, expected) in [
+            (b'n', b'\n'),
+            (b'r', b'\r'),
+            (b't', b'\t'),
+            (b'b', 0x08),
+            (b'f', 0x0C),
+            (b'\\', b'\\'),
+            (b'(', b'('),
+            (b')', b')'),
+        ] {
+            assert_eq!(simple_escape(input), Some(expected));
+        }
+        // Octal digits and unknown escapes are the caller's problem.
+        assert_eq!(simple_escape(b'0'), None);
+        assert_eq!(simple_escape(b'q'), None);
+    }
+
+    #[test]
+    fn skip_spaces_and_line_breaks_stop_at_the_right_byte() {
+        let mut pos = 0;
+        skip_spaces(b" \t \n", &mut pos);
+        assert_eq!(pos, 3); // stops at the newline
+        for (bytes, expected) in [
+            (b"\r\n!".as_slice(), 2usize),
+            (b"\r!", 1),
+            (b"\n!", 1),
+            (b"!", 0),
+        ] {
+            let mut pos = 0;
+            skip_line_break(bytes, &mut pos);
+            assert_eq!(pos, expected, "{bytes:?}");
+        }
     }
 
     #[test]

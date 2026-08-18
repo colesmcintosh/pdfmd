@@ -5,7 +5,10 @@
 //! /Filter chain on demand.
 
 use super::object::{Dictionary, Object, ObjectId, Stream};
-use super::syntax::{hex_digit, is_ws, is_ws_or_delim, skip_ws_and_comments as skip_ws_comments};
+use super::syntax::{
+    decode_hex, hex_digit, is_ws, is_ws_or_delim, simple_escape, skip_line_break, skip_spaces,
+    skip_ws_and_comments as skip_ws_comments,
+};
 use super::PdfError;
 
 /// Cap on container nesting depth. Real PDFs nest a handful of levels at
@@ -51,9 +54,7 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_inline_ws(&mut self) {
-        while self.pos < self.bytes.len() && matches!(self.bytes[self.pos], b' ' | b'\t') {
-            self.pos += 1;
-        }
+        skip_spaces(self.bytes, &mut self.pos);
     }
 
     // ---- Object dispatch -------------------------------------------------
@@ -217,15 +218,11 @@ impl<'a> Parser<'a> {
                         break;
                     };
                     self.pos += 1;
+                    if let Some(escaped) = simple_escape(c) {
+                        out.push(escaped);
+                        continue;
+                    }
                     match c {
-                        b'n' => out.push(b'\n'),
-                        b'r' => out.push(b'\r'),
-                        b't' => out.push(b'\t'),
-                        b'b' => out.push(0x08),
-                        b'f' => out.push(0x0C),
-                        b'\\' => out.push(b'\\'),
-                        b'(' => out.push(b'('),
-                        b')' => out.push(b')'),
                         b'\n' => {} // line continuation
                         b'\r' => {
                             if self.bytes.get(self.pos) == Some(&b'\n') {
@@ -260,33 +257,14 @@ impl<'a> Parser<'a> {
 
     fn parse_hex_string(&mut self) -> Result<Object, PdfError> {
         debug_assert_eq!(self.bytes[self.pos], b'<');
-        self.pos += 1;
-        let mut out = Vec::new();
-        let mut nibble: Option<u8> = None;
-        while let Some(&b) = self.bytes.get(self.pos) {
-            if b == b'>' {
-                self.pos += 1;
-                if let Some(prev) = nibble {
-                    out.push(prev << 4);
-                }
-                return Ok(Object::String(out));
-            }
-            self.pos += 1;
-            if is_ws(b) {
-                continue;
-            }
-            let Some(v) = hex_digit(b) else {
-                continue;
-            };
-            match nibble {
-                Some(prev) => {
-                    out.push((prev << 4) | v);
-                    nibble = None;
-                }
-                None => nibble = Some(v),
-            }
-        }
-        Err(PdfError::BadObject("unterminated hex string".into()))
+        let start = self.pos + 1;
+        let end = self.bytes[start..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|i| start + i)
+            .ok_or_else(|| PdfError::BadObject("unterminated hex string".into()))?;
+        self.pos = end + 1;
+        Ok(Object::String(decode_hex(&self.bytes[start..end])))
     }
 
     // ---- Names -----------------------------------------------------------
@@ -453,17 +431,9 @@ impl<'a> Parser<'a> {
                 ));
             };
             self.pos += b"stream".len();
-            // Spec: stream keyword is followed by CRLF or LF (not just CR).
-            match self.bytes.get(self.pos) {
-                Some(&b'\r') => {
-                    self.pos += 1;
-                    if self.bytes.get(self.pos) == Some(&b'\n') {
-                        self.pos += 1;
-                    }
-                }
-                Some(&b'\n') => self.pos += 1,
-                _ => {}
-            }
+            // Spec: stream keyword is followed by CRLF or LF; a lone CR is
+            // tolerated here for the producers that emit it.
+            skip_line_break(self.bytes, &mut self.pos);
             let (content_start, content_len) = match stream_length(&dict, resolve_length)? {
                 StreamLength::Direct(len) => {
                     if len > self.bytes.len().saturating_sub(self.pos) {
