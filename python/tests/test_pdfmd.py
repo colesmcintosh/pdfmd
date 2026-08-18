@@ -8,6 +8,8 @@ Run from the repository root after `cargo build --release`:
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -17,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pdfmd  # noqa: E402
-from pdfmd import _binding  # noqa: E402
+from pdfmd import _binding, __main__ as cli  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "sample.pdf"
 
@@ -94,6 +96,108 @@ class ConvertTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda _: pdfmd.convert(self.data), range(4)))
         self.assertEqual(len({r.markdown for r in results}), 1)
+
+
+class ConvertManyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.data = FIXTURE.read_bytes()
+        cls.expected = pdfmd.convert(cls.data).markdown
+
+    def test_converts_a_batch_in_input_order(self) -> None:
+        sources = [FIXTURE, self.data, str(FIXTURE)]
+        results = pdfmd.convert_many(sources)
+        self.assertEqual([r.markdown for r in results], [self.expected] * 3)
+
+    def test_empty_input_needs_no_workers(self) -> None:
+        self.assertEqual(pdfmd.convert_many([]), [])
+
+    def test_a_single_worker_stays_on_this_thread(self) -> None:
+        results = pdfmd.convert_many([self.data, self.data], workers=1)
+        self.assertEqual([r.markdown for r in results], [self.expected] * 2)
+
+    def test_options_reach_every_conversion(self) -> None:
+        results = pdfmd.convert_many(
+            [self.data, FIXTURE], page_breaks=True, image_dir="figs"
+        )
+        for result in results:
+            self.assertIn("\n---\n", result.markdown)
+            self.assertTrue(result.images)
+
+    def test_a_bad_source_raises(self) -> None:
+        with self.assertRaises(pdfmd.PdfError):
+            pdfmd.convert_many([self.data, b"not a pdf at all"])
+
+    def test_rejects_a_worker_count_below_one(self) -> None:
+        with self.assertRaises(ValueError):
+            pdfmd.convert_many([self.data], workers=0)
+
+    def test_accepts_an_iterator_of_sources(self) -> None:
+        results = pdfmd.convert_many(iter([self.data]))
+        self.assertEqual(len(results), 1)
+
+
+class CommandLineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.data = FIXTURE.read_bytes()
+
+    def run_cli(self, *argv: str, stdin: bytes = b"") -> tuple[int, str, str]:
+        """Run the CLI in-process; returns (exit code, stdout, stderr)."""
+        out, err = io.BytesIO(), io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = cli.main(list(argv), stdin=io.BytesIO(stdin), stdout=out)
+        return code, out.getvalue().decode("utf-8"), err.getvalue()
+
+    def test_writes_markdown_to_stdout(self) -> None:
+        code, markdown, _ = self.run_cli(str(FIXTURE))
+        self.assertEqual(code, 0)
+        self.assertEqual(markdown, pdfmd.convert(self.data).markdown)
+
+    def test_reads_a_pdf_from_stdin(self) -> None:
+        code, markdown, _ = self.run_cli("-", stdin=self.data)
+        self.assertEqual(code, 0)
+        self.assertTrue(markdown.startswith("# "))
+
+    def test_page_breaks_flag(self) -> None:
+        _, markdown, _ = self.run_cli(str(FIXTURE), "--page-breaks")
+        self.assertIn("\n---\n", markdown)
+
+    def test_output_and_extract_images_write_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.md"
+            figs = Path(tmp) / "figs"
+            code, stdout, _ = self.run_cli(
+                str(FIXTURE), "-o", str(out), "--extract-images", str(figs)
+            )
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertIn(f"![]({figs}/", out.read_text(encoding="utf-8"))
+            self.assertTrue(list(figs.iterdir()))
+
+    def test_reports_an_unreadable_input(self) -> None:
+        code, stdout, stderr = self.run_cli(str(FIXTURE.with_name("absent.pdf")))
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertIn("failed to read", stderr)
+
+    def test_reports_a_conversion_failure(self) -> None:
+        code, stdout, stderr = self.run_cli("-", stdin=b"not a pdf at all")
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertIn("does not look like a PDF", stderr)
+
+    def test_reports_an_unwritable_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "missing" / "out.md"
+            code, _, stderr = self.run_cli(str(FIXTURE), "-o", str(target))
+            self.assertEqual(code, 1)
+            self.assertIn("failed to write output", stderr)
+
+    def test_version_flag_prints_the_crate_version(self) -> None:
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            with self.assertRaises(SystemExit) as caught:
+                self.run_cli("--version")
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(printed.getvalue().strip(), f"pdfmd {pdfmd.__version__}")
 
 
 class MetadataTests(unittest.TestCase):
