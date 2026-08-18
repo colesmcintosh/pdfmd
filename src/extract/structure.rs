@@ -155,11 +155,8 @@ fn parse_role(name: &[u8]) -> Option<Role> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf::test_pdf::build_xref_pdf;
     use crate::pdf::Document;
-
-    fn build_xref_pdf(body: &[u8]) -> Vec<u8> {
-        crate::pdf::test_pdf::build_xref_pdf(body)
-    }
 
     #[test]
     fn empty_without_struct_tree() {

@@ -179,11 +179,39 @@ impl Matrix {
             f: 0.0,
         }
     }
+
+    /// The six operands `Tm` and `cm` both take, in order.
+    fn from_nums(nums: &[f32]) -> Option<Self> {
+        let [a, b, c, d, e, f, ..] = nums else {
+            return None;
+        };
+        Some(Self {
+            a: *a,
+            b: *b,
+            c: *c,
+            d: *d,
+            e: *e,
+            f: *f,
+        })
+    }
+
     /// Pre-multiply: `self = other * self` (translate-by-other semantics
     /// matches how PDF accumulates `Td` and `Tm` against the line matrix).
     fn translate(&mut self, tx: f32, ty: f32) {
         self.e += tx * self.a + ty * self.c;
         self.f += tx * self.b + ty * self.d;
+    }
+
+    /// `self × m`, the order `cm` concatenates onto the current CTM.
+    fn concat(&self, m: Matrix) -> Matrix {
+        Matrix {
+            a: self.a * m.a + self.b * m.c,
+            b: self.a * m.b + self.b * m.d,
+            c: self.c * m.a + self.d * m.c,
+            d: self.c * m.b + self.d * m.d,
+            e: self.e * m.a + self.f * m.c + m.e,
+            f: self.e * m.b + self.f * m.d + m.f,
+        }
     }
 }
 
@@ -262,6 +290,7 @@ pub fn extract_page_text(
         &forms,
         &form_fonts,
         &image_filenames,
+        FORM_EXECUTION_LIMITS,
     )
 }
 
@@ -350,28 +379,6 @@ impl PageBuilder {
     }
 }
 
-/// Extract page text while resolving Form XObjects at each `Do` paint.
-#[cfg(test)]
-pub(super) fn extract_page_text_with_forms<'fonts>(
-    content_bytes: &[u8],
-    fonts: &PageFonts<'fonts>,
-    xobjects: &HashMap<Vec<u8>, ObjectId>,
-    forms: &HashMap<ObjectId, FormXObject>,
-    form_fonts: &HashMap<ObjectId, PageFonts<'fonts>>,
-    image_filenames: &ImageFilenames<'_>,
-) -> String {
-    extract_page_layout(
-        content_bytes,
-        fonts,
-        xobjects,
-        forms,
-        form_fonts,
-        image_filenames,
-        true,
-    )
-    .text
-}
-
 pub(super) fn extract_page_layout<'fonts>(
     content_bytes: &[u8],
     fonts: &PageFonts<'fonts>,
@@ -395,8 +402,9 @@ pub(super) fn extract_page_layout<'fonts>(
     )
 }
 
+/// Extract page text while resolving Form XObjects at each `Do` paint.
 #[cfg(test)]
-fn extract_page_text_with_form_limits<'fonts>(
+fn extract_page_text_with_forms<'fonts>(
     content_bytes: &[u8],
     fonts: &PageFonts<'fonts>,
     xobjects: &HashMap<Vec<u8>, ObjectId>,
@@ -661,15 +669,7 @@ fn dispatch<'fonts>(
             }
         }
         b"Tm" => {
-            if let [a, b, c, d, e, f, ..] = ops.nums() {
-                let m = Matrix {
-                    a: *a,
-                    b: *b,
-                    c: *c,
-                    d: *d,
-                    e: *e,
-                    f: *f,
-                };
+            if let Some(m) = Matrix::from_nums(ops.nums()) {
                 let direction_changed = state
                     .line_matrix
                     .map(|previous| text_direction_changed(previous, m))
@@ -683,47 +683,23 @@ fn dispatch<'fonts>(
         }
         b"Td" | b"TD" => {
             if let [tx, ty, ..] = ops.nums() {
-                let (tx, ty) = (*tx, *ty);
                 if op == b"TD" {
-                    state.leading = -ty;
+                    state.leading = -*ty;
                 }
-                if let Some(mut line) = state.line_matrix {
-                    line.translate(tx, ty);
-                    state.set_line_matrix(line);
-                    position_changed(state, line.e, line.f, form_execution.output_floor(), page);
+                translate_line(state, *tx, *ty, form_execution.output_floor(), page);
+            }
+        }
+        // `'` and `"` are `T*` followed by `Tj`; `"` also takes word/char
+        // spacing operands, which we don't model.
+        b"Tj" | b"T*" | b"'" | b"\"" => {
+            if op != b"Tj" {
+                let leading = state.leading;
+                translate_line(state, 0.0, -leading, form_execution.output_floor(), page);
+            }
+            if op != b"T*" {
+                if let Some(s) = ops.string.as_deref() {
+                    emit(state, s, page);
                 }
-            }
-        }
-        b"T*" => {
-            if let Some(mut line) = state.line_matrix {
-                line.translate(0.0, -state.leading);
-                state.set_line_matrix(line);
-                position_changed(state, line.e, line.f, form_execution.output_floor(), page);
-            }
-        }
-        b"Tj" => {
-            if let Some(s) = ops.string.as_deref() {
-                emit(state, s, page);
-            }
-        }
-        b"'" => {
-            if let Some(mut line) = state.line_matrix {
-                line.translate(0.0, -state.leading);
-                state.set_line_matrix(line);
-                position_changed(state, line.e, line.f, form_execution.output_floor(), page);
-            }
-            if let Some(s) = ops.string.as_deref() {
-                emit(state, s, page);
-            }
-        }
-        b"\"" => {
-            if let Some(mut line) = state.line_matrix {
-                line.translate(0.0, -state.leading);
-                state.set_line_matrix(line);
-                position_changed(state, line.e, line.f, form_execution.output_floor(), page);
-            }
-            if let Some(s) = ops.string.as_deref() {
-                emit(state, s, page);
             }
         }
         b"Do" => {
@@ -741,49 +717,7 @@ fn dispatch<'fonts>(
                     let prev_alnum = page.last_alnum;
                     let prev_ws = page.last_ws;
                     if emit_form(id, state, resources, form_context, form_execution, page) {
-                        if page.keep_text {
-                            let previous = page.out[..start].chars().next_back();
-                            let first = page.out[start..].chars().next();
-                            let adjacent_words = previous
-                                .zip(first)
-                                .map(|(left, right)| {
-                                    left.is_alphanumeric() && right.is_alphanumeric()
-                                })
-                                .unwrap_or(false);
-                            let boundary_is_tight =
-                                previous.map(|ch| !ch.is_whitespace()).unwrap_or(false)
-                                    && first.map(|ch| !ch.is_whitespace()).unwrap_or(false);
-                            if boundary_is_tight && (state.pending_space || adjacent_words) {
-                                page.out.insert(start, ' ');
-                            }
-                            state.pending_form_word_boundary = page
-                                .out
-                                .chars()
-                                .next_back()
-                                .map(|ch| ch.is_alphanumeric())
-                                .unwrap_or(false);
-                        } else if let Some(first) = page.layout.spans.get_mut(span_start) {
-                            let first_ws = first
-                                .text
-                                .chars()
-                                .next()
-                                .map(|ch| ch.is_whitespace())
-                                .unwrap_or(true);
-                            let first_alnum = first
-                                .text
-                                .chars()
-                                .next()
-                                .map(|ch| ch.is_alphanumeric())
-                                .unwrap_or(false);
-                            if !prev_ws
-                                && !first_ws
-                                && (state.pending_space || (prev_alnum && first_alnum))
-                            {
-                                first.space_before = true;
-                            }
-                            state.pending_form_word_boundary = page.last_alnum;
-                        }
-                        state.pending_space = false;
+                        join_form_output(state, page, start, span_start, prev_ws, prev_alnum);
                     }
                 }
             }
@@ -807,24 +741,8 @@ fn dispatch<'fonts>(
             }
         }
         b"cm" => {
-            if let [a, b, c, d, e, f, ..] = ops.nums() {
-                let n = Matrix {
-                    a: *a,
-                    b: *b,
-                    c: *c,
-                    d: *d,
-                    e: *e,
-                    f: *f,
-                };
-                let m = page.ctm;
-                page.ctm = Matrix {
-                    a: n.a * m.a + n.b * m.c,
-                    b: n.a * m.b + n.b * m.d,
-                    c: n.c * m.a + n.d * m.c,
-                    d: n.c * m.b + n.d * m.d,
-                    e: n.e * m.a + n.f * m.c + m.e,
-                    f: n.e * m.b + n.f * m.d + m.f,
-                };
+            if let Some(n) = Matrix::from_nums(ops.nums()) {
+                page.ctm = n.concat(page.ctm);
             }
         }
         b"re" => {
@@ -847,6 +765,64 @@ fn dispatch<'fonts>(
         }
         _ => {}
     }
+}
+
+/// Shift the text-line matrix and report the move to the line/word-break
+/// heuristics. Shared by `Td`, `TD`, `T*`, `'`, and `"`.
+fn translate_line(
+    state: &mut TextState<'_>,
+    tx: f32,
+    ty: f32,
+    output_floor: usize,
+    page: &mut PageBuilder,
+) {
+    let Some(mut line) = state.line_matrix else {
+        return;
+    };
+    line.translate(tx, ty);
+    state.set_line_matrix(line);
+    position_changed(state, line.e, line.f, output_floor, page);
+}
+
+/// Recover a word break at the seam between the caller's output and the text
+/// a Form XObject just painted. `start` / `span_start` mark that seam, and
+/// `prev_ws` / `prev_alnum` describe the byte before it.
+fn join_form_output(
+    state: &mut TextState<'_>,
+    page: &mut PageBuilder,
+    start: usize,
+    span_start: usize,
+    prev_ws: bool,
+    prev_alnum: bool,
+) {
+    if page.keep_text {
+        let previous = page.out[..start].chars().next_back();
+        let first = page.out[start..].chars().next();
+        let adjacent_words = previous
+            .zip(first)
+            .map(|(left, right)| left.is_alphanumeric() && right.is_alphanumeric())
+            .unwrap_or(false);
+        let boundary_is_tight = previous.map(|ch| !ch.is_whitespace()).unwrap_or(false)
+            && first.map(|ch| !ch.is_whitespace()).unwrap_or(false);
+        if boundary_is_tight && (state.pending_space || adjacent_words) {
+            page.out.insert(start, ' ');
+        }
+        state.pending_form_word_boundary = page
+            .out
+            .chars()
+            .next_back()
+            .map(|ch| ch.is_alphanumeric())
+            .unwrap_or(false);
+    } else if let Some(first) = page.layout.spans.get_mut(span_start) {
+        let leading = first.text.chars().next();
+        let first_ws = leading.map(char::is_whitespace).unwrap_or(true);
+        let first_alnum = leading.map(char::is_alphanumeric).unwrap_or(false);
+        if !prev_ws && !first_ws && (state.pending_space || (prev_alnum && first_alnum)) {
+            first.space_before = true;
+        }
+        state.pending_form_word_boundary = page.last_alnum;
+    }
+    state.pending_space = false;
 }
 
 fn emit_image_marker(
@@ -1327,6 +1303,7 @@ ET
             &forms,
             &form_fonts,
             &image_filenames,
+            FORM_EXECUTION_LIMITS,
         );
         assert_eq!(punctuation, "word!");
 
@@ -1337,6 +1314,7 @@ ET
             &forms,
             &form_fonts,
             &image_filenames,
+            FORM_EXECUTION_LIMITS,
         );
         assert_eq!(alphanumeric, "word next");
     }
@@ -1361,7 +1339,7 @@ ET
         let form_fonts = HashMap::new();
         let image_filenames = ImageFilenames::new();
 
-        let invocation_limited = extract_page_text_with_form_limits(
+        let invocation_limited = extract_page_text_with_forms(
             b"/Root Do",
             &fonts,
             &xobjects,
@@ -1377,7 +1355,7 @@ ET
         assert_eq!(invocation_limited, "x x");
 
         let output_forms = HashMap::from([(leaf, form(b"BT /F1 12 Tf (abcdef) Tj ET"))]);
-        let output_limited = extract_page_text_with_form_limits(
+        let output_limited = extract_page_text_with_forms(
             b"/Leaf Do /Leaf Do",
             &fonts,
             &xobjects,
@@ -1406,7 +1384,7 @@ ET
             (silent, form(silent_content)),
             (marker, form(b"BT /F1 12 Tf (x) Tj ET")),
         ]);
-        let input_limited = extract_page_text_with_form_limits(
+        let input_limited = extract_page_text_with_forms(
             b"/Root Do",
             &fonts,
             &input_xobjects,
@@ -1493,7 +1471,7 @@ ET
         let image_filenames = HashMap::from([(image_id, "img-001.jpg")]);
         let complete = format!("\n\n{mark}img-001.jpg{mark}\n\n", mark = IMAGE_MARK);
 
-        let too_small = extract_page_text_with_form_limits(
+        let too_small = extract_page_text_with_forms(
             b"/Fm Do",
             &fonts,
             &xobjects,
@@ -1508,7 +1486,7 @@ ET
         );
         assert!(too_small.is_empty());
 
-        let exact = extract_page_text_with_form_limits(
+        let exact = extract_page_text_with_forms(
             b"/Fm Do",
             &fonts,
             &xobjects,
@@ -1779,7 +1757,7 @@ ET
         // page_font_refs returns empty.
         let mut res = crate::pdf::Dictionary::new();
         res.insert(b"Font".to_vec(), Object::Integer(0));
-        let bytes = build_pdf_with_xref(
+        let bytes = crate::pdf::test_pdf::build_xref_pdf(
             b"\
 %PDF-1.4
 1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
@@ -1794,7 +1772,7 @@ ET
     #[test]
     fn page_font_refs_returns_empty_when_font_entry_missing() {
         let res = crate::pdf::Dictionary::new();
-        let bytes = build_pdf_with_xref(
+        let bytes = crate::pdf::test_pdf::build_xref_pdf(
             b"\
 %PDF-1.4
 1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
@@ -1811,7 +1789,7 @@ ET
         // /Font is a Reference pointing at a non-dict object → empty.
         let mut res = crate::pdf::Dictionary::new();
         res.insert(b"Font".to_vec(), Object::Reference(ObjectId(4, 0)));
-        let bytes = build_pdf_with_xref(
+        let bytes = crate::pdf::test_pdf::build_xref_pdf(
             b"\
 %PDF-1.4
 1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj
@@ -1838,7 +1816,7 @@ ET
 5 0 obj <</F1 6 0 R>> endobj
 6 0 obj <</Type/Font/Subtype/Type1/BaseFont/Helvetica>> endobj
 ";
-        let bytes = build_pdf_with_xref(pdf);
+        let bytes = crate::pdf::test_pdf::build_xref_pdf(pdf);
         let doc = Document::load(&bytes).unwrap();
         let page_id = doc.pages()[0];
         let res = super::super::page_resources(&doc, page_id).unwrap();
@@ -1903,9 +1881,5 @@ ET
         );
         assert_eq!(layout.spans[0].text, "Hi");
         assert_eq!(layout.spans[0].mcid, Some(3));
-    }
-
-    fn build_pdf_with_xref(body: &[u8]) -> Vec<u8> {
-        crate::pdf::test_pdf::build_xref_pdf(body)
     }
 }
