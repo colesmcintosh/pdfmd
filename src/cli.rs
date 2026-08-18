@@ -65,20 +65,22 @@ fn parse_args() -> Result<Option<Cli>, String> {
                 .next()
                 .ok_or_else(|| "missing value for --extract-images".to_string())?;
             extract_images = Some(PathBuf::from(v));
-        } else if let Some(s) = arg.to_str() {
-            if let Some(rest) = s.strip_prefix("--output=") {
-                output = Some(PathBuf::from(rest));
-            } else if let Some(rest) = s.strip_prefix("--extract-images=") {
-                extract_images = Some(PathBuf::from(rest));
-            } else if s.starts_with("--") || (s.starts_with('-') && s != "-") {
-                return Err(format!("unknown flag: {s}"));
-            } else {
-                if input.is_some() {
-                    return Err(format!("unexpected positional argument: {s}"));
-                }
-                input = Some(PathBuf::from(arg));
-            }
         } else {
+            // Flags are always valid UTF-8; a path that isn't can only be the
+            // positional input.
+            if let Some(s) = arg.to_str() {
+                if let Some(rest) = s.strip_prefix("--output=") {
+                    output = Some(PathBuf::from(rest));
+                    continue;
+                }
+                if let Some(rest) = s.strip_prefix("--extract-images=") {
+                    extract_images = Some(PathBuf::from(rest));
+                    continue;
+                }
+                if s.starts_with("--") || (s.starts_with('-') && s != "-") {
+                    return Err(format!("unknown flag: {s}"));
+                }
+            }
             if input.is_some() {
                 return Err(format!(
                     "unexpected positional argument: {}",
@@ -234,6 +236,31 @@ fn execute(cli: Cli) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf")
+    }
+
+    /// Collision-free path under the system temp dir, tagged for readability.
+    fn tmp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pdfmd-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
+
+    fn cli(input: PathBuf, output: Option<PathBuf>, extract_images: Option<PathBuf>) -> Cli {
+        Cli {
+            input,
+            output,
+            page_breaks: false,
+            extract_images,
+        }
+    }
+
     #[test]
     fn is_url_recognises_http_and_https_only() {
         assert!(is_url("http://example.com/x.pdf"));
@@ -356,14 +383,7 @@ mod tests {
 
     #[test]
     fn write_images_creates_target_directory_and_writes() {
-        let tmp = std::env::temp_dir().join(format!(
-            "pdfmd-imgs-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        let tmp = tmp_path("imgs");
         let images = vec![ExtractedImage {
             filename: "a.jpg".to_string(),
             bytes: vec![1, 2, 3],
@@ -376,14 +396,7 @@ mod tests {
     #[test]
     fn write_images_errors_when_dir_path_is_a_file() {
         // Block dir creation by placing a regular file at the target path.
-        let tmp = std::env::temp_dir().join(format!(
-            "pdfmd-imgs-blocked-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        let tmp = tmp_path("imgs-blocked");
         std::fs::write(&tmp, b"not a dir").unwrap();
         let err = write_images(&tmp, &[]).unwrap_err();
         assert!(!err.to_string().is_empty());
@@ -395,14 +408,7 @@ mod tests {
         // Create the dir, then create a *directory* (not a file) at the
         // path where we'd try to write the image — that turns the inner
         // `fs::write` into an error.
-        let tmp = std::env::temp_dir().join(format!(
-            "pdfmd-imgs-busy-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        let tmp = tmp_path("imgs-busy");
         std::fs::create_dir_all(&tmp).unwrap();
         let blocker = tmp.join("a.jpg");
         std::fs::create_dir(&blocker).unwrap();
@@ -418,45 +424,17 @@ mod tests {
     #[test]
     fn write_output_errors_when_target_is_unwritable() {
         // A directory at the target path makes fs::write fail.
-        let tmp = std::env::temp_dir().join(format!(
-            "pdfmd-out-dir-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        let tmp = tmp_path("out-dir");
         std::fs::create_dir_all(&tmp).unwrap();
         assert!(write_output(Some(&tmp), "x").is_err());
         let _ = std::fs::remove_dir(&tmp);
-    }
-
-    fn fixture() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf")
-    }
-
-    fn tmp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "pdfmd-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ))
     }
 
     #[test]
     fn execute_writes_markdown_and_images_when_dir_set() {
         let out = tmp_path("md");
         let imgs = tmp_path("imgs");
-        let cli = Cli {
-            input: fixture(),
-            output: Some(out.clone()),
-            page_breaks: false,
-            extract_images: Some(imgs.clone()),
-        };
-        execute(cli).expect("execute");
+        execute(cli(fixture(), Some(out.clone()), Some(imgs.clone()))).expect("execute");
         let md = std::fs::read_to_string(&out).expect("read out");
         assert!(!md.is_empty());
         assert!(imgs.exists());
@@ -466,13 +444,8 @@ mod tests {
 
     #[test]
     fn execute_propagates_input_read_error() {
-        let cli = Cli {
-            input: PathBuf::from("/definitely/missing/pdfmd-exec.pdf"),
-            output: None,
-            page_breaks: false,
-            extract_images: None,
-        };
-        let err = execute(cli).unwrap_err();
+        let missing = PathBuf::from("/definitely/missing/pdfmd-exec.pdf");
+        let err = execute(cli(missing, None, None)).unwrap_err();
         assert!(err.contains("failed to read"));
     }
 
@@ -480,13 +453,7 @@ mod tests {
     fn execute_propagates_convert_error_for_non_pdf() {
         let path = tmp_path("notpdf");
         std::fs::write(&path, b"not a pdf").unwrap();
-        let cli = Cli {
-            input: path.clone(),
-            output: None,
-            page_breaks: false,
-            extract_images: None,
-        };
-        assert!(execute(cli).is_err());
+        assert!(execute(cli(path.clone(), None, None)).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -496,13 +463,12 @@ mod tests {
         let imgs_blocker = tmp_path("imgs-blocked");
         // Place a regular file where the images dir would go.
         std::fs::write(&imgs_blocker, b"i am a file").unwrap();
-        let cli = Cli {
-            input: fixture(),
-            output: Some(out.clone()),
-            page_breaks: false,
-            extract_images: Some(imgs_blocker.clone()),
-        };
-        let err = execute(cli).unwrap_err();
+        let err = execute(cli(
+            fixture(),
+            Some(out.clone()),
+            Some(imgs_blocker.clone()),
+        ))
+        .unwrap_err();
         assert!(err.contains("failed to write images"));
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(&imgs_blocker);
@@ -512,13 +478,7 @@ mod tests {
     fn execute_propagates_write_output_error_for_unwritable_path() {
         let out_dir = tmp_path("out-as-dir");
         std::fs::create_dir_all(&out_dir).unwrap();
-        let cli = Cli {
-            input: fixture(),
-            output: Some(out_dir.clone()),
-            page_breaks: false,
-            extract_images: None,
-        };
-        let err = execute(cli).unwrap_err();
+        let err = execute(cli(fixture(), Some(out_dir.clone()), None)).unwrap_err();
         assert!(err.contains("failed to write"));
         let _ = std::fs::remove_dir(&out_dir);
     }
@@ -528,14 +488,9 @@ mod tests {
     fn execute_rejects_non_utf8_extract_images_path() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        let cli = Cli {
-            input: fixture(),
-            output: Some(tmp_path("md")),
-            page_breaks: false,
-            // Lone 0xFF byte → not valid UTF-8 on Unix paths.
-            extract_images: Some(PathBuf::from(OsString::from_vec(vec![0xFF]))),
-        };
-        let err = execute(cli).unwrap_err();
+        // Lone 0xFF byte → not valid UTF-8 on Unix paths.
+        let bad = PathBuf::from(OsString::from_vec(vec![0xFF]));
+        let err = execute(cli(fixture(), Some(tmp_path("md")), Some(bad))).unwrap_err();
         assert!(err.contains("must be valid UTF-8"));
     }
 
@@ -544,27 +499,14 @@ mod tests {
         // We can't easily capture stdout in-process, but we can at least
         // run the code path. write_output → io::stdout().write_all should
         // succeed in the test harness.
-        let cli = Cli {
-            input: fixture(),
-            output: None,
-            page_breaks: false,
-            extract_images: None,
-        };
         // Don't assert anything about output content — just that the call
         // doesn't error.
-        execute(cli).expect("execute to stdout");
+        execute(cli(fixture(), None, None)).expect("execute to stdout");
     }
 
     #[test]
     fn write_images_with_empty_input_only_creates_dir() {
-        let tmp = std::env::temp_dir().join(format!(
-            "pdfmd-imgs-empty-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        let tmp = tmp_path("imgs-empty");
         write_images(&tmp, &[]).unwrap();
         assert!(tmp.exists());
         let _ = std::fs::remove_dir_all(&tmp);
