@@ -188,36 +188,39 @@ developer-only binaries that aren't part of the shipped library or CLI.
 
 Current breakdown:
 
-| file                   | lines   | regions | functions |
-|------------------------|---------|---------|-----------|
-| `cli.rs`               | 100.00% | 100.00% | 100.00%   |
-| `extract/cmap.rs`      | 100.00% | 98.64%  | 100.00%   |
-| `extract/content.rs`   | 97.44%  | 92.43%  | 97.85%    |
-| `extract/encoding.rs`  | 99.81%  | 99.80%  | 100.00%   |
-| `extract/font.rs`      | 100.00% | 100.00% | 100.00%   |
-| `extract/glyphs.rs`    | 99.85%  | 99.85%  | 100.00%   |
-| `extract/image.rs`     | 100.00% | 94.18%  | 100.00%   |
-| `extract/image/png.rs` | 100.00% | 98.51%  | 100.00%   |
-| `extract/layout.rs`    | 100.00% | 100.00% | 100.00%   |
-| `extract/mod.rs`       | 99.57%  | 97.60%  | 100.00%   |
-| `extract/parser.rs`    | 99.58%  | 98.60%  | 100.00%   |
-| `extract/structure.rs` | 95.91%  | 91.84%  | 100.00%   |
-| `heuristics/mod.rs`    | 95.80%  | 90.76%  | 97.20%    |
-| `heuristics/tables.rs` | 97.45%  | 93.01%  | 96.15%    |
-| `lib.rs`               | 100.00% | 100.00% | 100.00%   |
-| `main.rs`              | 100.00% | 100.00% | 100.00%   |
-| `pdf/deflate.rs`       | 100.00% | 100.00% | 100.00%   |
-| `pdf/filter.rs`        | 100.00% | 99.19%  | 100.00%   |
-| `pdf/mod.rs`           | 99.68%  | 97.71%  | 98.43%    |
-| `pdf/object.rs`        | 100.00% | 100.00% | 100.00%   |
-| `pdf/object_stream.rs` | 100.00% | 95.65%  | 100.00%   |
-| `pdf/page_tree.rs`     | 100.00% | 95.56%  | 100.00%   |
-| `pdf/parser.rs`        | 99.87%  | 99.56%  | 100.00%   |
-| `pdf/syntax.rs`        | 100.00% | 95.24%  | 100.00%   |
-| `pdf/test_pdf.rs`      | 100.00% | 100.00% | 100.00%   |
-| `pdf/xref.rs`          | 100.00% | 100.00% | 100.00%   |
-| `util.rs`              | 98.65%  | 97.22%  | 91.67%    |
-| **total**              | **99.04%** | **97.17%** | **99.06%** |
+| file                        | lines   | regions | functions |
+|-----------------------------|---------|---------|-----------|
+| `cli.rs`                    | 100.00% | 100.00% | 100.00%   |
+| `extract/cmap.rs`           | 100.00% | 99.59%  | 100.00%   |
+| `extract/content/forms.rs`  | 99.11%  | 99.41%  | 100.00%   |
+| `extract/content/matrix.rs` | 100.00% | 100.00% | 100.00%   |
+| `extract/content/mod.rs`    | 98.28%  | 97.43%  | 100.00%   |
+| `extract/encoding.rs`       | 100.00% | 100.00% | 100.00%   |
+| `extract/font.rs`           | 100.00% | 100.00% | 100.00%   |
+| `extract/glyphs.rs`         | 100.00% | 100.00% | 100.00%   |
+| `extract/image.rs`          | 100.00% | 98.09%  | 100.00%   |
+| `extract/image/png.rs`      | 100.00% | 100.00% | 100.00%   |
+| `extract/layout.rs`         | 100.00% | 100.00% | 100.00%   |
+| `extract/mod.rs`            | 99.53%  | 99.44%  | 100.00%   |
+| `extract/parser.rs`         | 99.49%  | 99.56%  | 100.00%   |
+| `extract/structure.rs`      | 95.83%  | 97.00%  | 100.00%   |
+| `heuristics/lines.rs`       | 98.72%  | 97.76%  | 100.00%   |
+| `heuristics/mod.rs`         | 97.93%  | 97.04%  | 100.00%   |
+| `heuristics/tables.rs`      | 97.77%  | 96.24%  | 100.00%   |
+| `lib.rs`                    | 100.00% | 100.00% | 100.00%   |
+| `main.rs`                   | 100.00% | 100.00% | 100.00%   |
+| `pdf/deflate.rs`            | 100.00% | 100.00% | 100.00%   |
+| `pdf/filter.rs`             | 100.00% | 99.84%  | 100.00%   |
+| `pdf/mod.rs`                | 99.17%  | 98.88%  | 100.00%   |
+| `pdf/object.rs`             | 100.00% | 100.00% | 100.00%   |
+| `pdf/object_stream.rs`      | 100.00% | 99.37%  | 100.00%   |
+| `pdf/page_tree.rs`          | 99.24%  | 98.35%  | 100.00%   |
+| `pdf/parser.rs`             | 99.86%  | 99.92%  | 100.00%   |
+| `pdf/syntax.rs`             | 100.00% | 100.00% | 100.00%   |
+| `pdf/test_pdf.rs`           | 99.46%  | 99.74%  | 100.00%   |
+| `pdf/xref.rs`               | 99.72%  | 99.69%  | 100.00%   |
+| `util.rs`                   | 100.00% | 100.00% | 100.00%   |
+| **total**                   | **99.33%** | **99.03%** | **100.00%** |
 
 The badge tracks line coverage. The table also includes llvm-cov region
 coverage, which is stricter about expression-level instrumentation.
@@ -253,8 +256,9 @@ src/
 │   ├── structure.rs      tagged-PDF structure tree → heading/table/list roles
 │   └── mod.rs            page walking + per-page parallelism
 ├── heuristics/
+│   ├── lines.rs          line-level headings, lists, and numbering
 │   ├── tables.rs         ruled and borderless GFM tables
-│   └── mod.rs            columns, headings, lists, emphasis, header/footer strip
+│   └── mod.rs            columns, spans, emphasis, header/footer strip
 ├── util.rs               shared parallel_map worker pool
 ├── lib.rs                public API
 ├── cli.rs                CLI parser and execution
