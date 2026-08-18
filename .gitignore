@@ -2,3 +2,13 @@
 *.pdf
 *.md.bak
 !tests/fixtures/*.pdf
+
+# Python bindings: build output and the shared library copied in by setup.py
+__pycache__/
+*.egg-info/
+/python/build/
+/python/dist/
+/dist/
+/python/pdfmd/*.so
+/python/pdfmd/*.dylib
+/python/pdfmd/*.dll

@@ -13,6 +13,7 @@ interpreter, heuristics, argv parser) is implemented in this crate.
 
 - Library entry: `src/lib.rs` (`convert_pdf_to_markdown`)
 - CLI entry: `src/main.rs` → `src/cli.rs`
+- C ABI: `src/ffi.rs` (cdylib); Python bindings: `python/`
 - Errors: `pdf::PdfError`, re-exported as `Error`
 - Vision: `VISION.md`
 
@@ -24,13 +25,17 @@ src/extract/      fonts, CMaps, content-stream interpreter, images, layout
 src/heuristics/   columns, tables, headings, lists, emphasis → Markdown
 src/lib.rs        public API + title promotion + image-mark rewrite
 src/cli.rs        argv parser, file/URL/stdin I/O (no clap)
+src/ffi.rs        C ABI over convert_pdf_to_markdown (cdylib)
 src/util.rs       parallel_map (std::thread::scope worker pool)
 src/bin/          profile.rs, opendataloader.rs — dev harnesses, not shipped
+python/           ctypes bindings over src/ffi.rs, packaging, tests
 tests/            integration + CLI + real fixtures only
 ```
 
 Public surface stays small: `convert_pdf_to_markdown`, `ConvertOptions`,
-`ConvertResult`, `ExtractedImage`, `Error` / `Result`.
+`ConvertResult`, `ExtractedImage`, `Error` / `Result`, plus the three
+`ffi` entry points (`pdfmd_convert`, `pdfmd_result_free`,
+`pdfmd_version`).
 
 ## Commands
 
@@ -42,6 +47,8 @@ cargo clippy --all-targets -- -D warnings     # CI gate
 RUSTFLAGS="-D warnings" cargo build           # what CI compiles with
 cargo llvm-cov --summary-only --ignore-filename-regex 'src/bin/'
 cargo run --release --bin profile             # hot-path sanity check
+cargo build --release && \
+  python -m unittest discover -s python/tests # Python bindings
 ```
 
 Run `fmt`, `clippy`, and `test --all-targets` before pushing. CI runs
@@ -51,7 +58,9 @@ that trio on Ubuntu for every PR; macOS and Windows tests run on `main`.
 
 - **No new dependencies.** `[dependencies]` in `Cargo.toml` must stay
   empty. If a task seems to require one, stop. Pulling in `serde`,
-  `clap`, `anyhow`, `flate2`, or a PDF crate defeats the project.
+  `clap`, `anyhow`, `flate2`, or a PDF crate defeats the project. This
+  covers bindings too: the Python package is `ctypes` over the C ABI,
+  not PyO3, and it has no runtime requirements of its own.
 - **MSRV is 1.70** (`rust-version` in `Cargo.toml`). No language or std
   features added after 1.70.
 - **Warnings are errors** in CI (`RUSTFLAGS=-D warnings`). Fix them;
@@ -110,6 +119,15 @@ Faster without a crate beats cleaner with a crate.
   `lib::promote_document_title`, not in `heuristics.rs`. Leave it there.
 - `src/bin/profile.rs` and `src/bin/opendataloader.rs` are dev-only,
   excluded from coverage. Don't import them from the library.
+- Every buffer crossing `src/ffi.rs` is a `(pointer, length)` pair with
+  no implied NUL — extracted text may contain any byte. A `PdfmdResult`
+  owns its buffers through an opaque handle and must be released once
+  with `pdfmd_result_free`.
+- `python/pdfmd/_binding.py` mirrors the `#[repr(C)]` structs field for
+  field. Change one side and you must change the other.
+- Coverage under `--all-targets` under-reports `src/ffi.rs`: the cdylib's
+  never-executed copy of the exported symbols is merged in. Check the
+  module with `cargo llvm-cov --lib`.
 
 ## Decision guide
 
@@ -120,4 +138,5 @@ Faster without a crate beats cleaner with a crate.
 | Unsure where a helper belongs | Put PDF syntax in `src/pdf/`, glyphs/layout in `src/extract/`, Markdown reconstruction in `src/heuristics/`. Shared thread pool stays in `src/util.rs`. |
 | Changing reconstruction of titles | Edit `promote_document_title` in `lib.rs`, not heuristics. |
 | Only the public API or CLI needs a real file | Add to `tests/integration.rs`. Otherwise unit-test beside the code. |
+| Binding another language | Call the C ABI in `src/ffi.rs`. Don't add a binding-generator crate. |
 | Trade-off is speed vs. readability on the hot path | Keep the fast version. Comment *why*. |

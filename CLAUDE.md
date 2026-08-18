@@ -39,6 +39,13 @@ If you touched `src/pdf/deflate.rs`, `src/extract/parser.rs`,
 cargo run --release --bin profile
 ```
 
+If you touched `src/ffi.rs` or `python/`, also run:
+
+```sh
+cargo build --release
+python -m unittest discover -s python/tests
+```
+
 ## Scope
 
 - Own the stack; don't wrap someone else's.
@@ -46,6 +53,8 @@ cargo run --release --bin profile
 - Title promotion lives in `lib::promote_document_title`, not heuristics.
 - Image sentinels (`\u{0001}filename\u{0001}`) and
   `lib::rewrite_image_marks` must stay in sync.
+- Bindings go through the C ABI in `src/ffi.rs`. No PyO3, no maturin —
+  `python/` is `ctypes` and stdlib only, on both sides.
 - `src/bin/*` is profiling / comparison only. Don't import it.
 
 Commit subjects: `module: lowercase summary`. Don't push to `main`.
