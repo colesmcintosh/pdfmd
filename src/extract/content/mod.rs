@@ -23,6 +23,12 @@ use super::layout::{font_style, PageLayout, PathRect, Span, SpanKind};
 use super::parser::{Parser, Token};
 use super::FormXObject;
 
+mod forms;
+mod matrix;
+
+use forms::{FormExecution, FormExecutionLimits, FORM_EXECUTION_LIMITS};
+use matrix::{text_direction_changed, Matrix};
+
 /// Map from a page's font-resource name (e.g. `b"F1"`) to a borrowed handle
 /// on the parsed font in the document-wide cache.
 pub type PageFonts<'a> = HashMap<Vec<u8>, &'a PdfFont>;
@@ -52,177 +58,13 @@ pub(crate) const IMAGE_MARK: char = '\u{0001}';
 /// the current text-space unit, so 100 ≈ a tenth of an em.
 const TJ_SPACE_THRESHOLD: f32 = 100.0;
 
-/// Bound recursive Form XObject invocation independently of the resource
-/// graph pre-pass. Real documents rarely nest forms more than a few levels;
-/// this cap keeps adversarial acyclic chains from exhausting the stack.
-const MAX_FORM_DEPTH: usize = 32;
 /// Figure drawings can emit tens of thousands of segments. Table detection
 /// only needs a handful of axis-aligned rules.
 const MAX_PATH_RECTS: usize = 256;
 
-/// Page-local limits keep a branching Form graph from multiplying a small
-/// resource set into unbounded work or output.
-const MAX_FORM_INVOCATIONS_PER_PAGE: usize = 16_384;
-const MAX_FORM_INPUT_BYTES_PER_PAGE: usize = 64 * 1024 * 1024;
-const MAX_FORM_OUTPUT_BYTES_PER_PAGE: usize = 16 * 1024 * 1024;
-
-#[derive(Clone, Copy)]
-struct FormExecutionLimits {
-    invocations: usize,
-    input_bytes: usize,
-    output_bytes: usize,
-}
-
-const FORM_EXECUTION_LIMITS: FormExecutionLimits = FormExecutionLimits {
-    invocations: MAX_FORM_INVOCATIONS_PER_PAGE,
-    input_bytes: MAX_FORM_INPUT_BYTES_PER_PAGE,
-    output_bytes: MAX_FORM_OUTPUT_BYTES_PER_PAGE,
-};
-
 struct PageExtractCfg {
     limits: FormExecutionLimits,
     keep_text: bool,
-}
-
-struct FormBudget {
-    limits: FormExecutionLimits,
-    invocations: usize,
-    input_bytes: usize,
-    output_bytes: usize,
-}
-
-impl FormBudget {
-    fn new(limits: FormExecutionLimits) -> Self {
-        Self {
-            limits,
-            invocations: 0,
-            input_bytes: 0,
-            output_bytes: 0,
-        }
-    }
-
-    fn output_exhausted(&self) -> bool {
-        self.output_bytes >= self.limits.output_bytes
-    }
-
-    fn output_remaining(&self) -> usize {
-        self.limits.output_bytes.saturating_sub(self.output_bytes)
-    }
-
-    fn charge_output(&mut self, out: Option<&mut String>, added: usize) {
-        let remaining = self.limits.output_bytes.saturating_sub(self.output_bytes);
-        if added <= remaining {
-            self.output_bytes += added;
-            return;
-        }
-
-        if let Some(out) = out {
-            let mut new_len = out.len().saturating_sub(added - remaining);
-            while new_len > 0 && !out.is_char_boundary(new_len) {
-                new_len -= 1;
-            }
-            out.truncate(new_len);
-        }
-        self.output_bytes = self.limits.output_bytes;
-    }
-}
-
-struct ActiveForm {
-    id: ObjectId,
-    /// Bytes below this point belong to the caller and must remain untouched.
-    output_floor: usize,
-}
-
-struct FormExecution {
-    active: Vec<ActiveForm>,
-    budget: FormBudget,
-}
-
-impl FormExecution {
-    fn new(limits: FormExecutionLimits) -> Self {
-        Self {
-            active: Vec::new(),
-            budget: FormBudget::new(limits),
-        }
-    }
-
-    fn output_floor(&self) -> usize {
-        self.active
-            .last()
-            .map(|form| form.output_floor)
-            .unwrap_or(0)
-    }
-
-    fn contains(&self, id: ObjectId) -> bool {
-        self.active.iter().any(|form| form.id == id)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Matrix {
-    a: f32,
-    b: f32,
-    c: f32,
-    d: f32,
-    e: f32,
-    f: f32,
-}
-
-impl Matrix {
-    fn identity() -> Self {
-        Self {
-            a: 1.0,
-            b: 0.0,
-            c: 0.0,
-            d: 1.0,
-            e: 0.0,
-            f: 0.0,
-        }
-    }
-
-    /// The six operands `Tm` and `cm` both take, in order.
-    fn from_nums(nums: &[f32]) -> Option<Self> {
-        let [a, b, c, d, e, f, ..] = nums else {
-            return None;
-        };
-        Some(Self {
-            a: *a,
-            b: *b,
-            c: *c,
-            d: *d,
-            e: *e,
-            f: *f,
-        })
-    }
-
-    /// Pre-multiply: `self = other * self` (translate-by-other semantics
-    /// matches how PDF accumulates `Td` and `Tm` against the line matrix).
-    fn translate(&mut self, tx: f32, ty: f32) {
-        self.e += tx * self.a + ty * self.c;
-        self.f += tx * self.b + ty * self.d;
-    }
-
-    /// `self × m`, the order `cm` concatenates onto the current CTM.
-    fn concat(&self, m: Matrix) -> Matrix {
-        Matrix {
-            a: self.a * m.a + self.b * m.c,
-            b: self.a * m.b + self.b * m.d,
-            c: self.c * m.a + self.d * m.c,
-            d: self.c * m.b + self.d * m.d,
-            e: self.e * m.a + self.f * m.c + m.e,
-            f: self.e * m.b + self.f * m.d + m.f,
-        }
-    }
-}
-
-fn text_direction_changed(previous: Matrix, next: Matrix) -> bool {
-    let previous_length = previous.a.hypot(previous.b);
-    let next_length = next.a.hypot(next.b);
-    if previous_length <= f32::EPSILON || next_length <= f32::EPSILON {
-        return false;
-    }
-    let dot = previous.a * next.a + previous.b * next.b;
-    dot < previous_length * next_length * 0.99
 }
 
 /// Operand stack for a single content-stream operator. PDF operators take at
@@ -341,11 +183,7 @@ impl PageBuilder {
     }
 
     fn apply(&self, x: f32, y: f32) -> (f32, f32) {
-        let m = self.ctm;
-        if m.a == 1.0 && m.b == 0.0 && m.c == 0.0 && m.d == 1.0 && m.e == 0.0 && m.f == 0.0 {
-            return (x, y);
-        }
-        (m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f)
+        self.ctm.apply(x, y)
     }
 
     fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
@@ -478,7 +316,7 @@ fn extract_content_into<'fonts>(
     let mut ops: Operands<'_> = Operands::default();
 
     loop {
-        if !form_execution.active.is_empty() && form_execution.budget.output_exhausted() {
+        if form_execution.is_nested() && form_execution.output_exhausted() {
             break;
         }
         match parser.next_token() {
@@ -510,13 +348,13 @@ fn extract_content_into<'fonts>(
                 } else if op == b"EMC" {
                     page.mcid = page.mcid_stack.pop().flatten();
                 }
-                let charge_output = !form_execution.active.is_empty();
+                let charge_output = form_execution.is_nested();
                 let output_start = if page.keep_text {
                     page.out.len()
                 } else {
                     page.emitted
                 };
-                let charged_start = form_execution.budget.output_bytes;
+                let charged_start = form_execution.charged();
                 dispatch(
                     op,
                     &ops,
@@ -532,17 +370,12 @@ fn extract_content_into<'fonts>(
                     } else {
                         page.emitted.saturating_sub(output_start)
                     };
-                    let nested_charge = form_execution
-                        .budget
-                        .output_bytes
-                        .saturating_sub(charged_start);
+                    let nested_charge = form_execution.charged().saturating_sub(charged_start);
                     let extra = added.saturating_sub(nested_charge);
                     if page.keep_text {
-                        form_execution
-                            .budget
-                            .charge_output(Some(&mut page.out), extra);
+                        form_execution.charge_output(Some(&mut page.out), extra);
                     } else {
-                        form_execution.budget.charge_output(None, extra);
+                        form_execution.charge_output(None, extra);
                     }
                 }
                 if op == b"BI" {
@@ -625,8 +458,7 @@ impl TextState<'_> {
     }
 
     fn set_line_matrix(&mut self, m: Matrix) {
-        self.hx = m.a.hypot(m.b);
-        self.vx = m.c.hypot(m.d);
+        (self.hx, self.vx) = m.basis_lengths();
         self.text_matrix = Some(m);
         self.line_matrix = Some(m);
     }
@@ -834,7 +666,7 @@ fn emit_image_marker(
     if page.keep_text {
         let out = &mut page.out;
         let output_floor = form_execution.output_floor().min(out.len());
-        if !form_execution.active.is_empty() {
+        if form_execution.is_nested() {
             let (removable_breaks, missing_breaks) =
                 trailing_break_adjustment(out, 2, output_floor);
             let Some(final_len) = out
@@ -846,7 +678,7 @@ fn emit_image_marker(
                 return false;
             };
             let added = final_len.saturating_sub(out.len());
-            if added > form_execution.budget.output_remaining() {
+            if added > form_execution.output_remaining() {
                 return false;
             }
         }
@@ -856,9 +688,7 @@ fn emit_image_marker(
         out.push_str(filename);
         out.push(IMAGE_MARK);
         out.push_str("\n\n");
-    } else if !form_execution.active.is_empty()
-        && marker_len > form_execution.budget.output_remaining()
-    {
+    } else if form_execution.is_nested() && marker_len > form_execution.output_remaining() {
         return false;
     }
     page.emitted += marker_len;
@@ -890,35 +720,15 @@ fn emit_form<'fonts>(
     form_execution: &mut FormExecution,
     page: &mut PageBuilder,
 ) -> bool {
-    if form_execution.active.len() >= MAX_FORM_DEPTH
-        || form_execution.contains(id)
-        || form_execution.budget.invocations >= form_execution.budget.limits.invocations
-        || form_execution.budget.output_exhausted()
-    {
-        return false;
-    }
     let Some(form) = form_context.forms.get(&id) else {
         return false;
     };
-    if form.content.len()
-        > form_execution
-            .budget
-            .limits
-            .input_bytes
-            .saturating_sub(form_execution.budget.input_bytes)
-    {
-        return false;
-    }
-
     let start = page.out.len();
     let emitted_start = page.emitted;
-    form_execution.budget.invocations += 1;
-    form_execution.budget.input_bytes += form.content.len();
+    if !form_execution.try_enter(id, form.content.len(), start) {
+        return false;
+    }
     let mut state = TextState::inherited_for_form(caller_state);
-    form_execution.active.push(ActiveForm {
-        id,
-        output_floor: start,
-    });
     if let (Some(fonts), Some(xobjects)) = (form_context.fonts.get(&id), form.xobject_refs.as_ref())
     {
         let resources = ContentResources { fonts, xobjects };
@@ -940,7 +750,7 @@ fn emit_form<'fonts>(
             page,
         );
     }
-    form_execution.active.pop();
+    form_execution.leave();
     if page.keep_text {
         page.out
             .get(start..)
@@ -1521,10 +1331,7 @@ ET
             input_bytes: usize::MAX,
             output_bytes: complete.len() - 1,
         });
-        form_execution.active.push(ActiveForm {
-            id: form_id,
-            output_floor: 0,
-        });
+        assert!(form_execution.try_enter(form_id, 0, 0));
         let mut page = PageBuilder::new(0);
         extract_content_into(
             b"/Im Do",
