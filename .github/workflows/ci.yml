@@ -1,5 +1,13 @@
 name: CI
 
+# Two things make this workflow unusual, both because `[dependencies]` is
+# empty. There is nothing to cache: `Swatinem/rust-cache` spends longer
+# restoring and saving a tarball than a cold build of this crate takes
+# (clippy ~2s, `test --all-targets` ~5s, the cdylib ~4s), so every job
+# builds from scratch. And there is no toolchain action: GitHub's runner
+# images ship rustup with a stable toolchain, cargo, clippy, and rustfmt
+# already, so installing a second one only buys a download.
+
 on:
   push:
     branches: [main]
@@ -17,35 +25,27 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Nothing here is rebuilt twice, so incremental state is pure overhead.
+  CARGO_INCREMENTAL: "0"
+  # Full debug info is ~2.5s of compile and 220MB of `target/` that CI
+  # never reads; line tables still give backtraces their line numbers.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  fmt:
-    name: fmt
+  # fmt and clippy are seconds of work each; a second runner for them
+  # would cost more in startup than it saves.
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: components
+        run: rustup component add rustfmt clippy
       - run: cargo fmt --all --check
-
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: clippy
       - run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
@@ -62,11 +62,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-${{ runner.os }}
-          save-if: ${{ runner.os == 'Linux' || github.ref == 'refs/heads/main' }}
       - run: cargo test --locked --all-targets
 
   python:
@@ -79,24 +74,30 @@ jobs:
         # Floor and current: the bindings are ctypes, so nothing is compiled
         # against a Python ABI and these two bracket the supported range.
         python: ["3.9", "3.13"]
+    env:
+      # These tests only need a cdylib that loads and answers correctly.
+      # LTO and one codegen unit buy runtime speed nothing here measures,
+      # at ~5x the build time.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: python
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: cargo build --release --locked
+      # --lib is the cdylib and nothing else; the CLI binary and the
+      # dev harnesses in src/bin are already covered by the test job.
+      - run: cargo build --release --locked --lib
       - name: unit tests against the freshly built cdylib
-        run: python -m unittest discover -s python/tests -v
+        run: python -m unittest discover -s python/tests
       - name: build and install the wheel
+        # Without this, setup.py shells out to its own `cargo build
+        # --release` and pays for the whole crate a second time.
+        env:
+          PDFMD_LIBRARY: ${{ github.workspace }}/target/release/libpdfmd.so
         run: |
-          python -m pip install --upgrade pip
           python -m pip wheel ./python --no-deps -w dist
           python -m pip install --no-index --find-links dist pdfmd
       - name: the installed package finds its own library
