@@ -3,8 +3,9 @@
 //! Covers what the text extractor needs and nothing more: classic xref
 //! tables, xref streams, object streams (PDF 1.5+), the `FlateDecode`
 //! filter (with optional PNG predictor), and an in-memory cache keyed by
-//! object id. Encryption and incremental updates beyond a single `/Prev`
-//! chain are out of scope.
+//! object id. Damaged files fall back to a full-file object scan
+//! (`repair`). Encryption is out of scope and reported as
+//! `PdfError::Encrypted`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -15,6 +16,7 @@ mod object;
 mod object_stream;
 mod page_tree;
 mod parser;
+mod repair;
 pub(crate) mod syntax;
 #[cfg(test)]
 pub(crate) mod test_pdf;
@@ -27,6 +29,7 @@ use filter::decode_filters;
 use object_stream::{object_stream_candidates, parse_object_stream, ObjectStreamEntry};
 use page_tree::collect_pages;
 use parser::Parser;
+use repair::scan_xref;
 use xref::{find_startxref, read_xref_chain, XrefEntry};
 
 // ---- Errors ----------------------------------------------------------------
@@ -38,6 +41,7 @@ pub enum PdfError {
     BadObject(String),
     BadFilter(String),
     Deflate(String),
+    Encrypted,
 }
 
 impl fmt::Display for PdfError {
@@ -48,6 +52,7 @@ impl fmt::Display for PdfError {
             PdfError::BadObject(m) => write!(f, "object: {m}"),
             PdfError::BadFilter(m) => write!(f, "filter: {m}"),
             PdfError::Deflate(m) => write!(f, "deflate: {m}"),
+            PdfError::Encrypted => f.write_str("encrypted PDFs are not supported"),
         }
     }
 }
@@ -67,18 +72,56 @@ impl<'a> Document<'a> {
     /// object. Returns a self-contained `Document` that can be shared by
     /// reference across threads.
     pub fn load(bytes: &'a [u8]) -> Result<Self, PdfError> {
-        if !bytes.starts_with(b"%PDF-") {
-            return Err(PdfError::NotPdf);
+        // Readers accept junk before the header; xref offsets then count
+        // from the `%`.
+        let header = find_header(bytes);
+        let body = header.map_or(bytes, |at| &bytes[at..]);
+        let first_err = match header {
+            None => PdfError::NotPdf,
+            Some(_) => match find_startxref(body).and_then(|at| read_xref_chain(body, at)) {
+                Ok((xref, trailer)) => match Self::from_xref(body, &xref, trailer, false) {
+                    Ok(doc) if !doc.pages.is_empty() => return Ok(doc),
+                    Err(PdfError::Encrypted) => return Err(PdfError::Encrypted),
+                    Ok(doc) => return Ok(Self::recover(bytes).unwrap_or(doc)),
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            },
+        };
+        match Self::recover(bytes) {
+            Ok(doc) => Ok(doc),
+            Err(PdfError::Encrypted) => Err(PdfError::Encrypted),
+            Err(_) => Err(first_err),
         }
-        let startxref = find_startxref(bytes)?;
-        let (xref, trailer) = read_xref_chain(bytes, startxref)?;
+    }
+
+    /// Rebuild the object map from a full scan. Only succeeds when the
+    /// scan reaches at least one page.
+    fn recover(bytes: &'a [u8]) -> Result<Self, PdfError> {
+        let (xref, trailer) = scan_xref(bytes);
+        let doc = Self::from_xref(bytes, &xref, trailer, true)?;
+        if doc.pages.is_empty() {
+            return Err(PdfError::BadXref("no pages found".into()));
+        }
+        Ok(doc)
+    }
+
+    fn from_xref(
+        bytes: &'a [u8],
+        xref: &std::collections::BTreeMap<ObjectId, XrefEntry>,
+        trailer: Dictionary,
+        scanned: bool,
+    ) -> Result<Self, PdfError> {
+        if trailer.get(b"Encrypt").is_some() {
+            return Err(PdfError::Encrypted);
+        }
 
         // Materialize every uncompressed object first; object streams need
         // the surrounding objects to already exist when we expand them.
         let mut objects: HashMap<ObjectId, Object> = HashMap::with_capacity(xref.len());
         let mut compressed: Vec<(ObjectId, u32, u32)> = Vec::new();
         let length_cache = std::cell::RefCell::new(HashMap::new());
-        for (id, entry) in &xref {
+        for (id, entry) in xref {
             match *entry {
                 XrefEntry::Free => {}
                 XrefEntry::Uncompressed { offset } => {
@@ -86,7 +129,7 @@ impl<'a> Document<'a> {
                         resolve_indirect_length_cached(
                             &mut length_cache.borrow_mut(),
                             bytes,
-                            &xref,
+                            xref,
                             length_id,
                         )
                     };
@@ -116,8 +159,14 @@ impl<'a> Document<'a> {
                     let Some(Object::Stream(s)) = objects.get(&stream_id) else {
                         continue;
                     };
-                    let decoded = decode_filters(s, bytes)?;
-                    let entries = parse_object_stream(&s.dict, &decoded)?;
+                    // A damaged object stream costs its own objects, not
+                    // the document.
+                    let Ok(decoded) = decode_filters(s, bytes) else {
+                        continue;
+                    };
+                    let Ok(entries) = parse_object_stream(&s.dict, &decoded) else {
+                        continue;
+                    };
                     objstm_cache.insert(*stream_obj, CachedObjectStream { decoded, entries });
                     &objstm_cache[stream_obj]
                 }
@@ -149,7 +198,7 @@ impl<'a> Document<'a> {
         // above; reparsing one here could create a self/cyclic dependency and
         // leave those maps inconsistent with their source.
         let mut repaired_streams = Vec::new();
-        for (id, entry) in &xref {
+        for (id, entry) in xref {
             let XrefEntry::Uncompressed { offset } = *entry else {
                 continue;
             };
@@ -183,7 +232,35 @@ impl<'a> Document<'a> {
         }
         objects.extend(repaired_streams);
 
-        let pages = collect_pages(&objects, &trailer)?;
+        // A scan only sees top-level objects; unpack every object stream
+        // it found. Top-level definitions win over packed ones.
+        if scanned {
+            let mut packed = Vec::new();
+            for obj in objects.values() {
+                let Object::Stream(s) = obj else {
+                    continue;
+                };
+                if s.dict.get(b"Type").and_then(Object::as_name) != Some(b"ObjStm") {
+                    continue;
+                }
+                let Ok(decoded) = decode_filters(s, bytes) else {
+                    continue;
+                };
+                let Ok(entries) = parse_object_stream(&s.dict, &decoded) else {
+                    continue;
+                };
+                for entry in entries.iter().flatten() {
+                    if let Ok(obj) = Parser::new(entry.content(&decoded)).parse_object() {
+                        packed.push((ObjectId(entry.number(), 0), obj));
+                    }
+                }
+            }
+            for (id, obj) in packed {
+                objects.entry(id).or_insert(obj);
+            }
+        }
+
+        let pages = collect_pages(&objects, &trailer);
 
         Ok(Document {
             bytes,
@@ -273,6 +350,11 @@ impl<'a> Document<'a> {
 
 // ---- Helpers ---------------------------------------------------------------
 
+fn find_header(bytes: &[u8]) -> Option<usize> {
+    let window = &bytes[..bytes.len().min(1024)];
+    window.windows(5).position(|w| w == b"%PDF-")
+}
+
 fn parse_at(
     bytes: &[u8],
     at: usize,
@@ -331,7 +413,10 @@ fn resolve_materialized_length(objects: &HashMap<ObjectId, Object>, id: ObjectId
 
 #[cfg(test)]
 mod tests {
-    use super::test_pdf::{build_xref_pdf, page, page_tree_objects, XrefStreamPdf, CATALOG, PAGES};
+    use super::test_pdf::{
+        build_xref_pdf, build_xref_pdf_with, find_bytes, page, page_tree_objects, XrefStreamPdf,
+        CATALOG, PAGES,
+    };
     use super::*;
 
     /// Classic-xref PDF whose page draws object 4, defined by `contents`.
@@ -407,6 +492,7 @@ mod tests {
             (PdfError::BadObject("o".into()), "object: o"),
             (PdfError::BadFilter("f".into()), "filter: f"),
             (PdfError::Deflate("d".into()), "deflate: d"),
+            (PdfError::Encrypted, "encrypted PDFs are not supported"),
         ];
         for (err, expected) in cases {
             let s = format!("{err}");
@@ -416,6 +502,69 @@ mod tests {
         }
         // std::error::Error trait should be implemented.
         let _: Box<dyn std::error::Error> = Box::new(PdfError::NotPdf);
+    }
+
+    fn recovered_pages(bytes: &[u8]) -> usize {
+        Document::load(bytes).unwrap().pages().len()
+    }
+
+    #[test]
+    fn load_tolerates_junk_before_the_header() {
+        let mut bytes = b"junk\n\n".to_vec();
+        bytes.extend(classic_pdf(
+            "4 0 obj<</Length 0>>stream\n\nendstream endobj\n",
+        ));
+        assert_eq!(recovered_pages(&bytes), 1);
+    }
+
+    #[test]
+    fn load_rebuilds_a_missing_or_broken_xref() {
+        let body = format!("%PDF-1.4\n{}", page_tree_objects(""));
+        // No xref at all.
+        assert_eq!(recovered_pages(body.as_bytes()), 1);
+        // No header either.
+        assert_eq!(recovered_pages(page_tree_objects("").as_bytes()), 1);
+        // `startxref` points into the middle of an object.
+        let bad = format!("{body}trailer<</Root 1 0 R>>\nstartxref\n12\n%%EOF");
+        assert_eq!(recovered_pages(bad.as_bytes()), 1);
+        // Every xref offset is stale because bytes were inserted up front.
+        let good = build_xref_pdf(body.as_bytes());
+        let shifted = [b"%PDF-1.4\n%padding\n".as_slice(), &good[9..]].concat();
+        assert_eq!(recovered_pages(&shifted), 1);
+    }
+
+    #[test]
+    fn load_keeps_a_pageless_document_when_the_scan_finds_nothing_better() {
+        let body = "%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n";
+        let bytes = build_xref_pdf(body.as_bytes());
+        assert!(Document::load(&bytes).unwrap().pages().is_empty());
+    }
+
+    #[test]
+    fn load_reports_encryption() {
+        let body = format!("%PDF-1.4\n{}", page_tree_objects(""));
+        let chained = build_xref_pdf_with(
+            body.as_bytes(),
+            &[],
+            "<</Size {size}/Root 1 0 R/Encrypt<</Filter/Standard>>>>",
+        );
+        let scanned = format!("{body}trailer<</Root 1 0 R/Encrypt 9 0 R>>");
+        for bytes in [chained, scanned.into_bytes()] {
+            assert!(matches!(Document::load(&bytes), Err(PdfError::Encrypted)));
+        }
+    }
+
+    #[test]
+    fn load_unpacks_object_streams_found_by_the_scan() {
+        let mut pdf = XrefStreamPdf::new();
+        pdf.obj(1, CATALOG)
+            .obj(2, PAGES)
+            .objstm(5, &[(3, &page(""))])
+            .compressed(3, 5, 0);
+        let bytes = pdf.finish(6);
+        let xref_at = find_bytes(&bytes, b"startxref").unwrap();
+        let broken = [&bytes[..xref_at], b"startxref\n1\n%%EOF"].concat();
+        assert_eq!(recovered_pages(&broken), 1);
     }
 
     #[test]
@@ -550,9 +699,9 @@ mod tests {
     }
 
     #[test]
-    fn document_load_propagates_objstm_errors() {
+    fn document_load_skips_broken_object_streams() {
         // A /FlateDecode objstm whose body is garbage, then one whose header
-        // has a non-numeric object id. Both propagate out of Document::load.
+        // has a non-numeric object id. Each loses only its own objects.
         for (dict, payload) in [
             (
                 "<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length 4>>",
@@ -564,7 +713,9 @@ mod tests {
             pdf.page_tree("")
                 .stream(4, dict, payload)
                 .compressed(5, 4, 0);
-            assert!(Document::load(&pdf.finish(6)).is_err(), "{dict}");
+            let bytes = pdf.finish(6);
+            let doc = Document::load(&bytes).unwrap();
+            assert!(doc.get_object(ObjectId(5, 0)).is_none(), "{dict}");
         }
     }
 
