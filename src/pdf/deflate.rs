@@ -35,8 +35,37 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
+/// Decompress a `FlateDecode` payload the way readers in the wild do:
+/// accept a raw DEFLATE body when the zlib header is missing or damaged,
+/// and keep whatever decoded before a corrupt or truncated block.
+pub fn inflate_lenient(input: &[u8]) -> Result<Vec<u8>, PdfError> {
+    let mut out = Vec::new();
+    let err = match zlib_body(input) {
+        Ok(body) => match inflate_into(body, &mut out) {
+            Ok(()) => return Ok(out),
+            Err(e) => e,
+        },
+        Err(header_err) => match inflate_into(input, &mut out) {
+            Ok(()) => return Ok(out),
+            Err(_) => header_err,
+        },
+    };
+    if out.is_empty() {
+        Err(err)
+    } else {
+        Ok(out)
+    }
+}
+
 /// Decompress a zlib-wrapped DEFLATE payload.
-pub fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>, PdfError> {
+#[cfg(test)]
+fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>, PdfError> {
+    inflate_raw(zlib_body(input)?)
+}
+
+/// Validate the zlib header and return the DEFLATE body between it and
+/// the adler-32 trailer.
+fn zlib_body(input: &[u8]) -> Result<&[u8], PdfError> {
     if input.len() < 2 {
         return Err(PdfError::Deflate("zlib stream truncated".into()));
     }
@@ -62,32 +91,38 @@ pub fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>, PdfError> {
     }
     // Last 4 bytes are an adler-32 checksum we ignore.
     let end = input.len().saturating_sub(4).max(start);
-    inflate_raw(&input[start..end])
+    Ok(&input[start..end])
 }
 
 /// Decompress a raw DEFLATE stream (no zlib wrapper).
-pub fn inflate_raw(input: &[u8]) -> Result<Vec<u8>, PdfError> {
+#[cfg(test)]
+fn inflate_raw(input: &[u8]) -> Result<Vec<u8>, PdfError> {
+    let mut out = Vec::new();
+    inflate_into(input, &mut out)?;
+    Ok(out)
+}
+
+/// Inflate into `out`. On error `out` holds every byte decoded so far.
+fn inflate_into(input: &[u8], out: &mut Vec<u8>) -> Result<(), PdfError> {
     let mut reader = BitReader::new(input);
     // Generous initial guess: most PDF streams expand 2-4x.
-    let initial_capacity = input.len().saturating_mul(4).min(MAX_INFLATE_OUTPUT);
-    let mut out = Vec::with_capacity(initial_capacity);
+    out.reserve(input.len().saturating_mul(4).min(MAX_INFLATE_OUTPUT));
     loop {
         let bfinal = reader.read(1);
         let btype = reader.read(2);
         match btype {
-            0 => decode_stored(&mut reader, &mut out)?,
-            1 => decode_huffman(&mut reader, &mut out, fixed_ll_table(), fixed_dist_table())?,
+            0 => decode_stored(&mut reader, out)?,
+            1 => decode_huffman(&mut reader, out, fixed_ll_table(), fixed_dist_table())?,
             2 => {
                 let (ll, dist) = read_dynamic_tables(&mut reader)?;
-                decode_huffman(&mut reader, &mut out, &ll, &dist)?;
+                decode_huffman(&mut reader, out, &ll, &dist)?;
             }
             _ => return Err(PdfError::Deflate("reserved DEFLATE block type".into())),
         }
         if bfinal == 1 {
-            break;
+            return Ok(());
         }
     }
-    Ok(out)
 }
 
 fn decode_stored(reader: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), PdfError> {
@@ -326,7 +361,10 @@ impl HuffmanTable {
         // `mask + 1` is the table length, so this index is in bounds.
         let entry = unsafe { *self.entries.get_unchecked(bits as usize) };
         let len = entry & 0x1F;
-        if len == 0 {
+        // `fill` leaves every remaining bit buffered, so a code longer than
+        // the buffer runs past EOF. Stops truncated streams from decoding
+        // zero padding until the output cap.
+        if len == 0 || len > reader.buf_bits {
             return Err(PdfError::Deflate("invalid Huffman code".into()));
         }
         reader.consume(len);
@@ -486,6 +524,42 @@ mod tests {
         ];
         let out = inflate_raw(&raw).unwrap();
         assert_eq!(out, b"ABCDE");
+    }
+
+    #[test]
+    fn lenient_inflate_accepts_raw_deflate_without_zlib_header() {
+        let raw = [0x01, 0x05, 0x00, 0xFA, 0xFF, b'A', b'B', b'C', b'D', b'E'];
+        assert_eq!(inflate_lenient(&raw).unwrap(), b"ABCDE");
+    }
+
+    #[test]
+    fn lenient_inflate_keeps_prefix_of_truncated_stream() {
+        // Stored "AB", then a stored block that ends after "CD" of nine bytes.
+        let mut z = vec![0x78, 0x9C];
+        z.extend_from_slice(&[0x00, 0x02, 0x00, 0xFD, 0xFF, b'A', b'B']);
+        z.extend_from_slice(&[0x01, 0x09, 0x00, 0xF6, 0xFF, b'C', b'D']);
+        z.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(inflate_lenient(&z).unwrap(), b"ABCD");
+    }
+
+    #[test]
+    fn lenient_inflate_reports_errors_when_nothing_decodes() {
+        assert!(inflate_lenient(&[0x79, 0x9C, 0x07]).is_err());
+        assert!(inflate_lenient(&[0x78, 0x9C, 0x07, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn truncated_huffman_stream_stops_at_eof() {
+        // Fixed-Huffman "Hello, world!" with the end-of-block code cut off.
+        let z = [
+            0x78, 0x9C, 0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xD7, 0x51, 0x28, 0xCF, 0x2F, 0xCA, 0x49,
+            0x51, 0x04, 0x00, 0x1F, 0x9E, 0x04, 0x6A,
+        ];
+        let body = &z[2..14];
+        assert!(inflate_raw(body).is_err());
+        let partial = inflate_lenient(body).unwrap();
+        assert!(b"Hello, world!".starts_with(&partial));
+        assert!(!partial.is_empty());
     }
 
     #[test]

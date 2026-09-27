@@ -42,7 +42,7 @@ fn collect_parms(dict: &Dictionary) -> Vec<Dictionary> {
 fn apply_filter(name: &[u8], data: &[u8], parms: &Dictionary) -> Result<Vec<u8>, PdfError> {
     match name {
         b"FlateDecode" | b"Fl" => {
-            let inflated = deflate::inflate_zlib(data)?;
+            let inflated = deflate::inflate_lenient(data)?;
             // Skipping the predictor keeps the inflated buffer, avoiding a copy.
             if predictor_enabled(parms) {
                 apply_predictor(&inflated, parms)
@@ -52,6 +52,7 @@ fn apply_filter(name: &[u8], data: &[u8], parms: &Dictionary) -> Result<Vec<u8>,
         }
         b"ASCIIHexDecode" | b"AHx" => Ok(decode_hex(data)),
         b"ASCII85Decode" | b"A85" => Ok(decode_ascii85(data)),
+        b"RunLengthDecode" | b"RL" => Ok(decode_run_length(data)),
         // Pass-through filters: the consumer reads `Stream::content`
         // directly, but if a caller invokes the chain we just hand the
         // bytes back unchanged.
@@ -69,6 +70,30 @@ fn predictor_enabled(parms: &Dictionary) -> bool {
         .and_then(Object::as_integer)
         .unwrap_or(1)
         > 1
+}
+
+/// PackBits: a length byte `n` copies the next `n + 1` bytes (n < 128) or
+/// repeats the next byte `257 - n` times (n > 128); 128 ends the data.
+fn decode_run_length(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    let mut i = 0;
+    while let Some(&n) = data.get(i) {
+        i += 1;
+        match n {
+            0..=127 => {
+                let end = data.len().min(i + n as usize + 1);
+                out.extend_from_slice(&data[i..end]);
+                i = end;
+            }
+            128 => break,
+            _ => {
+                let Some(&b) = data.get(i) else { break };
+                out.resize(out.len() + 257 - n as usize, b);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn decode_ascii85(data: &[u8]) -> Vec<u8> {
@@ -189,6 +214,19 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_length_decodes_literals_repeats_and_eod() {
+        let data = [2, b'a', b'b', b'c', 254, b'x', 128, 0, b'z'];
+        assert_eq!(decode_run_length(&data), b"abcxxx");
+        // Truncated literal run and a repeat missing its byte stop cleanly.
+        assert_eq!(decode_run_length(&[5, b'q']), b"q");
+        assert_eq!(decode_run_length(&[200]), b"");
+        let mut dict = Dictionary::new();
+        dict.insert(b"Filter".to_vec(), Object::Name(b"RL".to_vec()));
+        let stream = Stream::owned(dict, vec![0, b'k', 128]);
+        assert_eq!(decode_filters(&stream, &[]).unwrap(), b"k");
+    }
 
     fn params(entries: &[(&[u8], i64)]) -> Dictionary {
         let mut d = Dictionary::new();
