@@ -147,6 +147,11 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
         }
+        // A stray delimiter (`)`, `{`, `}`) is not a token start; consume it
+        // so the caller always makes progress.
+        if self.pos == start {
+            self.pos += 1;
+        }
         Token::Op(&self.bytes[start..self.pos])
     }
 
@@ -601,6 +606,14 @@ mod tests {
         let mut p = Parser::new(b"image-bytes-without-the-end-marker");
         p.skip_inline_image();
         assert_eq!(describe(&p.next_token()), "eof");
+    }
+
+    #[test]
+    fn stray_delimiters_are_consumed_as_ops() {
+        let mut p = Parser::new(b") { } Tj");
+        for want in ["op:)", "op:{", "op:}", "op:Tj", "eof"] {
+            assert_eq!(describe(&p.next_token()), want);
+        }
     }
 
     fn describe(tok: &Token<'_>) -> String {
