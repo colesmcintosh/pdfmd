@@ -46,8 +46,10 @@ pub fn font_style(name: &[u8]) -> (bool, bool, bool) {
         || contains(n, b"black")
         || contains(n, b"heavy")
         || contains(n, b"demibold")
-        || contains(n, b"semibold");
-    let italic = contains(n, b"italic") || contains(n, b"oblique");
+        || contains(n, b"semibold")
+        // URW's Times clone (`NimbusRomNo9L-Medi`) spells bold "Medi".
+        || contains(n, b"medi");
+    let italic = contains(n, b"ital") || contains(n, b"oblique");
     let mono = contains(n, b"courier")
         || contains(n, b"mono")
         || contains(n, b"consolas")
@@ -72,5 +74,7 @@ mod tests {
         assert_eq!(font_style(b"Courier"), (false, false, true));
         assert_eq!(font_style(b"Menlo-BoldItalic"), (true, true, true));
         assert_eq!(font_style(b"Helv"), (false, false, false));
+        assert_eq!(font_style(b"NimbusRomNo9L-Medi"), (true, false, false));
+        assert_eq!(font_style(b"NimbusRomNo9L-ReguItal"), (false, true, false));
     }
 }

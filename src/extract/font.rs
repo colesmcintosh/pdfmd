@@ -28,6 +28,31 @@ pub struct PdfFont {
     /// Indexed by byte; `None` entries are silently skipped (matches the
     /// behaviour of the slow path for unmappable codes).
     simple_table: Option<Box<[Option<Box<str>>; 256]>>,
+    /// Glyph advances, when the font dictionary carries them.
+    metrics: Option<Metrics>,
+}
+
+/// Advance widths in glyph units; `scale` maps them to text space
+/// (1/1000 for everything but Type 3, which uses its `/FontMatrix`).
+#[derive(Debug)]
+struct Metrics {
+    /// Simple fonts: every byte's width, the default already filled in, so
+    /// the per-glyph lookup on the hot path is an index.
+    bytes: Option<Box<[f32; 256]>>,
+    /// Composite fonts: widths by CID; anything absent takes `default`.
+    by_code: HashMap<u32, f32>,
+    default: f32,
+    scale: f32,
+}
+
+/// What showing a string does to the pen, in unscaled text space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Advance {
+    /// Sum of glyph widths, already divided into text-space units.
+    pub width: f32,
+    pub glyphs: usize,
+    /// Single-byte code 32s, which also take word spacing (`Tw`).
+    pub spaces: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +114,60 @@ impl PdfFont {
         if font.kind == FontKind::Simple {
             font.simple_table = Some(font.build_simple_table());
         }
+        font.metrics = match font.kind {
+            FontKind::Simple => simple_metrics(doc, font_dict, subtype == "Type3"),
+            FontKind::Composite => composite_metrics(doc, font_dict),
+        };
 
         font
+    }
+
+    /// A 1-byte font whose every glyph advances `width` thousandths.
+    #[cfg(test)]
+    pub(crate) fn with_uniform_width(width: f32) -> Self {
+        let mut font = PdfFont {
+            code_width: 1,
+            metrics: Some(Metrics {
+                bytes: Some(Box::new([width; 256])),
+                by_code: HashMap::new(),
+                default: width,
+                scale: 0.001,
+            }),
+            ..PdfFont::default()
+        };
+        font.simple_table = Some(font.build_simple_table());
+        font
+    }
+
+    /// Pen advance for `bytes`, or `None` when the font has no widths and
+    /// the caller must estimate.
+    pub fn advance(&self, bytes: &[u8]) -> Option<Advance> {
+        let metrics = self.metrics.as_ref()?;
+        if let Some(table) = metrics.bytes.as_deref() {
+            let total: f32 = bytes.iter().map(|&b| table[b as usize]).sum();
+            return Some(Advance {
+                width: total * metrics.scale,
+                glyphs: bytes.len(),
+                spaces: bytes.iter().filter(|&&b| b == b' ').count(),
+            });
+        }
+        // Composite codes are multi-byte, which word spacing never touches.
+        let mut total = 0.0;
+        let mut glyphs = 0;
+        for chunk in bytes.chunks(self.code_width.max(1)) {
+            let code = chunk.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32);
+            total += metrics
+                .by_code
+                .get(&code)
+                .copied()
+                .unwrap_or(metrics.default);
+            glyphs += 1;
+        }
+        Some(Advance {
+            width: total * metrics.scale,
+            glyphs,
+            spaces: 0,
+        })
     }
 
     /// Append the decoded text for `bytes` to `out`. The common case — a
@@ -162,6 +239,101 @@ impl PdfFont {
     }
 }
 
+fn number(doc: &Document<'_>, obj: &Object) -> Option<f32> {
+    doc.deref(obj).as_real()
+}
+
+fn simple_metrics(
+    doc: &Document<'_>,
+    font_dict: &crate::pdf::Dictionary,
+    type3: bool,
+) -> Option<Metrics> {
+    let widths = doc.deref(font_dict.get(b"Widths")?).as_array()?;
+    let first = font_dict
+        .get(b"FirstChar")
+        .and_then(|o| number(doc, o))
+        .unwrap_or(0.0) as u32;
+    let default = font_dict
+        .get(b"FontDescriptor")
+        .and_then(|d| doc.deref(d).as_dict())
+        .and_then(|d| d.get(b"MissingWidth"))
+        .and_then(|o| number(doc, o))
+        .unwrap_or(0.0);
+    let mut bytes = Box::new([default; 256]);
+    for (i, w) in widths.iter().enumerate() {
+        let code = first as usize + i;
+        if let (Some(slot), Some(w)) = (bytes.get_mut(code), number(doc, w)) {
+            *slot = w;
+        }
+    }
+    let scale = if type3 {
+        font_dict
+            .get(b"FontMatrix")
+            .and_then(|m| doc.deref(m).as_array())
+            .and_then(|m| m.first())
+            .and_then(|a| number(doc, a))
+            .unwrap_or(0.001)
+    } else {
+        0.001
+    };
+    Some(Metrics {
+        bytes: Some(bytes),
+        by_code: HashMap::new(),
+        default,
+        scale,
+    })
+}
+
+/// `/DW` plus the `/W` array of the descendant CIDFont. Codes are taken as
+/// CIDs, which holds for the Identity encodings nearly every producer uses.
+fn composite_metrics(doc: &Document<'_>, font_dict: &crate::pdf::Dictionary) -> Option<Metrics> {
+    let descendant = doc
+        .deref(font_dict.get(b"DescendantFonts")?)
+        .as_array()?
+        .first()
+        .and_then(|d| doc.deref(d).as_dict())?;
+    let default = descendant
+        .get(b"DW")
+        .and_then(|o| number(doc, o))
+        .unwrap_or(1000.0);
+    let mut by_code = HashMap::new();
+    if let Some(w) = descendant.get(b"W").and_then(|w| doc.deref(w).as_array()) {
+        let mut i = 0;
+        while i + 1 < w.len() {
+            let Some(start) = number(doc, &w[i]) else {
+                break;
+            };
+            let start = start as u32;
+            if let Some(list) = doc.deref(&w[i + 1]).as_array() {
+                for (k, width) in list.iter().enumerate() {
+                    if let Some(width) = number(doc, width) {
+                        by_code.insert(start + k as u32, width);
+                    }
+                }
+                i += 2;
+            } else {
+                let (Some(end), Some(width)) = (
+                    number(doc, &w[i + 1]),
+                    w.get(i + 2).and_then(|o| number(doc, o)),
+                ) else {
+                    break;
+                };
+                // Cap pathological ranges; widths past the cap fall back to /DW.
+                for cid in start..=(end as u32).min(start.saturating_add(65_535)) {
+                    by_code.insert(cid, width);
+                }
+                i += 3;
+            }
+        }
+    }
+    Some(Metrics {
+        bytes: None,
+        by_code,
+        default,
+        scale: 0.001,
+    })
+}
+
 /// Resolve a `/Differences` array into a byte → glyph-name map.
 fn parse_differences(arr: &[Object]) -> HashMap<u8, String> {
     let mut out = HashMap::new();
@@ -197,6 +369,80 @@ mod tests {
     use super::*;
     use crate::pdf::test_pdf::{load_minimal_doc_str, zlib_stored};
     use crate::pdf::Dictionary;
+
+    #[test]
+    fn simple_font_advance_uses_widths_and_missing_width() {
+        let doc = load_minimal_doc_str(&[
+            (
+                10,
+                "<< /Type /Font /Subtype /TrueType /FirstChar 65 /Widths [600 0 700] \
+                 /FontDescriptor 11 0 R >>",
+            ),
+            (11, "<< /MissingWidth 250 >>"),
+        ]);
+        let font = PdfFont::from_object(&doc, ObjectId(10, 0));
+        // A (600) + C (700) + space, which has no entry (250).
+        let advance = font.advance(b"AC ").expect("widths");
+        assert!((advance.width - 1.55).abs() < 1e-4, "{advance:?}");
+        assert_eq!((advance.glyphs, advance.spaces), (3, 1));
+    }
+
+    #[test]
+    fn type3_widths_scale_by_font_matrix() {
+        let doc = load_minimal_doc_str(&[(
+            10,
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [0.01 0 0 0.01 0 0] \
+             /FirstChar 97 /Widths [50] >>",
+        )]);
+        let font = PdfFont::from_object(&doc, ObjectId(10, 0));
+        let advance = font.advance(b"a").expect("widths");
+        assert!((advance.width - 0.5).abs() < 1e-4, "{advance:?}");
+    }
+
+    #[test]
+    fn font_without_widths_has_no_advance() {
+        let doc = load_minimal_doc_str(&[(10, "<< /Type /Font /BaseFont /Helvetica >>")]);
+        let font = PdfFont::from_object(&doc, ObjectId(10, 0));
+        assert!(font.advance(b"abc").is_none());
+    }
+
+    #[test]
+    fn composite_font_advance_reads_w_array_and_dw() {
+        let doc = load_minimal_doc_str(&[
+            (
+                10,
+                "<< /Type /Font /Subtype /Type0 /DescendantFonts [11 0 R] >>",
+            ),
+            (11, "<< /DW 400 /W [1 [500 600] 5 7 900 /Junk 3] >>"),
+        ]);
+        let font = PdfFont::from_object(&doc, ObjectId(10, 0));
+        // CIDs 1 (500), 2 (600), 6 (900 from the range), 9 (/DW 400).
+        let advance = font.advance(&[0, 1, 0, 2, 0, 6, 0, 9]).expect("widths");
+        assert!((advance.width - 2.4).abs() < 1e-4, "{advance:?}");
+        assert_eq!((advance.glyphs, advance.spaces), (4, 0));
+    }
+
+    #[test]
+    fn composite_w_range_without_a_width_stops_parsing() {
+        let doc = load_minimal_doc_str(&[
+            (
+                10,
+                "<< /Type /Font /Subtype /Type0 /DescendantFonts [11 0 R] >>",
+            ),
+            (11, "<< /W [1 [500] 5 7] >>"),
+        ]);
+        let font = PdfFont::from_object(&doc, ObjectId(10, 0));
+        // CID 1 keeps its width; the broken range leaves 5 on the 1000 default.
+        let advance = font.advance(&[0, 1, 0, 5]).expect("widths");
+        assert!((advance.width - 1.5).abs() < 1e-4, "{advance:?}");
+    }
+
+    #[test]
+    fn composite_font_without_descendant_has_no_advance() {
+        let doc = load_minimal_doc_str(&[(10, "<< /Type /Font /Subtype /Type0 >>")]);
+        let font = PdfFont::from_object(&doc, ObjectId(10, 0));
+        assert!(font.advance(&[0, 1]).is_none());
+    }
 
     #[test]
     fn missing_font_object_returns_default() {

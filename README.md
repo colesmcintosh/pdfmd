@@ -151,14 +151,20 @@ must be released once with `pdfmd_result_free`.
 
 Conversion walks positioned spans (not a flat text dump) and:
 
+- Measures every span with its font's glyph widths (`/Widths`, `/W`), so
+  word breaks, table cells, and column gutters come from real positions.
 - Reads multi-column pages left-to-right, then top-to-bottom in each column.
-- Emits GFM tables from ruled path grids and from aligned borderless columns.
-- Infers headings from tagged-PDF roles, font size, bold, numbered sections,
-  and names such as `Abstract` / `Introduction`.
+  Full-width tables, captions, and title blocks between columns are read
+  whole, in place.
+- Emits GFM tables from ruled path grids and from aligned borderless columns,
+  including rows with empty cells and labels centred across a group of rows.
+- Infers headings from tagged-PDF roles, font size, bold, numbered sections
+  (`3.1`, `A.1`), and names such as `Abstract` / `Introduction`.
 - Keeps bullet and ordered lists, bold/italic from the font name, and
   monospace runs as fenced code blocks.
-- Strips repeating running headers and footers, and joins hyphenated
-  line breaks.
+- Strips repeating running headers and footers, joins hyphenated line
+  breaks, and moves rotated margin text (an arXiv stamp) to the end of its
+  page.
 
 The first paragraph is promoted to `#` in `promote_document_title`.
 

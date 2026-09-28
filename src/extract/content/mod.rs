@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::pdf::Object;
 use crate::pdf::{Dictionary, ObjectId};
 
-use super::font::PdfFont;
+use super::font::{Advance, PdfFont};
 #[cfg(test)]
 use super::image::PageImages;
 use super::layout::{font_style, PageLayout, PathRect, Span, SpanKind};
@@ -410,6 +410,15 @@ struct TextState<'a> {
     font: Option<&'a PdfFont>,
     font_size: f32,
     leading: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    /// `Tz` as a fraction; 0.0 means unset (100%).
+    horizontal_scaling: f32,
+    /// Where the last show left the pen, when the font's real widths put
+    /// it there. It outlives `ET` so a word split across text objects
+    /// (an underlined word, a font change) is still measured. Estimated
+    /// pens only locate spans, never word gaps.
+    pen_end_x: Option<f32>,
     last_y: Option<f32>,
     last_x: Option<f32>,
     pending_space: bool,
@@ -432,6 +441,9 @@ impl TextState<'_> {
             font: caller.font,
             font_size: caller.font_size,
             leading: caller.leading,
+            char_spacing: caller.char_spacing,
+            word_spacing: caller.word_spacing,
+            horizontal_scaling: caller.horizontal_scaling,
             bold: caller.bold,
             italic: caller.italic,
             mono: caller.mono,
@@ -454,6 +466,22 @@ impl TextState<'_> {
             self.vx
         } else {
             1.0
+        }
+    }
+
+    fn tz(&self) -> f32 {
+        if self.horizontal_scaling > 0.0 {
+            self.horizontal_scaling
+        } else {
+            1.0
+        }
+    }
+
+    /// Move the pen along the baseline by `tx` unscaled text-space units.
+    fn advance_pen(&mut self, tx: f32) {
+        let tx = tx * self.tz();
+        if let Some(m) = self.text_matrix.as_mut() {
+            m.translate(tx, 0.0);
         }
     }
 
@@ -500,14 +528,30 @@ fn dispatch<'fonts>(
                 state.leading = *v;
             }
         }
+        b"Tc" => {
+            if let [v, ..] = ops.nums() {
+                state.char_spacing = *v;
+            }
+        }
+        b"Tw" => {
+            if let [v, ..] = ops.nums() {
+                state.word_spacing = *v;
+            }
+        }
+        b"Tz" => {
+            if let [v, ..] = ops.nums() {
+                state.horizontal_scaling = *v / 100.0;
+            }
+        }
         b"Tm" => {
             if let Some(m) = Matrix::from_nums(ops.nums()) {
                 let direction_changed = state
                     .line_matrix
                     .map(|previous| text_direction_changed(previous, m))
                     .unwrap_or(false);
+                let pen_x = state.pen_end_x;
                 state.set_line_matrix(m);
-                position_changed(state, m.e, m.f, form_execution.output_floor(), page);
+                position_changed(state, m.e, m.f, pen_x, form_execution.output_floor(), page);
                 if direction_changed {
                     state.pending_space = true;
                 }
@@ -562,6 +606,11 @@ fn dispatch<'fonts>(
                         if *v <= -TJ_SPACE_THRESHOLD {
                             state.pending_space = true;
                         }
+                        let size = state.font_size;
+                        state.advance_pen(-*v / 1000.0 * size);
+                        if state.pen_end_x.is_some() {
+                            state.pen_end_x = state.text_matrix.map(|m| m.e);
+                        }
                     }
                 }
             }
@@ -612,8 +661,9 @@ fn translate_line(
         return;
     };
     line.translate(tx, ty);
+    let pen_x = state.pen_end_x;
     state.set_line_matrix(line);
-    position_changed(state, line.e, line.f, output_floor, page);
+    position_changed(state, line.e, line.f, pen_x, output_floor, page);
 }
 
 /// Recover a word break at the seam between the caller's output and the text
@@ -763,6 +813,23 @@ fn emit_form<'fonts>(
 
 fn emit(state: &mut TextState<'_>, bytes: &[u8], page: &mut PageBuilder) {
     let Some(font) = state.font else { return };
+    let pen = state.text_matrix;
+    let measured = font.advance(bytes);
+    // Fonts without widths keep the old half-em-per-glyph estimate.
+    let advance = measured.unwrap_or(Advance {
+        width: bytes.len() as f32 * 0.5,
+        glyphs: bytes.len(),
+        spaces: 0,
+    });
+    state.advance_pen(
+        advance.width * state.font_size
+            + advance.glyphs as f32 * state.char_spacing
+            + advance.spaces as f32 * state.word_spacing,
+    );
+    state.pen_end_x = state
+        .text_matrix
+        .filter(|_| measured.is_some())
+        .map(|m| m.e);
 
     page.scratch.clear();
     font.decode_into(bytes, &mut page.scratch);
@@ -816,10 +883,23 @@ fn emit(state: &mut TextState<'_>, bytes: &[u8], page: &mut PageBuilder) {
     let hx = state.hscale();
     let vx = state.vscale();
     let font_size = (state.font_size.abs() * vx).max(0.1);
-    let raw_x = state.last_x.unwrap_or(0.0);
-    let raw_y = state.last_y.unwrap_or(0.0);
-    let (x, y) = page.apply(raw_x, raw_y);
-    let extra_w = page.scratch.len() as f32 * font_size * 0.5 * hx.max(0.1);
+    let (x, y, extra_w) = match (pen, state.text_matrix) {
+        (Some(start), Some(end)) => {
+            let (x0, y0) = page.apply(start.e, start.f);
+            let (x1, _) = page.apply(end.e, end.f);
+            (x0, y0, (x1 - x0).max(0.0))
+        }
+        _ => {
+            let raw_x = state.last_x.unwrap_or(0.0);
+            let raw_y = state.last_y.unwrap_or(0.0);
+            let (x, y) = page.apply(raw_x, raw_y);
+            (
+                x,
+                y,
+                page.scratch.len() as f32 * font_size * 0.5 * hx.max(0.1),
+            )
+        }
+    };
     let space = added_space || form_space;
     if merge_span(page, x, y, font_size, extra_w, space, state) {
         return;
@@ -862,8 +942,9 @@ fn merge_span(
     {
         return false;
     }
-    // Same paint origin (TJ pieces) or a tight continuation on this line.
-    let close = (x - last.x).abs() < 1.0 || x <= last.x + last.width + font_size * 0.35;
+    // Same paint origin, or a continuation on this line. Loose justified
+    // word gaps reach ~0.5 em; tight table gutters run from ~0.7 em.
+    let close = (x - last.x).abs() < 1.0 || x <= last.x + last.width + font_size * 0.6;
     if !close {
         return false;
     }
@@ -888,6 +969,7 @@ fn position_changed(
     state: &mut TextState<'_>,
     new_x: f32,
     new_y: f32,
+    pen_x: Option<f32>,
     output_floor: usize,
     page: &mut PageBuilder,
 ) {
@@ -934,6 +1016,12 @@ fn position_changed(
                 None => dy,
             };
             state.typical_line_height = Some(new_ema);
+        }
+    } else if let Some(pen_x) = pen_x {
+        // The gap after the last glyph: kerning stays under ~0.1 em, and
+        // even a squeezed justified space is wider than 0.15 em.
+        if new_x - pen_x > (font_size * horizontal_scale).max(1.0) * 0.15 {
+            state.pending_space = true;
         }
     } else if let Some(prev_x) = state.last_x {
         let dx = new_x - prev_x;
@@ -1651,6 +1739,71 @@ ET
         assert!(layout.spans[0].font_size > 10.0);
         assert_eq!(layout.rects.len(), 1);
         assert!((layout.rects[0].w - 30.0).abs() < 0.1);
+    }
+
+    fn measured_layout(content: &[u8]) -> PageLayout {
+        let font = PdfFont::with_uniform_width(500.0);
+        let fonts = font_map(&font);
+        extract_page_layout(
+            content,
+            &fonts,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+        )
+    }
+
+    #[test]
+    fn wide_tj_offset_starts_a_new_span_at_the_pen() {
+        let layout = measured_layout(b"BT /F1 10 Tf 1 0 0 1 50 700 Tm [(ab) -2000 (cd)] TJ ET");
+        assert_eq!(layout.spans.len(), 2, "{:?}", layout.spans);
+        // Two half-em glyphs at 10pt, then a two-em gap.
+        assert!((layout.spans[0].width - 10.0).abs() < 0.01);
+        assert!((layout.spans[1].x - 80.0).abs() < 0.01);
+        assert!(layout.spans[1].space_before);
+    }
+
+    #[test]
+    fn word_sized_tj_offset_stays_in_the_span() {
+        let layout = measured_layout(b"BT /F1 10 Tf 1 0 0 1 50 700 Tm [(ab) -250 (cd)] TJ ET");
+        assert_eq!(layout.spans.len(), 1, "{:?}", layout.spans);
+        assert_eq!(layout.spans[0].text, "ab cd");
+        assert!((layout.spans[0].width - 22.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn char_word_and_horizontal_scaling_widen_the_advance() {
+        let layout = measured_layout(b"BT /F1 10 Tf 2 Tc 3 Tw 50 Tz 1 0 0 1 0 0 Tm (a b) Tj ET");
+        // Glyphs 15 + Tc 3x2 + Tw 3 = 24, at 50% horizontal scaling.
+        assert!(
+            (layout.spans[0].width - 12.0).abs() < 0.01,
+            "{:?}",
+            layout.spans
+        );
+    }
+
+    #[test]
+    fn measured_gap_spans_text_objects() {
+        // TeX closes the text object around an underlined word; the period
+        // after it starts a new one exactly at the pen.
+        let tight = measured_layout(
+            b"BT /F1 10 Tf 1 0 0 1 50 700 Tm (ab) Tj ET BT /F1 10 Tf 1 0 0 1 60 700 Tm (.) Tj ET",
+        );
+        assert_eq!(tight.text, "ab.");
+        let spaced = measured_layout(
+            b"BT /F1 10 Tf 1 0 0 1 50 700 Tm (ab) Tj ET BT /F1 10 Tf 1 0 0 1 63 700 Tm (c) Tj ET",
+        );
+        assert_eq!(spaced.text, "ab c");
+    }
+
+    #[test]
+    fn text_shown_before_any_text_object_is_placed_by_its_last_position() {
+        let layout = measured_layout(b"/F1 10 Tf (ab) Tj");
+        assert_eq!(layout.spans.len(), 1);
+        assert_eq!(layout.spans[0].x, 0.0);
+        assert!((layout.spans[0].width - 10.0).abs() < 0.01);
     }
 
     #[test]

@@ -123,6 +123,10 @@ pub(super) fn is_numbered_heading(line: &str) -> bool {
 fn match_numbered_heading(line: &str) -> Option<Match<'_>> {
     let b = line.as_bytes();
     let mut i = digit_run(b);
+    // Appendix numbering, `A.1`: a capital letter stands in for the digits.
+    if i == 0 && b.len() > 2 && b[0].is_ascii_uppercase() && b[1] == b'.' && b[2].is_ascii_digit() {
+        i = 1;
+    }
     if i == 0 {
         return None;
     }
@@ -134,9 +138,14 @@ fn match_numbered_heading(line: &str) -> Option<Match<'_>> {
     if b.get(i) == Some(&b'.') {
         i += 1;
     }
+    let match_len = after_separator(line, i)?;
+    // `11086.2 10932.4` is a row of figures, not section 11086.2.
+    if b.get(match_len).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
     Some(Match {
         capture: &line[..capture_end],
-        match_len: after_separator(line, i)?,
+        match_len,
     })
 }
 
@@ -195,6 +204,15 @@ mod tests {
     fn match_numbered_heading_requires_digit_prefix() {
         assert!(match_numbered_heading("Intro 1").is_none());
         assert!(match_numbered_heading("1.").is_none());
+    }
+
+    #[test]
+    fn rows_of_figures_are_not_numbered_headings() {
+        assert!(heading_level("11086.2 10932.4 10629.9 7691.9").is_none());
+        assert_eq!(strip_heading_prefix("12.5 13.0"), "12.5 13.0");
+        assert_eq!(heading_level("3.1 Results"), Some(2));
+        assert_eq!(heading_level("A.1 Model Hyperparameters"), Some(2));
+        assert!(match_numbered_heading("A cat sat").is_none());
     }
 
     #[test]
