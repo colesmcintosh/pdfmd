@@ -20,7 +20,8 @@ interpreter, heuristics, argv parser) is implemented in this crate.
 ## Map
 
 ```
-src/pdf/          byte-level PDF reader (xref, objects, filters, deflate)
+src/pdf/          byte-level PDF reader (xref, objects, filters, deflate,
+                  xref repair for damaged files)
 src/extract/      fonts, CMaps, content-stream interpreter, images, layout
 src/heuristics/   columns, tables, headings, lists, emphasis → Markdown
 src/lib.rs        public API + title promotion + image-mark rewrite
@@ -112,7 +113,14 @@ Faster without a crate beats cleaner with a crate.
 - URL inputs are fetched by shelling out to `curl` — no HTTP client
   lives in the crate. Tests that hit URLs skip when `curl` is missing.
 - `LZWDecode` and encrypted PDFs are unsupported by design. Return
-  `PdfError` cleanly; don't add stubs.
+  `PdfError` cleanly (`PdfError::Encrypted` for encryption); don't add
+  stubs.
+- Damaged input degrades, it doesn't fail: `Document::load` falls back
+  to `pdf/repair.rs` (full-file `N G obj` scan) when the xref chain is
+  unusable or yields no pages, a broken object stream costs only its
+  own objects, and `FlateDecode` keeps whatever inflated before
+  corruption. Tokenizers must always advance — a stray `)`/`{`/`}` once
+  hung the content and CMap lexers.
 - Image XObject extraction is pass-through for JPEG / JPEG 2000, plus
   PNG encoding for decoded 8-bit rasters. The content extractor emits
   `\u{0001}filename\u{0001}` sentinels at paint position;

@@ -314,6 +314,7 @@ src/
 │   ├── object_stream.rs  PDF 1.5 object stream unpacking
 │   ├── page_tree.rs      catalog / page tree traversal
 │   ├── parser.rs         byte-level object parser
+│   ├── repair.rs         xref rebuild by full-file scan for damaged files
 │   ├── syntax.rs         shared ISO 32000 whitespace / hex helpers
 │   ├── xref.rs           classic xref tables and xref streams
 │   └── mod.rs            Document facade and object cache
@@ -354,7 +355,10 @@ src/
   encoding nor a `/Differences` array will silently drop glyphs.
 - The heuristic layer targets academic and prose documents. Forms,
   invoices, and other heavily-structured PDFs will not reconstruct well.
-- Encrypted PDFs and `LZWDecode` streams are not supported.
+- Encrypted PDFs (reported as `PdfError::Encrypted`) and `LZWDecode`
+  streams are not supported. Damaged files — broken or missing xref
+  tables, junk before the header, truncated or headerless DEFLATE
+  streams — are repaired on a best-effort basis.
 - The Python wheel is platform-specific and is not published to PyPI;
   build it from a checkout with `pip install ./python`.
 - `python -m pdfmd` covers the same flags as the Rust CLI; a `pdfmd`

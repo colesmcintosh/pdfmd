@@ -11,6 +11,20 @@ pub fn glyph_to_string(name: &str) -> Option<String> {
         return Some(s.to_string());
     }
 
+    // Adobe Glyph List rules: drop a `.suffix` (`a.sc`, `one.oldstyle`)
+    // and read `_` as a ligature of components (`f_f_i`).
+    let base = name.split('.').next().unwrap_or("");
+    if base.len() < name.len() || base.contains('_') {
+        let mut out = String::new();
+        for part in base.split('_') {
+            if part.is_empty() {
+                return None;
+            }
+            out.push_str(&glyph_to_string(part)?);
+        }
+        return Some(out);
+    }
+
     if let Some(rest) = name.strip_prefix("uni") {
         return decode_uni_sequence(rest);
     }
@@ -402,6 +416,18 @@ mod tests {
     #[test]
     fn unknown_glyph_returns_none() {
         assert!(glyph_to_string("definitely_not_a_glyph").is_none());
+        assert!(glyph_to_string("g152").is_none());
+        assert!(glyph_to_string(".notdef").is_none());
+        assert!(glyph_to_string("f__i").is_none());
+    }
+
+    #[test]
+    fn agl_suffixes_and_ligature_components_resolve() {
+        assert_eq!(glyph_to_string("a.sc").as_deref(), Some("a"));
+        assert_eq!(glyph_to_string("one.oldstyle").as_deref(), Some("1"));
+        assert_eq!(glyph_to_string("f_f_i").as_deref(), Some("ffi"));
+        assert_eq!(glyph_to_string("T_h.liga").as_deref(), Some("Th"));
+        assert_eq!(glyph_to_string("uni0041_B").as_deref(), Some("AB"));
     }
 
     #[test]

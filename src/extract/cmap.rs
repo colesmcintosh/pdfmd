@@ -303,6 +303,10 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
                 while i < data.len() && !is_ws_or_delim(data[i]) {
                     i += 1;
                 }
+                // Stray `)`, `{`, `}`: consume so the loop always advances.
+                if i == start {
+                    i += 1;
+                }
                 let word = std::str::from_utf8(&data[start..i])
                     .unwrap_or("")
                     .to_string();
@@ -332,6 +336,12 @@ fn is_relevant_keyword(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenizer_skips_stray_delimiters() {
+        let cmap = parse(b") { } 1 beginbfchar <01> <0041> endbfchar");
+        assert_eq!(cmap.lookup(0x01), Some("A"));
+    }
 
     #[test]
     fn parses_bfchar() {

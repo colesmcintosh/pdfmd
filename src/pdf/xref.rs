@@ -126,11 +126,10 @@ fn read_classic_xref(
         for i in 0..count {
             let row = &bytes[p.pos..p.pos + 20];
             p.pos += 20;
-            // Spec mandates 10 ASCII digits + space + 5 ASCII digits, both
-            // always valid utf-8 — non-utf8 indicates a malformed PDF that
-            // we'd reject elsewhere too.
-            let offset_s = std::str::from_utf8(&row[0..10]).expect("ascii digits");
-            let gen_s = std::str::from_utf8(&row[11..16]).expect("ascii digits");
+            // Spec mandates 10 ASCII digits + space + 5 ASCII digits. A
+            // damaged row parses as offset 0 and fails the object id check.
+            let offset_s = std::str::from_utf8(&row[0..10]).unwrap_or("");
+            let gen_s = std::str::from_utf8(&row[11..16]).unwrap_or("");
             let kind = row[17];
             let n = first + i;
             let g: u16 = gen_s.trim().parse().unwrap_or(0);
@@ -385,9 +384,9 @@ mod tests {
     }
 
     #[test]
-    fn load_errors_on_pdf_with_no_root() {
+    fn load_finds_catalog_when_trailer_has_no_root() {
         let bytes = classic_pdf(&[], "<</Size {size}>>");
-        assert!(Document::load(&bytes).is_err());
+        assert_eq!(Document::load(&bytes).unwrap().pages().len(), 1);
     }
 
     // ---- Xref streams ---------------------------------------------------
