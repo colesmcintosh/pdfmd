@@ -140,6 +140,14 @@ fn promote_document_title(markdown: &mut String) {
     if title.is_empty() || title.contains('\n') {
         return;
     }
+    // A heading carries its own weight; drop emphasis wrapping the whole title.
+    let title = ["***", "**", "*"]
+        .into_iter()
+        .find_map(|w| {
+            let inner = title.strip_prefix(w)?.strip_suffix(w)?;
+            (!inner.contains('*')).then_some(inner)
+        })
+        .unwrap_or(title);
     let replacement = format!("# {title}");
     markdown.replace_range(leading_ws..leading_ws + end, &replacement);
 }

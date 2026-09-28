@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::extract::layout::{PageLayout, Span, SpanKind};
+use crate::extract::layout::{PageLayout, PathRect, Span, SpanKind};
 use crate::extract::structure::{Role, RoleMap};
 use crate::extract::IMAGE_MARK;
 
@@ -16,6 +16,7 @@ use lines::{
     named_section, short_title_case, strip_heading_prefix,
 };
 
+mod columns;
 mod lines;
 mod tables;
 
@@ -108,31 +109,56 @@ fn format_page_layout(
     if spans.is_empty() {
         return String::new();
     }
+    // Text set along the page edge (an arXiv stamp) has no horizontal
+    // extent; left in, it lands on whatever prose line shares its baseline.
+    // A page that is mostly rotated is read as it is.
+    let (rotated, upright): (Vec<&Span>, Vec<&Span>) =
+        spans.iter().copied().partition(|s| is_rotated(s));
+    let margin_notes = if rotated.len() * 2 < spans.len() {
+        spans = upright;
+        rotated
+    } else {
+        Vec::new()
+    };
 
-    let gaps = column_gaps(&spans);
-    let cols: Vec<usize> = spans
-        .iter()
-        .map(|s| gaps.iter().take_while(|&&g| s.x >= g).count())
-        .collect();
-    let n_cols = cols.iter().copied().max().unwrap_or(0) + 1;
     let median = median_size(&spans);
+    let (gaps, bands) = columns::page_bands(&spans);
 
     let mut parts = Vec::new();
-    for col in 0..n_cols {
-        let col_spans: Vec<&Span> = spans
-            .iter()
-            .zip(cols.iter())
-            .filter_map(|(s, c)| (*c == col).then_some(*s))
-            .collect();
-        if col_spans.is_empty() {
-            continue;
-        }
-        let md = format_column(&col_spans, &page.rects, page_idx, roles, median);
-        if !md.is_empty() {
-            parts.push(md);
+    for (i, band) in bands.iter().enumerate() {
+        // Only a banded page clips rects, so a single-band page keeps every rule.
+        let rects: Vec<PathRect> = if bands.len() == 1 {
+            page.rects.clone()
+        } else {
+            let top = if i == 0 {
+                f32::MAX
+            } else {
+                bands[i - 1].bottom
+            };
+            let bottom = bands.get(i + 1).map_or(f32::MIN, |b| b.top);
+            let (top, bottom) = ((top + band.top) / 2.0, (bottom + band.bottom) / 2.0);
+            page.rects
+                .iter()
+                .copied()
+                .filter(|r| r.y < top && r.y + r.h > bottom)
+                .collect()
+        };
+        let band_gaps: &[f32] = if band.split { &gaps } else { &[] };
+        for col_spans in columns::split_columns(&band.spans, band_gaps) {
+            let md = format_column(&col_spans, &rects, page_idx, roles, median);
+            if !md.is_empty() {
+                parts.push(md);
+            }
         }
     }
+    let notes: Vec<&str> = margin_notes.iter().map(|s| s.text.trim()).collect();
+    parts.push(escape_leading_hash(notes.join(" ")));
     join_blocks(parts)
+}
+
+/// Text whose pen moved along y rather than x: several glyphs, no width.
+fn is_rotated(s: &Span) -> bool {
+    s.kind == SpanKind::Text && s.width < s.font_size * 0.25 && s.text.trim().chars().count() >= 2
 }
 
 /// Join markdown blocks with a blank line between them, dropping empties.
@@ -197,7 +223,7 @@ fn format_column_text(spans: &[&Span], page_idx: usize, roles: &RoleMap, median:
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if let Some((n, table)) = tables::borderless_run(&lines[i..]) {
+        if let Some((n, table)) = tables::table_at(&lines, i) {
             out.push(table);
             i += n;
             continue;
@@ -214,7 +240,19 @@ fn format_column_text(spans: &[&Span], page_idx: usize, roles: &RoleMap, median:
             if dy > size * 1.5 {
                 break;
             }
-            if tables::is_table_prefix(&lines[i..]) {
+            // A heading set larger than the text under it is its own block.
+            let (above, here) = (text_size(&lines[i - 1]), text_size(&lines[i]));
+            if above > here * 1.15 || here > above * 1.15 {
+                break;
+            }
+            if is_bold_line(&lines[i - 1]) && !is_bold_line(&lines[i]) {
+                break;
+            }
+            // A quoted Markdown heading line stays on its own.
+            if opens_with_hash(&lines[i - 1]) || opens_with_hash(&lines[i]) {
+                break;
+            }
+            if tables::table_at(&lines, i).is_some() {
                 break;
             }
             i += 1;
@@ -256,9 +294,44 @@ fn format_line_block(lines: &[VLine<'_>], page_idx: usize, roles: &RoleMap, medi
         if let Some(level) = heading_for_line(&lines[0], &line, page_idx, roles, median) {
             return format!("{} {}", "#".repeat(level), strip_heading_prefix(&line));
         }
-        return style_line(&lines[0]);
+        return escape_leading_hash(style_line(&lines[0]));
     }
-    join_paragraph(lines)
+    escape_leading_hash(join_paragraph(lines))
+}
+
+/// Body text that happens to open with `#` (`# of calls`, a quoted
+/// Markdown prompt) must not render as a heading.
+fn escape_leading_hash(text: String) -> String {
+    if text.starts_with('#') {
+        format!("\\{text}")
+    } else {
+        text
+    }
+}
+
+/// Largest text size on a line; 0 for a line of images.
+fn text_size(line: &VLine<'_>) -> f32 {
+    line.spans
+        .iter()
+        .filter(|s| s.kind == SpanKind::Text)
+        .map(|s| s.font_size)
+        .fold(0.0f32, f32::max)
+}
+
+fn opens_with_hash(line: &VLine<'_>) -> bool {
+    line.spans
+        .iter()
+        .find(|s| s.kind == SpanKind::Text && !s.text.trim().is_empty())
+        .is_some_and(|s| s.text.trim_start().starts_with('#'))
+}
+
+fn is_bold_line(line: &VLine<'_>) -> bool {
+    let mut text = line
+        .spans
+        .iter()
+        .filter(|s| s.kind == SpanKind::Text && !s.text.trim().is_empty())
+        .peekable();
+    text.peek().is_some() && text.all(|s| s.bold)
 }
 
 fn line_is_blank(line: &VLine<'_>) -> bool {
@@ -290,7 +363,7 @@ fn heading_for_line(
         return Some(2);
     }
     let bold = vline.spans.iter().any(|s| s.bold);
-    if median > 0.1 && (size >= median * 1.15 || bold) {
+    if median > 0.1 && (size >= median * 1.15 || bold) && !is_bold_label(line) {
         if let Some(level) = heading_level(line) {
             return Some(level);
         }
@@ -309,6 +382,16 @@ fn heading_for_line(
         return Some(2);
     }
     None
+}
+
+/// Emphasised text that is a label rather than a title: `Cluster ID: 6`,
+/// `Given answer: {answer}`, or a bare `{placeholder}`.
+fn is_bold_label(line: &str) -> bool {
+    if !line.starts_with(|c: char| c.is_uppercase() || c.is_ascii_digit()) {
+        return true;
+    }
+    line.rsplit_once(": ")
+        .is_some_and(|(_, value)| !value.starts_with(char::is_uppercase))
 }
 
 fn line_role(line: &VLine<'_>, page_idx: usize, roles: &RoleMap) -> Option<Role> {
@@ -330,20 +413,44 @@ fn join_paragraph(lines: &[VLine<'_>]) -> String {
             out.push_str(&t);
             continue;
         }
-        if out.ends_with('-') {
-            let next = t.chars().next();
-            if next.map(|c| c.is_lowercase()).unwrap_or(false) {
-                out.pop();
-                out.push_str(&t);
-                continue;
-            }
+        // Carry an emphasis run across the line break before joining, so a
+        // word hyphenated inside italics still rejoins.
+        let wrap = ["***", "**", "*"]
+            .into_iter()
+            .find(|w| t.starts_with(w) && !t[w.len()..].starts_with('*'));
+        let rest = match wrap {
+            Some(w) if continue_emphasis(&mut out, w) => &t[w.len()..],
+            _ => t.as_str(),
+        };
+        if out.ends_with('-') && rest.starts_with(char::is_lowercase) {
+            out.pop();
+            out.push_str(rest);
+            continue;
         }
         if !out.is_empty() && !out.ends_with(' ') {
             out.push(' ');
         }
-        out.push_str(&t);
+        out.push_str(rest);
     }
     out
+}
+
+/// Reopen the emphasis run `out` just closed with `wrap`, so neighbouring
+/// runs in one style read `**a b**` rather than `**a** **b**`.
+fn continue_emphasis(out: &mut String, wrap: &str) -> bool {
+    if wrap.is_empty() {
+        return false;
+    }
+    let body = out.trim_end_matches(' ');
+    let Some(before) = body.strip_suffix(wrap) else {
+        return false;
+    };
+    if before.is_empty() || before.ends_with('*') {
+        return false;
+    }
+    let cut = before.len();
+    out.replace_range(cut..cut + wrap.len(), "");
+    true
 }
 
 fn style_line(line: &VLine<'_>) -> String {
@@ -372,9 +479,22 @@ fn push_span(out: &mut String, s: &Span, styled: bool) {
         (true, false, true) => "*",
         _ => "",
     };
+    if wrap.is_empty() {
+        out.push_str(t);
+        return;
+    }
+    // Markers hug the text: `** Bold**` does not render as bold.
+    let core = t.trim();
+    let lead = &t[..t.len() - t.trim_start().len()];
+    let trail = &t[t.trim_end().len()..];
+    let reopened = continue_emphasis(out, wrap);
+    out.push_str(lead);
+    if !reopened {
+        out.push_str(wrap);
+    }
+    out.push_str(core);
     out.push_str(wrap);
-    out.push_str(t);
-    out.push_str(wrap);
+    out.push_str(trail);
 }
 
 fn image_block(lines: &[VLine<'_>]) -> String {
@@ -423,59 +543,6 @@ fn median_size(spans: &[&Span]) -> f32 {
         }
     }
     12.0
-}
-
-fn column_gaps(spans: &[&Span]) -> Vec<f32> {
-    let mut min = f32::MAX;
-    let mut max = f32::MIN;
-    let mut n = 0usize;
-    for s in spans {
-        if s.kind != SpanKind::Text {
-            continue;
-        }
-        n += 1;
-        min = min.min(s.x);
-        max = max.max(s.x);
-    }
-    if n < 8 || max - min < 180.0 {
-        return Vec::new();
-    }
-    const B: usize = 24;
-    let mut hist = [0u32; B];
-    let width = (max - min).max(1.0);
-    for s in spans {
-        if s.kind != SpanKind::Text {
-            continue;
-        }
-        let i = (((s.x - min) / width) * B as f32) as usize;
-        hist[i.min(B - 1)] += 1;
-    }
-    let total = n as u32;
-    let empty = (total / 40).max(2);
-    let mut gaps = Vec::new();
-    let mut i = 1usize;
-    while i + 1 < B {
-        if hist[i] > empty {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i + 1 < B && hist[i] <= empty {
-            i += 1;
-        }
-        let len = i - start;
-        if len < 2 {
-            continue;
-        }
-        let left: u32 = hist[..start].iter().sum();
-        let right: u32 = hist[i..].iter().sum();
-        if left * 5 >= total && right * 5 >= total {
-            let mid_bucket = start + len / 2;
-            gaps.push(min + width * (mid_bucket as f32 + 0.5) / B as f32);
-        }
-    }
-    gaps.truncate(2);
-    gaps
 }
 
 fn running_margins(pages: &[PageLayout]) -> (Vec<String>, Vec<String>) {
@@ -565,16 +632,24 @@ fn visual_lines<'a>(spans: &[&'a Span], cols: &[usize]) -> Vec<VLine<'a>> {
             })
     });
     let mut lines: Vec<VLine<'a>> = Vec::new();
+    let mut line_size = 0.0f32;
     for i in order {
         let s = spans[i];
         let col = cols[i];
-        let thresh = (s.font_size * 0.45).max(2.0);
         if let Some(last) = lines.last_mut() {
+            // Measure against the larger text so a superscript joins its line.
+            let thresh = (s.font_size.max(line_size) * 0.45).max(2.0);
             if last.col == col && (last.y - s.y).abs() < thresh {
                 last.spans.push(s);
+                // The baseline is the main text's, not a raised exponent's.
+                if s.font_size > line_size {
+                    last.y = s.y;
+                    line_size = s.font_size;
+                }
                 continue;
             }
         }
+        line_size = s.font_size;
         lines.push(VLine {
             y: s.y,
             col,
@@ -930,5 +1005,298 @@ mod tests {
         let md = format_pages(&[page], &HashMap::new());
         assert!(md[0].contains("| A | B |"), "{}", md[0]);
         assert!(md[0].contains("| C | D |"), "{}", md[0]);
+    }
+
+    fn page_of(spans: Vec<Span>) -> String {
+        let page = PageLayout {
+            text: String::new(),
+            spans,
+            rects: Vec::new(),
+        };
+        format_pages(&[page], &HashMap::new()).remove(0)
+    }
+
+    fn styled(mut span: Span, bold: bool, italic: bool) -> Span {
+        span.bold = bold;
+        span.italic = italic;
+        span
+    }
+
+    /// Two columns of prose, then a table spanning both under a caption.
+    fn two_columns_over_a_table() -> Vec<Span> {
+        let mut spans = Vec::new();
+        for i in 0..6 {
+            let y = 700.0 - i as f32 * 14.0;
+            spans.push(sp(
+                &format!("left column prose line number {i} reads on"),
+                20.0,
+                y,
+                10.0,
+            ));
+            spans.push(sp(
+                &format!("right column prose line number {i} reads on"),
+                300.0,
+                y,
+                10.0,
+            ));
+        }
+        spans.push(sp(
+            "Table 1: a caption that runs the full width of the page under the prose",
+            20.0,
+            600.0,
+            10.0,
+        ));
+        for (r, row) in [
+            ["Model", "Score", "Cost"],
+            ["Base", "27.3", "3.3"],
+            ["Big", "28.4", "2.3"],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = 580.0 - r as f32 * 14.0;
+            for (c, cell) in row.iter().enumerate() {
+                spans.push(sp(cell, 20.0 + c as f32 * 200.0, y, 10.0));
+            }
+        }
+        spans
+    }
+
+    #[test]
+    fn full_width_table_under_two_columns_stays_whole() {
+        let md = page_of(two_columns_over_a_table());
+        assert!(md.contains("| Model | Score | Cost |"), "{md}");
+        assert!(md.contains("| Big | 28.4 | 2.3 |"), "{md}");
+        let left = md.find("left column prose line number 5").expect(&md);
+        let right = md.find("right column prose line number 0").expect(&md);
+        let table = md.find("| Model").expect(&md);
+        assert!(left < right && right < table, "{md}");
+    }
+
+    #[test]
+    fn table_rows_may_leave_cells_empty() {
+        let mut spans = Vec::new();
+        let rows: [&[(&str, f32)]; 4] = [
+            &[("Dataset", 20.0), ("Method", 120.0), ("Score", 260.0)],
+            &[("CISC", 120.0), ("13.0", 260.0)],
+            &[("AQuA", 20.0), ("Vec", 120.0), ("8.9", 260.0)],
+            &[("CISC", 120.0), ("11.0", 260.0)],
+        ];
+        for (r, row) in rows.iter().enumerate() {
+            for &(text, x) in row.iter() {
+                spans.push(sp(text, x, 700.0 - r as f32 * 12.0, 10.0));
+            }
+        }
+        let md = page_of(spans);
+        assert!(md.contains("|  | CISC | 13.0 |"), "{md}");
+        assert!(md.contains("| AQuA | Vec | 8.9 |"), "{md}");
+    }
+
+    #[test]
+    fn a_label_between_rows_folds_into_the_nearer_one() {
+        let mut spans = vec![
+            sp("Set", 20.0, 714.0, 10.0),
+            sp("Method", 120.0, 714.0, 10.0),
+            sp("Score", 260.0, 714.0, 10.0),
+        ];
+        for r in 0..4 {
+            let y = 700.0 - r as f32 * 14.0;
+            spans.push(sp(&format!("m{r}"), 120.0, y, 10.0));
+            spans.push(sp(&format!("{r}.5"), 260.0, y, 10.0));
+        }
+        // A multirow label centred between the middle rows, nearer the third.
+        spans.push(sp("Group", 20.0, 700.0 - 14.0 * 1.6, 10.0));
+        let md = page_of(spans);
+        assert!(md.contains("| Group | m2 | 2.5 |"), "{md}");
+        // Header, separator, and four rows: the label took no row of its own.
+        assert_eq!(md.lines().count(), 6, "{md}");
+    }
+
+    #[test]
+    fn justified_prose_is_not_a_table() {
+        // Loose justification opens word gaps wider than a table gutter;
+        // the next line's words ignore those gutters.
+        let first = ["We", "computed", "the", "reduction", "for", "each"];
+        let second = ["(dataset, model)", "combination by", "running"];
+        let mut spans = Vec::new();
+        for (i, w) in first.iter().enumerate() {
+            spans.push(sp(w, 20.0 + i as f32 * 45.0, 700.0, 10.0));
+        }
+        for (i, w) in second.iter().enumerate() {
+            spans.push(sp(w, 20.0 + i as f32 * 95.0, 686.0, 10.0));
+        }
+        let md = page_of(spans);
+        assert!(!md.contains("| --- |"), "{md}");
+    }
+
+    #[test]
+    fn section_numbers_and_equations_are_not_tables() {
+        let md = page_of(vec![
+            sp("3", 20.0, 700.0, 10.0),
+            sp("Experiments", 40.0, 700.0, 10.0),
+            sp("3.1", 20.0, 686.0, 10.0),
+            sp("Datasets", 40.0, 686.0, 10.0),
+        ]);
+        assert!(!md.contains("| --- |"), "{md}");
+        let md = page_of(vec![
+            sp("x = y", 120.0, 700.0, 10.0),
+            sp("(11)", 300.0, 700.0, 10.0),
+            sp("a + b", 120.0, 686.0, 10.0),
+            sp("(12)", 300.0, 686.0, 10.0),
+        ]);
+        assert!(!md.contains("| --- |"), "{md}");
+    }
+
+    #[test]
+    fn math_stacked_under_a_numbered_equation_is_not_a_table() {
+        let md = page_of(vec![
+            sp("c = exp", 120.0, 700.0, 10.0),
+            sp("(11)", 300.0, 700.0, 10.0),
+            sp("P K", 110.0, 690.0, 10.0),
+            sp("c j", 160.0, 690.0, 10.0),
+            sp("j=1 exp", 110.0, 680.0, 8.0),
+            sp("T", 160.0, 680.0, 8.0),
+        ]);
+        assert!(!md.contains("| --- |"), "{md}");
+    }
+
+    #[test]
+    fn superscripts_join_their_line() {
+        let md = page_of(vec![
+            sp("Model", 20.0, 700.0, 10.0),
+            sp("Cost", 200.0, 700.0, 10.0),
+            sp("Base", 20.0, 686.0, 10.0),
+            sp("3.3 · 10", 200.0, 686.0, 10.0),
+            sp("18", 240.0, 689.6, 7.0),
+            sp("Big", 20.0, 672.0, 10.0),
+            sp("2.3 · 10", 200.0, 672.0, 10.0),
+            sp("19", 240.0, 675.6, 7.0),
+        ]);
+        assert!(md.contains("| Base | 3.3 · 1018 |"), "{md}");
+        assert!(md.contains("| Big | 2.3 · 1019 |"), "{md}");
+    }
+
+    #[test]
+    fn body_text_opening_with_a_hash_is_escaped() {
+        let md = page_of(vec![sp("# of calls in the pipeline", 20.0, 700.0, 10.0)]);
+        assert_eq!(md, "\\# of calls in the pipeline");
+    }
+
+    #[test]
+    fn neighbouring_runs_share_one_emphasis() {
+        let mut second = styled(sp("words", 90.0, 700.0, 10.0), true, false);
+        second.space_before = true;
+        let mut tail = sp("mid sentence.", 120.0, 700.0, 10.0);
+        tail.space_before = true;
+        let md = page_of(vec![
+            sp("We set", 20.0, 700.0, 10.0),
+            styled(sp(" Bold", 50.0, 700.0, 10.0), true, false),
+            second,
+            tail,
+        ]);
+        assert_eq!(md, "We set **Bold words** mid sentence.");
+    }
+
+    #[test]
+    fn hyphenated_italic_word_rejoins_across_lines() {
+        let md = page_of(vec![
+            sp("In", 20.0, 700.0, 10.0),
+            styled(sp("Pro-", 40.0, 700.0, 10.0), false, true),
+            styled(sp("ceedings of ACL", 20.0, 686.0, 10.0), false, true),
+        ]);
+        assert!(md.contains("*Proceedings of ACL*"), "{md}");
+    }
+
+    #[test]
+    fn rotated_margin_text_leaves_the_flow() {
+        let mut stamp = sp("arXiv:1706.03762v7", 5.0, 700.0, 20.0);
+        stamp.width = 0.0;
+        let md = page_of(vec![
+            stamp,
+            sp("First line of the abstract text.", 60.0, 700.0, 10.0),
+            sp("Second line of the abstract text.", 60.0, 686.0, 10.0),
+        ]);
+        assert_eq!(
+            md,
+            "First line of the abstract text. Second line of the abstract text.\n\narXiv:1706.03762v7"
+        );
+    }
+
+    #[test]
+    fn a_larger_or_bold_heading_line_is_its_own_block() {
+        let md = page_of(vec![
+            sp("References", 20.0, 700.0, 12.0),
+            sp("Samir Abdaljalil and others. 2025.", 20.0, 684.0, 10.0),
+            sp("Sindex: semantic inconsistency.", 20.0, 672.0, 10.0),
+        ]);
+        assert!(md.starts_with("### References\n\n"), "{md}");
+        let md = page_of(vec![
+            styled(
+                sp("A.1 Model Hyperparameters", 20.0, 700.0, 10.0),
+                true,
+                false,
+            ),
+            sp("For all our experiments, we set n = 20.", 20.0, 686.0, 10.0),
+        ]);
+        assert!(md.starts_with("## Model Hyperparameters\n\n"), "{md}");
+    }
+
+    #[test]
+    fn a_blank_line_or_a_long_run_ends_a_table() {
+        let mut spans = Vec::new();
+        for r in 0..70 {
+            let y = 1200.0 - r as f32 * 14.0;
+            spans.push(sp(&format!("r{r}"), 20.0, y, 10.0));
+            spans.push(sp(&format!("{r}.0"), 200.0, y, 10.0));
+        }
+        let md = page_of(spans);
+        // Tables cap at 64 rows; the rest start a fresh table.
+        assert_eq!(md.matches("| --- |").count(), 2, "{md}");
+        let md = page_of(vec![
+            sp("a", 20.0, 700.0, 10.0),
+            sp("1", 200.0, 700.0, 10.0),
+            sp("b", 20.0, 686.0, 10.0),
+            sp("2", 200.0, 686.0, 10.0),
+            sp("c", 20.0, 600.0, 10.0),
+            sp("3", 200.0, 600.0, 10.0),
+        ]);
+        assert!(
+            md.contains("| b | 2 |") && !md.contains("| c | 3 |"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn a_mostly_rotated_page_is_read_as_is() {
+        let mut spans = Vec::new();
+        for i in 0..3 {
+            let mut s = sp(
+                &format!("sideways {i}"),
+                20.0 + i as f32 * 30.0,
+                700.0,
+                10.0,
+            );
+            s.width = 0.0;
+            s.space_before = i > 0;
+            spans.push(s);
+        }
+        let md = page_of(spans);
+        assert_eq!(md, "sideways 0 sideways 1 sideways 2");
+    }
+
+    #[test]
+    fn bold_labels_are_not_headings() {
+        let md = page_of(vec![styled(
+            sp("Cluster ID: 6", 20.0, 700.0, 10.0),
+            true,
+            false,
+        )]);
+        assert_eq!(md, "**Cluster ID: 6**");
+        let md = page_of(vec![styled(
+            sp("{question}", 20.0, 700.0, 10.0),
+            true,
+            false,
+        )]);
+        assert_eq!(md, "**{question}**");
     }
 }
