@@ -28,7 +28,7 @@ src/lib.rs        public API + title promotion + image-mark rewrite
 src/cli.rs        argv parser, file/URL/stdin I/O (no clap)
 src/ffi.rs        C ABI over convert_pdf_to_markdown (cdylib)
 src/util.rs       parallel_map (std::thread::scope worker pool)
-src/bin/          profile.rs, opendataloader.rs — dev harnesses, not shipped
+src/bin/          profile.rs, opendataloader.rs — dev harnesses (`dev-harness`)
 python/           ctypes bindings over src/ffi.rs, CLI, packaging, tests
 tests/            integration + CLI + real fixtures only
 ```
@@ -45,19 +45,22 @@ behind `python -m pdfmd` and the wheel's `pdfmd` script.
 
 ```sh
 cargo build --release                         # LTO release binary
-cargo test --all-targets                      # full suite
+cargo test --all-targets --all-features       # full suite, including harnesses
 cargo fmt --all --check                       # CI gate
-cargo clippy --all-targets -- -D warnings     # CI gate
+cargo clippy --all-targets --all-features -- -D warnings
 RUSTFLAGS="-D warnings" cargo build           # what CI compiles with
 cargo llvm-cov --summary-only --ignore-filename-regex 'src/bin/'
-cargo run --release --bin profile             # hot-path sanity check
+cargo run --release --bin profile --features dev-harness
 cargo build --release && \
   python -m unittest discover -s python/tests # Python bindings
 ```
 
-Run `fmt`, `clippy`, and `test --all-targets` before pushing. CI runs
-that trio on Ubuntu for every PR, plus `cargo test --locked` on the
-`rust-version` in `Cargo.toml`. macOS and Windows tests run on `main`.
+Run `fmt`, `clippy`, and `test --all-targets --all-features` before
+pushing. CI runs that trio on Ubuntu for every PR, plus `cargo test
+--locked --all-targets --all-features` on the `rust-version` in
+`Cargo.toml`. macOS and Windows tests run on `main`. `--all-features`
+compiles the dev harnesses. `cargo package --locked` is the
+publish-tarball check.
 
 ## Hard rules
 
@@ -87,7 +90,7 @@ and multi-page Markdown formatting extract in parallel via
 
 If a change touches `src/pdf/deflate.rs`, `src/extract/parser.rs`,
 `src/extract/content/`, or `src/util.rs`, benchmark with
-`cargo run --release --bin profile` before calling it done.
+`cargo run --release --bin profile --features dev-harness` before calling it done.
 
 Faster without a crate beats cleaner with a crate.
 
@@ -98,8 +101,9 @@ Faster without a crate beats cleaner with a crate.
 - Don't add doc comments to private helpers unless there's a real
   subtlety.
 - Don't create new top-level files (READMEs, design docs, CHANGELOGs)
-  unless asked. `README.md`, `VISION.md`, `AGENTS.md`, and `CLAUDE.md`
-  are the first-class docs; keep them in sync when behavior changes.
+  unless asked. `README.md`, `VISION.md`, `AGENTS.md`, `CLAUDE.md`, and
+  `CONTRIBUTING.md` are the docs to keep in sync when behavior or the
+  release process changes.
 - Commit subjects use a `module: lowercase summary` prefix —
   e.g. `pdf: cap dictionary entry count to avoid quadratic insert hang`.
 - Don't push to `main`; open a PR. Use
@@ -136,7 +140,16 @@ Faster without a crate beats cleaner with a crate.
 - The first paragraph is promoted to `# H1` in
   `lib::promote_document_title`, not in `heuristics.rs`. Leave it there.
 - `src/bin/profile.rs` and `src/bin/opendataloader.rs` are dev-only,
-  excluded from coverage. Don't import them from the library.
+  behind the `dev-harness` feature so `cargo install` does not put a
+  `profile` binary on `PATH`. Don't import them from the library.
+  Coverage still ignores `src/bin/`.
+- Releases are tags. `.github/workflows/release.yml` publishes to
+  crates.io with the `CARGO_REGISTRY_TOKEN` secret and attaches static
+  Linux, macOS, and Windows CLI archives plus `SHA256SUMS`. A missing
+  token fails only the publish job. The tag is `v` plus the
+  `Cargo.toml` version, on a commit that contains the workflow. Do not
+  publish the Python package: the PyPI name is taken. Steps are in
+  `CONTRIBUTING.md`.
 - Every buffer crossing `src/ffi.rs` is a `(pointer, length)` pair with
   no implied NUL — extracted text may contain any byte. A `PdfmdResult`
   owns its buffers through an opaque handle and must be released once
@@ -163,3 +176,4 @@ Faster without a crate beats cleaner with a crate.
 | Binding another language | Call the C ABI in `src/ffi.rs`. Don't add a binding-generator crate. |
 | Adding to the Python package | Stdlib only, both at build and run time. Test it in `python/tests/`. |
 | Trade-off is speed vs. readability on the hot path | Keep the fast version. Comment *why*. |
+| Cutting a release | Tag `v` plus the `Cargo.toml` version. See `CONTRIBUTING.md`. Do not publish to PyPI. |

@@ -28,15 +28,15 @@ features. Do not `#[allow]` warnings that CI will reject.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
 ```
 
 If you touched `src/pdf/deflate.rs`, `src/extract/parser.rs`,
 `src/extract/content/`, or `src/util.rs`, also run:
 
 ```sh
-cargo run --release --bin profile
+cargo run --release --bin profile --features dev-harness
 ```
 
 If you touched `src/ffi.rs` or `python/`, also run:
@@ -55,7 +55,10 @@ python -m unittest discover -s python/tests
   `lib::rewrite_image_marks` must stay in sync.
 - Bindings go through the C ABI in `src/ffi.rs`. No PyO3, no maturin —
   `python/` is `ctypes` and stdlib only, on both sides.
-- `src/bin/*` is profiling / comparison only. Don't import it.
+- `src/bin/*` is profiling / comparison only, behind `--features
+  dev-harness`. Don't import it.
+- Releases: tag `v<Cargo.toml version>`. See `CONTRIBUTING.md`. Do not
+  publish the Python package to PyPI.
 
 Commit subjects: `module: lowercase summary`. Don't push to `main`.
 Fill `.github/PULL_REQUEST_TEMPLATE.md` on every PR. New issues use
