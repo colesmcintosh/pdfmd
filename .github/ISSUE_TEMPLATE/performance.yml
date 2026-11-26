@@ -23,7 +23,7 @@ body:
     id: numbers
     attributes:
       label: Numbers
-      description: End-to-end wall time from bytes to Markdown, not a single-stage microbenchmark. Include page count, file size, and how you measured (`hyperfine`, `cargo run --release --bin profile`).
+      description: End-to-end wall time from bytes to Markdown, not a single-stage microbenchmark. Include page count, file size, and how you measured (`hyperfine`, `cargo run --release --bin profile --features dev-harness`).
     validations:
       required: true
 

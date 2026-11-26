@@ -9,13 +9,45 @@ readme = "README.md"
 license = "MIT"
 repository = "https://github.com/colesmcintosh/pdfmd"
 homepage = "https://colesmcintosh.github.io/pdfmd/"
+documentation = "https://docs.rs/pdfmd"
 keywords = ["pdf", "markdown", "parser", "converter", "text-extraction"]
 categories = ["command-line-utilities", "parser-implementations", "text-processing"]
+# Default discovery would install `profile` and `opendataloader` beside
+# the CLI. Those are dev harnesses, not part of `cargo install pdfmd`.
+autobins = false
+# The integration fixture is a real PDF. The website, Python checkout,
+# and CI config are not part of the crate a downstream build compiles.
+exclude = [
+    "python/**",
+    "docs/**",
+    ".github/**",
+    "tests/**",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".gitignore",
+]
+
+[features]
+dev-harness = []
 
 # `cdylib` alongside `rlib` so `src/ffi.rs` ships a C ABI for the Python
 # package in `python/`; the rlib is what `cargo test` and Rust callers use.
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "pdfmd"
+path = "src/main.rs"
+
+[[bin]]
+name = "profile"
+path = "src/bin/profile.rs"
+required-features = ["dev-harness"]
+
+[[bin]]
+name = "opendataloader"
+path = "src/bin/opendataloader.rs"
+required-features = ["dev-harness"]
 
 # Zero runtime dependencies by design. The PDF reader, zlib/DEFLATE
 # decoder, font/CMap handling, content-stream interpreter, CLI parser,

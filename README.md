@@ -33,13 +33,54 @@ is in [`VISION.md`](VISION.md).
 
 ## Install
 
+### crates.io
+
 ```sh
-cargo install --path .
+cargo install pdfmd
 ```
 
-Or build a release binary directly:
+Rust 1.70 or newer. This compiles the CLI on the machine.
+
+### Prebuilt binaries
+
+Tagged releases attach CLI builds and a `SHA256SUMS` file. Linux
+binaries are static musl executables (`x86_64` and `aarch64`), so they
+do not need a system libc. macOS binaries are `x86_64` and `arm64`,
+built for macOS 11 or newer. Windows is an `x86_64` `.exe` with the C
+runtime linked in. They are unsigned; the checksum ties an archive to
+the release.
+
+| platform | archive |
+| --- | --- |
+| Linux x86_64 | `pdfmd-x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64 | `pdfmd-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel | `pdfmd-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `pdfmd-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `pdfmd-x86_64-pc-windows-msvc.zip` |
+
+Linux or macOS, after choosing an archive name from the table:
 
 ```sh
+asset=pdfmd-x86_64-unknown-linux-musl.tar.gz
+base=https://github.com/colesmcintosh/pdfmd/releases/latest/download
+curl -fsSL -o "$asset" "$base/$asset"
+curl -fsSL -o SHA256SUMS "$base/SHA256SUMS"
+grep "$asset" SHA256SUMS | sha256sum -c -   # macOS: shasum -a 256 -c
+tar -xzf "$asset"
+mkdir -p "$HOME/.local/bin"
+install -m 755 pdfmd "$HOME/.local/bin/pdfmd"
+```
+
+On Windows, download the `.zip` and `SHA256SUMS` from the same release.
+`(Get-FileHash pdfmd-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash`
+should match the hash on that line (case-insensitive). The archive
+contains `pdfmd.exe`.
+
+### From a checkout
+
+```sh
+cargo install --path .
+# or
 cargo build --release
 # binary is at ./target/release/pdfmd
 ```
@@ -86,6 +127,8 @@ runtime packages on either side.
 cargo build --release       # produces target/release/libpdfmd.{so,dylib,dll}
 pip install ./python        # builds the library and ships it in the wheel
 ```
+
+The package is not on PyPI. That project name belongs to someone else.
 
 ```python
 import pdfmd
@@ -251,7 +294,7 @@ heuristics and remain best-effort on complex pages.
 Run them with:
 
 ```sh
-cargo test --all-targets
+cargo test --all-targets --all-features
 cargo build --release && python -m unittest discover -s python/tests
 ```
 
@@ -365,11 +408,17 @@ src/
   streams are not supported. Damaged files — broken or missing xref
   tables, junk before the header, truncated or headerless DEFLATE
   streams — are repaired on a best-effort basis.
-- The Python wheel is platform-specific and is not published to PyPI;
-  build it from a checkout with `pip install ./python`.
+- The Python wheel is platform-specific and is not published to PyPI.
+  The `pdfmd` name there belongs to an unrelated project. Build the
+  bindings from a checkout with `pip install ./python`.
 - `python -m pdfmd` covers the same flags as the Rust CLI; a `pdfmd`
   binary from `cargo install` and one from a wheel both answer to that
   name, so PATH order decides which runs.
+
+## Contributing
+
+Release steps — the version bump, the tag, the crates.io token, and the
+binaries that tag builds — are in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
