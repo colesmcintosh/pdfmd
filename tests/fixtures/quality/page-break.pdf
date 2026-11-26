@@ -1,0 +1,100 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [13 0 R 15 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Title (page-break) /Producer (pdfmd tests/quality fixture generator) >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [1 /fi /fl] >> >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique /Encoding /WinAnsiEncoding >>
+endobj
+8 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+9 0 obj
+<< /Length 366 >>
+stream
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<4E2D> <4E2D>
+<6587> <6587>
+<5B57> <5B57>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+
+endstream
+endobj
+10 0 obj
+<< /Type /Font /Subtype /CIDFontType2 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 1000 >>
+endobj
+11 0 obj
+<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /Identity-H /DescendantFonts [10 0 R] /ToUnicode 9 0 R >>
+endobj
+12 0 obj
+<< /Length 263 >>
+stream
+BT /F1 26.00 Tf 1 0 0 1 72.00 740.00 Tm (Across The Break) Tj ET
+BT /F1 12.00 Tf 1 0 0 1 72.00 690.00 Tm (The opening sentence stays on the first page.) Tj ET
+BT /F1 12.00 Tf 1 0 0 1 72.00 72.00 Tm (This sentence starts at the bottom of the first page and) Tj ET
+
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R /F4 7 0 R /F5 8 0 R /F6 11 0 R >> >> /Contents 12 0 R >>
+endobj
+14 0 obj
+<< /Length 103 >>
+stream
+BT /F1 12.00 Tf 1 0 0 1 72.00 740.00 Tm (finishes at the top of the next page as one paragraph.) Tj ET
+
+endstream
+endobj
+15 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R /F4 7 0 R /F5 8 0 R /F6 11 0 R >> >> /Contents 14 0 R >>
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000129 00000 n 
+0000000220 00000 n 
+0000000378 00000 n 
+0000000480 00000 n 
+0000000585 00000 n 
+0000000694 00000 n 
+0000000789 00000 n 
+0000001206 00000 n 
+0000001370 00000 n 
+0000001509 00000 n 
+0000001824 00000 n 
+0000002003 00000 n 
+0000002158 00000 n 
+trailer << /Size 16 /Root 1 0 R /Info 3 0 R >>
+startxref
+2337
+%%EOF

@@ -30,7 +30,11 @@ features. Do not `#[allow]` warnings that CI will reject.
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
+cargo test --test quality -- --nocapture
 ```
+
+`tests/quality` is the output-quality gate (also part of `--all-targets`).
+See `CONTRIBUTING.md` before changing a fixture or the baseline.
 
 If you touched `src/pdf/deflate.rs`, `src/extract/parser.rs`,
 `src/extract/content/`, or `src/util.rs`, also run:

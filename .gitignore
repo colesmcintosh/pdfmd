@@ -2,6 +2,7 @@
 *.pdf
 *.md.bak
 !tests/fixtures/*.pdf
+!tests/fixtures/**/*.pdf
 
 # Python bindings: build output and the shared library copied in by setup.py
 __pycache__/

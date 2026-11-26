@@ -1,0 +1,10 @@
+field-note.pdf is the one real-world fixture in this corpus.
+
+source: tests/fixtures/quality/src/field-note.html
+license: original text written for this repository (MIT)
+producer: Google Chrome 157.0.8103.50
+command: google-chrome --headless --disable-gpu --no-sandbox --no-pdf-header-footer --print-to-pdf=tests/fixtures/quality/field-note.pdf tests/fixtures/quality/src/field-note.html
+
+The other PDFs under tests/fixtures/quality/ are synthetic. tests/quality/gen.rs
+writes them with no dependencies. CI does not run Chrome or regenerate
+either kind; both the generator and the PDFs are committed.

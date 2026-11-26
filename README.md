@@ -290,13 +290,25 @@ heuristics and remain best-effort on complex pages.
 
 ## Testing & coverage
 
-438 tests (414 unit + 24 integration), plus 32 for the Python bindings.
-Run them with:
+438 tests (414 unit + 24 integration), plus 32 for the Python bindings,
+plus the output-quality gate in `tests/quality`. Run them with:
 
 ```sh
 cargo test --all-targets --all-features
+cargo test --test quality -- --nocapture
 cargo build --release && python -m unittest discover -s python/tests
 ```
+
+`tests/quality` scores a committed corpus
+(`tests/fixtures/quality/`) against hand-written Markdown: text
+similarity, word and paragraph F1, heading precision/recall and level
+accuracy, list recall and nesting, table cells and spans, code fences,
+reading order, stripped running headers, and link recall. CI fails if
+any metric for any fixture drops more than `0.02` below
+`tests/quality/baseline.json`. The expected Markdown stays the ideal
+document, so a case the converter handles badly keeps a low score.
+`UPDATE_QUALITY_BASELINE=1 cargo test --test quality` locks in a new
+run. How to add a fixture is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 Reproduce the coverage numbers in the badge:
 

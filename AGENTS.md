@@ -51,6 +51,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 RUSTFLAGS="-D warnings" cargo build           # what CI compiles with
 cargo llvm-cov --summary-only --ignore-filename-regex 'src/bin/'
 cargo run --release --bin profile --features dev-harness
+cargo test --test quality -- --nocapture    # output-quality gate
+UPDATE_QUALITY_BASELINE=1 cargo test --test quality
 cargo build --release && \
   python -m unittest discover -s python/tests # Python bindings
 ```
@@ -113,8 +115,12 @@ Faster without a crate beats cleaner with a crate.
 
 ## Gotchas
 
-- `*.pdf` is gitignored **except** `tests/fixtures/*.pdf`. New fixtures
-  must still match the negated rule.
+- `*.pdf` is gitignored **except** `tests/fixtures/**/*.pdf`. New fixtures
+  must still match the negated rule. Output-quality PDFs live in
+  `tests/fixtures/quality/`; expected Markdown is hand-written, and
+  `tests/quality/baseline.json` is the regression gate. Do not lower
+  the expected Markdown to hide a bad score. Update the baseline only
+  with `UPDATE_QUALITY_BASELINE=1 cargo test --test quality`.
 - `Cargo.lock` has to parse on the MSRV toolchain. Lockfile v4 needs
   Cargo 1.78; 1.70 rejects it, and `--locked` then fails the `msrv`
   job. Cargo 1.83+ writes v4 for a new lockfile unless `rust-version`

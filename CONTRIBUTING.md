@@ -12,6 +12,53 @@ commands are in [AGENTS.md](AGENTS.md).
 cargo run --release --bin profile --features dev-harness
 ```
 
+## Output quality
+
+`tests/quality` converts every PDF in `tests/fixtures/quality/` and
+scores it against a hand-written Markdown file. The numbers are a
+regression gate. They are not a snapshot of whatever the extractor
+happens to emit, and a low score stays low until the extractor gets
+better.
+
+`cargo test --test quality` prints a table and writes
+`target/quality-report.md` plus `target/quality-report.json`. CI's
+`quality` job uploads those files and copies the summary into the job
+log. The same test also runs as part of `cargo test --all-targets`, so
+a regression fails the normal test job too.
+
+The gate fails when any metric for any fixture drops by more than
+`0.02` below `tests/quality/baseline.json`. A higher score passes, so
+an improvement can land before you lock it in. Exact output is also
+kept in `tests/quality/snapshots/` for review. Snapshot drift is
+printed in the report and is not itself a failure.
+
+### Add a fixture
+
+1. For a synthetic document, add a builder in `tests/quality/gen.rs`
+   and its id in `FIXTURES` inside `tests/quality/main.rs`. The
+   generator has no dependencies. For a file from a real tool, commit
+   the PDF and note the tool, version, and source next to
+   `tests/fixtures/quality/src/PRODUCER.txt`. `field-note.pdf` is a
+   Chrome print of `field-note.html`.
+2. Write `tests/fixtures/quality/<id>.md` as the ideal Markdown, not
+   as a copy of the current output. Inside an HTML comment, lines
+   `boilerplate: ...` name running headers, footers, and page numbers
+   that must not survive.
+3. Regenerate synthetic PDFs, then read the report before updating
+   the numbers:
+
+```sh
+UPDATE_QUALITY_FIXTURES=1 cargo test --test quality -- --nocapture
+```
+
+4. Lock the scores you just measured. This also refreshes the
+   snapshots. Review the diff: a drop you did not intend should not
+   be written into the baseline.
+
+```sh
+UPDATE_QUALITY_BASELINE=1 cargo test --test quality -- --nocapture
+```
+
 ## Releasing
 
 Releases are git tags. [`.github/workflows/release.yml`](.github/workflows/release.yml)

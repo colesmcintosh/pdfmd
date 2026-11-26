@@ -1,0 +1,89 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [13 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Title (unicode) /Producer (pdfmd tests/quality fixture generator) >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [1 /fi /fl] >> >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique /Encoding /WinAnsiEncoding >>
+endobj
+8 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+9 0 obj
+<< /Length 366 >>
+stream
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<4E2D> <4E2D>
+<6587> <6587>
+<5B57> <5B57>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+
+endstream
+endobj
+10 0 obj
+<< /Type /Font /Subtype /CIDFontType2 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 1000 >>
+endobj
+11 0 obj
+<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /Identity-H /DescendantFonts [10 0 R] /ToUnicode 9 0 R >>
+endobj
+12 0 obj
+<< /Length 305 >>
+stream
+BT /F1 26.00 Tf 1 0 0 1 72.00 740.00 Tm (Unicode Text) Tj ET
+BT /F1 12.00 Tf 1 0 0 1 72.00 704.00 Tm (Caf\351 na\357ve r\351sum\351 \227 accents survive.) Tj ET
+BT /F6 12.00 Tf 1 0 0 1 72.00 684.00 Tm <4E2D65875B57> Tj ET
+BT /F1 12.00 Tf 1 0 0 1 72.00 664.00 Tm (The \001rst \002ow uses ligatures.) Tj ET
+
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R /F4 7 0 R /F5 8 0 R /F6 11 0 R >> >> /Contents 12 0 R >>
+endobj
+xref
+0 14
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000122 00000 n 
+0000000210 00000 n 
+0000000368 00000 n 
+0000000470 00000 n 
+0000000575 00000 n 
+0000000684 00000 n 
+0000000779 00000 n 
+0000001196 00000 n 
+0000001360 00000 n 
+0000001499 00000 n 
+0000001856 00000 n 
+trailer << /Size 14 /Root 1 0 R /Info 3 0 R >>
+startxref
+2035
+%%EOF

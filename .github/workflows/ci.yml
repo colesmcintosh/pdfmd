@@ -179,3 +179,37 @@ jobs:
         run: |
           pdfmd tests/fixtures/sample.pdf -o "$RUNNER_TEMP/out.md"
           head -1 "$RUNNER_TEMP/out.md"
+
+  # Scores committed fixtures against hand-written Markdown. The same
+  # test also runs inside `test` and `msrv`; this job is the one that
+  # publishes the report. A drop of more than the baseline tolerance
+  # fails the test, which fails this job.
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: score fixtures
+        run: cargo test --locked --test quality -- --nocapture
+      - name: summary
+        if: always()
+        run: |
+          if [ -f target/quality-summary.md ]; then
+            cat target/quality-summary.md >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f target/quality-report.md ]; then
+            cat target/quality-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Quality report was not written." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: quality-report
+          path: |
+            target/quality-report.md
+            target/quality-report.json
+            target/quality-summary.md
+          if-no-files-found: warn

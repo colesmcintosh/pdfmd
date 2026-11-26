@@ -1,0 +1,99 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [13 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Title (table-simple) /Producer (pdfmd tests/quality fixture generator) >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [1 /fi /fl] >> >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique /Encoding /WinAnsiEncoding >>
+endobj
+8 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+9 0 obj
+<< /Length 366 >>
+stream
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<4E2D> <4E2D>
+<6587> <6587>
+<5B57> <5B57>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+
+endstream
+endobj
+10 0 obj
+<< /Type /Font /Subtype /CIDFontType2 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 1000 >>
+endobj
+11 0 obj
+<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /Identity-H /DescendantFonts [10 0 R] /ToUnicode 9 0 R >>
+endobj
+12 0 obj
+<< /Length 651 >>
+stream
+BT /F1 26.00 Tf 1 0 0 1 72.00 740.00 Tm (Simple Table) Tj ET
+BT /F1 12.00 Tf 1 0 0 1 72.00 700.00 Tm (Two people from the sample.) Tj ET
+72.00 640.00 150.00 22.00 re S
+222.00 640.00 150.00 22.00 re S
+72.00 618.00 150.00 22.00 re S
+222.00 618.00 150.00 22.00 re S
+72.00 596.00 150.00 22.00 re S
+222.00 596.00 150.00 22.00 re S
+BT /F2 11.00 Tf 1 0 0 1 80.00 646.00 Tm (Name) Tj ET
+BT /F2 11.00 Tf 1 0 0 1 230.00 646.00 Tm (Role) Tj ET
+BT /F1 11.00 Tf 1 0 0 1 80.00 624.00 Tm (Ada) Tj ET
+BT /F1 11.00 Tf 1 0 0 1 230.00 624.00 Tm (Engineer) Tj ET
+BT /F1 11.00 Tf 1 0 0 1 80.00 602.00 Tm (Lin) Tj ET
+BT /F1 11.00 Tf 1 0 0 1 230.00 602.00 Tm (Writer) Tj ET
+
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R /F4 7 0 R /F5 8 0 R /F6 11 0 R >> >> /Contents 12 0 R >>
+endobj
+xref
+0 14
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000122 00000 n 
+0000000215 00000 n 
+0000000373 00000 n 
+0000000475 00000 n 
+0000000580 00000 n 
+0000000689 00000 n 
+0000000784 00000 n 
+0000001201 00000 n 
+0000001365 00000 n 
+0000001504 00000 n 
+0000002207 00000 n 
+trailer << /Size 14 /Root 1 0 R /Info 3 0 R >>
+startxref
+2386
+%%EOF
