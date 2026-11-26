@@ -650,7 +650,7 @@ fn parse_html_table(block: &str) -> Table {
         let start = search_from + rel;
         let after = &block[start..];
         let lower_after = after.to_ascii_lowercase();
-        let end = lower_after.find("</tr>").map_or(after.len(), |n| n);
+        let end = lower_after.find("</tr>").unwrap_or(after.len());
         raw_rows.push(&after[..end]);
         search_from = start + end;
     }
