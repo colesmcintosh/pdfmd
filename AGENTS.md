@@ -56,7 +56,8 @@ cargo build --release && \
 ```
 
 Run `fmt`, `clippy`, and `test --all-targets` before pushing. CI runs
-that trio on Ubuntu for every PR; macOS and Windows tests run on `main`.
+that trio on Ubuntu for every PR, plus `cargo test --locked` on the
+`rust-version` in `Cargo.toml`. macOS and Windows tests run on `main`.
 
 ## Hard rules
 
@@ -110,6 +111,12 @@ Faster without a crate beats cleaner with a crate.
 
 - `*.pdf` is gitignored **except** `tests/fixtures/*.pdf`. New fixtures
   must still match the negated rule.
+- `Cargo.lock` has to parse on the MSRV toolchain. Lockfile v4 needs
+  Cargo 1.78; 1.70 rejects it, and `--locked` then fails the `msrv`
+  job. Cargo 1.83+ writes v4 for a new lockfile unless `rust-version`
+  is 1.82 or below, in which case it writes v3 and leaves an existing
+  v3 file alone. It does not downgrade a v4 file already in the tree.
+  Regenerating with `--ignore-rust-version` bumps the file to v4.
 - URL inputs are fetched by shelling out to `curl` — no HTTP client
   lives in the crate. Tests that hit URLs skip when `curl` is missing.
 - `LZWDecode` and encrypted PDFs are unsupported by design. Return

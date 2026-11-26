@@ -1,0 +1,9 @@
+# Only Actions drift. `[dependencies]` is empty, and the Python package
+# is stdlib plus the cdylib, so a cargo or pip ecosystem would open
+# updates against nothing.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
