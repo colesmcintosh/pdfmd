@@ -97,7 +97,10 @@ jobs:
 
   python:
     name: python (${{ matrix.python }})
-    runs-on: ubuntu-latest
+    # ubuntu-latest is 26.04, and actions/python-versions ships no CPython
+    # 3.9 build for it. 24.04 still has 3.9, which is what pyproject.toml
+    # declares as the floor. The job name stays `python (3.9)`.
+    runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
