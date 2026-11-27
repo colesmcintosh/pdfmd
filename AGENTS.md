@@ -28,7 +28,7 @@ src/lib.rs        public API + title promotion + image-mark rewrite
 src/cli.rs        argv parser, file/URL/stdin I/O (no clap)
 src/ffi.rs        C ABI over convert_pdf_to_markdown (cdylib)
 src/util.rs       parallel_map (std::thread::scope worker pool)
-src/bin/          profile.rs, opendataloader.rs — dev harnesses (`dev-harness`)
+src/bin/          profile.rs, opendataloader.rs, quality.rs — dev harnesses (`dev-harness`)
 python/           ctypes bindings over src/ffi.rs, CLI, packaging, tests
 tests/            integration + CLI + real fixtures only
 ```
@@ -139,10 +139,10 @@ Faster without a crate beats cleaner with a crate.
   Keep both sides in sync.
 - The first paragraph is promoted to `# H1` in
   `lib::promote_document_title`, not in `heuristics.rs`. Leave it there.
-- `src/bin/profile.rs` and `src/bin/opendataloader.rs` are dev-only,
-  behind the `dev-harness` feature so `cargo install` does not put a
-  `profile` binary on `PATH`. Don't import them from the library.
-  Coverage still ignores `src/bin/`.
+- `src/bin/profile.rs`, `src/bin/opendataloader.rs`, and `src/bin/quality.rs`
+  are dev-only, behind the `dev-harness` feature so `cargo install` does not
+  put dev binaries on `PATH`. Don't import them from the library. Coverage
+  still ignores `src/bin/`.
 - Releases are tags. `.github/workflows/release.yml` publishes to
   crates.io with the `CARGO_REGISTRY_TOKEN` secret and attaches static
   Linux, macOS, and Windows CLI archives plus `SHA256SUMS`. A missing

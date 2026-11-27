@@ -49,6 +49,11 @@ name = "opendataloader"
 path = "src/bin/opendataloader.rs"
 required-features = ["dev-harness"]
 
+[[bin]]
+name = "quality"
+path = "src/bin/quality.rs"
+required-features = ["dev-harness"]
+
 # Zero runtime dependencies by design. The PDF reader, zlib/DEFLATE
 # decoder, font/CMap handling, content-stream interpreter, CLI parser,
 # and parallel work-stealer are all implemented in this crate.
