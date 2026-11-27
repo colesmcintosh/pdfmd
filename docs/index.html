@@ -4,315 +4,193 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>pdfmd — fast, zero-dependency PDF to Markdown</title>
-<meta name="description" content="pdfmd converts PDF bytes to Markdown. A Rust CLI and library that owns the whole stack, with zero runtime dependencies.">
+<meta name="description" content="Convert PDF bytes to Markdown in Rust with zero runtime dependencies. CLI, Rust crate, Python bindings, and C ABI.">
 <link rel="canonical" href="https://colesmcintosh.github.io/pdfmd/">
-<meta name="theme-color" content="#E8E8E8">
+<meta name="theme-color" content="#FAFAFA" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0E1015" media="(prefers-color-scheme: dark)">
 <meta property="og:title" content="pdfmd — fast, zero-dependency PDF to Markdown">
-<meta property="og:description" content="A Rust CLI and library that owns the path from PDF bytes to Markdown. No runtime dependencies.">
+<meta property="og:description" content="Convert PDF bytes to Markdown in Rust with zero runtime dependencies.">
 <meta property="og:url" content="https://colesmcintosh.github.io/pdfmd/">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<a class="skip" href="#content">Skip to content</a>
+<div class="shell">
+  <header class="topbar">
+    <a class="brand" href="./">
+      <span class="brand-mark" aria-hidden="true">#</span>
+      <span>pdfmd</span>
+      <span class="version">v0.4.0</span>
+    </a>
+    <nav aria-label="Project">
+      <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
+      <a href="https://crates.io/crates/pdfmd">crates.io</a>
+      <a href="https://github.com/colesmcintosh/pdfmd/releases">Releases</a>
+    </nav>
+  </header>
 
-<header class="wrap topbar mono">
-  <a class="mark" href="./">pdfmd</a>
-  <nav aria-label="Project">
-    <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
-    <a href="#usage">Usage</a>
-    <a href="#reference">Reference</a>
-  </nav>
-</header>
-
-<main id="content">
-<section class="wrap hero">
-  <div class="section-head mono"><span>PDF to Markdown, in Rust</span><span class="dim">v0.4.0 · MIT</span></div>
-  <h1 class="headline">PDF bytes in.<br><span class="quiet">Markdown out.</span></h1>
-  <div class="grid cols">
-    <div class="col c1">
-      <span class="mono">The whole stack</span>
-      <p class="lead">pdfmd parses the object graph, inflates streams, decodes fonts, and interprets content operators itself. Then it recovers columns, tables, headings, and lists. 17 pages in 4.4&nbsp;ms.</p>
+  <main class="stage">
+    <div class="intro">
+      <h1>PDF bytes in. Markdown out.</h1>
+      <p class="subtitle">
+        Zero-dependency PDF → Markdown converter in Rust. Recovers columns,
+        GFM tables, headings, and lists straight from glyph positions.
+      </p>
+      <p class="facts">
+        <span><strong>4.4 ms</strong> 17-page paper</span>
+        <span><strong>0</strong> dependencies</span>
+        <span><strong>~700 KB</strong> binary</span>
+        <span><strong>99%</strong> coverage</span>
+      </p>
     </div>
-    <div class="col c2">
-      <span class="mono">Install</span>
-      <p class="lead">One crate, no build scripts. Release binaries cover a machine with no toolchain. Python stays <code>pip install ./python</code> — the PyPI name is taken.</p>
+
+    <div class="controls">
       <div class="install">
+        <span class="prompt" aria-hidden="true">$</span>
         <code id="install-cmd">cargo install pdfmd</code>
-        <button class="copy" id="copy-install" type="button">Copy</button>
+        <button class="copy-btn" id="copy-install" type="button" aria-label="Copy install command">Copy</button>
+      </div>
+
+      <div class="tabs" role="tablist" aria-label="View">
+        <button role="tab" aria-selected="true" aria-controls="panel-demo" id="tab-demo" type="button">Demo</button>
+        <button role="tab" aria-selected="false" aria-controls="panel-cli" id="tab-cli" type="button" tabindex="-1">CLI</button>
+        <button role="tab" aria-selected="false" aria-controls="panel-rust" id="tab-rust" type="button" tabindex="-1">Rust</button>
+        <button role="tab" aria-selected="false" aria-controls="panel-python" id="tab-python" type="button" tabindex="-1">Python</button>
+        <button role="tab" aria-selected="false" aria-controls="panel-c" id="tab-c" type="button" tabindex="-1">C</button>
       </div>
     </div>
-    <div class="col c3">
-      <span class="mono">Zero dependencies</span>
-<pre class="manifest" aria-label="Cargo.toml with an empty dependencies table">[package]
-name         = "pdfmd"
-version      = "0.4.0"
-rust-version = "1.70"
 
-<b>[dependencies]</b></pre>
-      <div class="verdict mono"><span>runtime crates →</span><span>0</span></div>
-    </div>
-  </div>
-</section>
-
-<section class="band-dark" aria-label="A content stream being read into Markdown">
-  <div class="wrap field">
-    <div class="section-head mono"><span>page.pdf → page.md</span><span class="dim">4 blocks · real output</span></div>
-    <div class="grid scan-demo">
-      <div class="col doc">
-        <span class="mono">Content stream</span>
-<pre class="doc-lines" id="doc-lines">BT /F1 24 Tf 72 720 Td
-<span class="tok on" data-field="0">(Layout-Aware Extraction)</span> Tj ET
-BT /F1 14 Tf 72 684 Td
-<span class="tok on" data-field="1">(1  Two columns, one pass)</span> Tj ET
-BT /F1 10 Tf 72 660 Td
-(Reading order comes from) Tj
-0 -12 Td <span class="tok on" data-field="2">(glyph positions.)</span> Tj ET
-BT /F1 10 Tf 72 620 Td (stage) Tj 80 0 Td (ms) Tj ET
-BT /F1 10 Tf 72 606 Td <span class="tok on" data-field="3">(inflate)</span> Tj 80 0 Td (0.9) Tj ET<span class="scanline" id="scanline" aria-hidden="true"></span></pre>
-      </div>
-      <div class="col extracted">
-        <span class="mono">Markdown</span>
-        <div>
-          <dl class="scanned" id="scanned">
-            <div class="on"><span class="n">1</span><dt>24 pt</dt><dd># Layout-Aware Extraction</dd></div>
-            <div class="on"><span class="n">2</span><dt>14 pt</dt><dd>## Two columns, one pass</dd></div>
-            <div class="on"><span class="n">3</span><dt>body</dt><dd>Reading order comes from glyph positions.</dd></div>
-            <div class="on"><span class="n">4</span><dt>aligned</dt><dd>| stage | ms |
-| --- | --- |
-| inflate | 0.9 |</dd></div>
-          </dl>
-          <div class="scan-status mono"><span id="scan-count">4 / 4 blocks</span><span id="scan-state" data-state="done">written</span></div>
+    <div class="viewport-card">
+      <div class="panel" id="panel-demo" role="tabpanel" aria-labelledby="tab-demo">
+        <div class="specimen" id="specimen">
+          <div class="pane">
+            <div class="pane-head">
+              <span>PDF content stream</span>
+              <span class="hint">Hover to trace</span>
+            </div>
+            <pre class="stream"><code><span class="pair" data-pair="0" tabindex="0"><span class="op">BT</span> /F1 24 <span class="op">Tf</span> 72 720 <span class="op">Td</span>
+(Layout-Aware Extraction) <span class="op">Tj ET</span></span><span class="pair" data-pair="1" tabindex="0"><span class="op">BT</span> /F1 10 <span class="op">Tf</span> 72 684 <span class="op">Td</span>
+(Reading order comes from) <span class="op">Tj</span>
+0 -12 <span class="op">Td</span> (glyph positions.) <span class="op">Tj ET</span></span><span class="pair" data-pair="2" tabindex="0"><span class="op">BT</span> /F1 10 <span class="op">Tf</span> 72 640 <span class="op">Td</span>
+(stage) <span class="op">Tj</span> 80 0 <span class="op">Td</span> (ms) <span class="op">Tj</span>
+0 -14 <span class="op">Td</span> (inflate) <span class="op">Tj</span> 80 0 <span class="op">Td</span> (0.9) <span class="op">Tj ET</span></span></code></pre>
+          </div>
+          <div class="pane">
+            <div class="pane-head">
+              <span>Markdown</span>
+              <span class="hint">GFM</span>
+            </div>
+            <pre class="output"><code><span class="pair" data-pair="0" tabindex="0"># Layout-Aware Extraction</span><span class="pair" data-pair="1" tabindex="0">Reading order comes from glyph positions.</span><span class="pair" data-pair="2" tabindex="0">| stage   | ms  |
+| ------- | --- |
+| inflate | 0.9 |</span></code></pre>
+          </div>
         </div>
       </div>
-    </div>
-    <div class="field-foot mono"><span>Font size makes headings. Alignment makes tables. Position makes reading order.</span><span>Tf · Td · Tj</span></div>
-  </div>
-</section>
 
-<section class="wrap example" id="usage">
-  <div class="section-head mono"><span>Usage</span><span class="dim">shell · rust · python</span></div>
-  <h2 class="headline small">One converter.<br><span class="quiet">Three ways in.</span></h2>
-  <div class="grid cols">
-    <div class="col">
-      <span class="mono">CLI — files, stdin, or a URL</span>
-<pre class="code"><code>pdfmd input.pdf              <span class="d"># to stdout</span>
-pdfmd input.pdf -o out.md
-pdfmd input.pdf --page-breaks
-pdfmd input.pdf \
-  --extract-images figs -o out.md
-cat input.pdf | pdfmd -
-pdfmd https://example.com/x.pdf</code></pre>
-      <p class="note">URLs are fetched with <code>curl</code> on PATH. Images pass through as JPEG or JPEG 2000, or are re-encoded as PNG.</p>
-    </div>
-    <div class="col">
-      <span class="mono">Rust — main.rs</span>
-<pre class="code"><code><span class="d">use</span> pdfmd::{
-    convert_pdf_to_markdown,
-    ConvertOptions,
-};
-
-<span class="d">let</span> result = convert_pdf_to_markdown(
-    &amp;pdf_bytes,
-    &amp;ConvertOptions::default(),
-)?;
-print!("{}", result.markdown);</code></pre>
-      <p class="note">One error type. <code>result.images</code> is empty unless <code>image_dir</code> is set.</p>
-    </div>
-    <div class="col">
-      <span class="mono">Python — convert.py</span>
-<pre class="code"><code><span class="d">import</span> pdfmd
-
-result = pdfmd.convert_file(
-    "paper.pdf",
-    image_dir="figs",
-)
-print(result.markdown)
-
-<span class="d"># one thread per core, input order</span>
-batch = pdfmd.convert_many(
-    ["a.pdf", "b.pdf"],
-)</code></pre>
-      <p class="note"><code>ctypes</code> over the C ABI. No PyO3, no maturin, no runtime packages.</p>
-    </div>
-  </div>
-</section>
-
-<section class="wrap speed" id="speed">
-  <div class="section-head mono"><span>Speed</span><span class="dim">hyperfine · Apple Silicon · release</span></div>
-  <h2 class="headline small">4.4 milliseconds.<br><span class="quiet">Seventeen pages.</span></h2>
-  <div class="grid cols">
-    <div class="col c1">
-      <span class="mono">CLI — 1.05 MB arXiv paper</span>
-      <dl class="readout">
-        <div><span class="n">1</span><dt>mean</dt><dd>4.4 ms ± 0.3</dd></div>
-        <div><span class="n">2</span><dt>min</dt><dd>3.8 ms</dd></div>
-        <div><span class="n">3</span><dt>throughput</dt><dd>~240 MB/s</dd></div>
-        <div><span class="n">4</span><dt>pages/sec</dt><dd>~3,900</dd></div>
-        <div><span class="n">5</span><dt>binary</dt><dd>~700 KB</dd></div>
-      </dl>
-      <p class="note">Pages extract in parallel on <code>std::thread::scope</code>. The tokenizer and DEFLATE decoder borrow straight from the source bytes.</p>
-    </div>
-    <div class="col c2">
-      <span class="mono">Against published library timings</span>
-      <div class="table-wrap">
-        <table class="versus">
-          <thead>
-            <tr><th scope="col">pages</th><th scope="col">published</th><th scope="col">pdfmd</th><th scope="col">speedup</th></tr>
-          </thead>
-          <tbody>
-            <tr><td>1</td><td>2.0 ms</td><td class="ours">0.012 ms</td><td><span class="bar"><span class="track"><span class="fill" style="--w:20%"></span></span><span class="num">167×</span></span></td></tr>
-            <tr><td>24</td><td>41.0 ms</td><td class="ours">0.118 ms</td><td><span class="bar"><span class="track"><span class="fill" style="--w:42%"></span></span><span class="num">347×</span></span></td></tr>
-            <tr><td>60</td><td>123.0 ms</td><td class="ours">0.201 ms</td><td><span class="bar"><span class="track"><span class="fill" style="--w:73%"></span></span><span class="num">612×</span></span></td></tr>
-            <tr><td>457</td><td>777.0 ms</td><td class="ours">0.933 ms</td><td><span class="bar"><span class="track"><span class="fill" style="--w:100%"></span></span><span class="num">833×</span></span></td></tr>
-          </tbody>
-        </table>
+      <div class="panel" id="panel-cli" role="tabpanel" aria-labelledby="tab-cli" hidden inert>
+<pre class="code"><code>pdfmd paper.pdf                         <span class="c"># markdown to stdout</span>
+pdfmd paper.pdf -o out.md               <span class="c"># write to file</span>
+pdfmd paper.pdf --page-breaks           <span class="c"># insert --- between pages</span>
+pdfmd paper.pdf --extract-images figs   <span class="c"># JPEG, JP2, and PNG rasters</span>
+cat paper.pdf | pdfmd -                 <span class="c"># read from stdin</span></code></pre>
       </div>
-      <p class="note">Throughput targets against other libraries' published numbers, not a claim on their exact corpora or hardware.</p>
-    </div>
-  </div>
-</section>
 
-<section class="band-dark" id="reference">
-  <div class="wrap reference">
-    <div class="section-head mono"><span>Reference</span><span class="dim">layout · internals · limits</span></div>
-    <h2 class="headline small">No crates.<br><span class="quiet">Every layer in-house.</span></h2>
-    <div class="ref-list">
-      <details open>
-        <summary class="grid"><span class="key mono">markdown</span><span class="question">What does it recover?</span><span class="sign" aria-hidden="true"></span></summary>
-        <div class="answer grid">
-          <p>Layout-aware and still best-effort. Reading order comes from glyph positions, not the order bytes appear in the stream.</p>
-          <dl class="spec">
-            <div><dt>Columns</dt><dd>Multi-column pages read left to right, then top to bottom in each column.</dd></div>
-            <div><dt>Tables</dt><dd>GFM tables from ruled path grids and from aligned borderless columns.</dd></div>
-            <div><dt>Headings</dt><dd>From tagged-PDF roles, font size, bold, numbered sections, and names like Abstract.</dd></div>
-            <div><dt>Text</dt><dd>Lists, bold and italic from the font name, monospace as fenced code, hyphenated breaks rejoined.</dd></div>
-            <div><dt>Margins</dt><dd>Repeating running headers and footers are stripped.</dd></div>
-          </dl>
-        </div>
-      </details>
-      <details>
-        <summary class="grid"><span class="key mono">src/</span><span class="question">What is inside?</span><span class="sign" aria-hidden="true"></span></summary>
-        <div class="answer grid">
-          <p>bytes → xref → objects → inflate → fonts → content ops → layout → heuristics → markdown.</p>
-          <dl class="spec">
-            <div><dt>pdf/</dt><dd>xref, objects, streams, DEFLATE, page tree.</dd></div>
-            <div><dt>extract/</dt><dd>Fonts, CMaps, content operators, layout, tagged PDF, images.</dd></div>
-            <div><dt>heuristics/</dt><dd>Columns, tables, headings, lists, emphasis.</dd></div>
-            <div><dt>lib.rs</dt><dd>convert_pdf_to_markdown.</dd></div>
-            <div><dt>ffi.rs</dt><dd>The C ABI behind the python/ bindings.</dd></div>
-          </dl>
-        </div>
-      </details>
-      <details>
-        <summary class="grid"><span class="key mono">ffi</span><span class="question">Can I call it from another language?</span><span class="sign" aria-hidden="true"></span></summary>
-        <div class="answer grid">
-          <p>The crate builds a cdylib. Anything that can call C can use it. Buffers are pointer and length pairs with no implied NUL, and every result is freed once.</p>
-<pre><code>PdfmdResult *r = pdfmd_convert(bytes, len, false, NULL);
-<span class="d">if</span> (r-&gt;error) fwrite(r-&gt;error, 1, r-&gt;error_len, stderr);
-<span class="d">else</span>          fwrite(r-&gt;markdown, 1, r-&gt;markdown_len, stdout);
+      <div class="panel" id="panel-rust" role="tabpanel" aria-labelledby="tab-rust" hidden inert>
+<pre class="code"><code>use pdfmd::{convert_pdf_to_markdown, ConvertOptions};
+
+let result = convert_pdf_to_markdown(&amp;pdf_bytes, &amp;ConvertOptions::default())?;
+print!("{}", result.markdown);
+<span class="c">// Rust 1.70+ · empty [dependencies] · single error type</span></code></pre>
+      </div>
+
+      <div class="panel" id="panel-python" role="tabpanel" aria-labelledby="tab-python" hidden inert>
+<pre class="code"><code><span class="c"># pip install ./python  (ctypes over cdylib, stdlib only)</span>
+import pdfmd
+
+result = pdfmd.convert_file("paper.pdf", image_dir="figs")
+batch  = pdfmd.convert_many(["a.pdf", "b.pdf"], workers=8)
+print(result.markdown)</code></pre>
+      </div>
+
+      <div class="panel" id="panel-c" role="tabpanel" aria-labelledby="tab-c" hidden inert>
+<pre class="code"><code>PdfmdResult *r = pdfmd_convert(bytes, len, false, NULL);
+if (r-&gt;error) fwrite(r-&gt;error, 1, r-&gt;error_len, stderr);
+else          fwrite(r-&gt;markdown, 1, r-&gt;markdown_len, stdout);
 pdfmd_result_free(r);</code></pre>
-        </div>
-      </details>
-      <details>
-        <summary class="grid"><span class="key mono">limits</span><span class="question">What won't it do?</span><span class="sign" aria-hidden="true"></span></summary>
-        <div class="answer grid">
-          <p>It targets academic and prose documents, not forms or invoices.</p>
-          <dl class="spec">
-            <div><dt>Layout</dt><dd>Spanned cells, nested tables, and complex math stay best-effort reflow.</dd></div>
-            <div><dt>Fonts</dt><dd>Fonts without a ToUnicode CMap, a standard encoding, or /Differences drop glyphs.</dd></div>
-            <div><dt>By design</dt><dd>Encrypted PDFs and LZWDecode streams return an error.</dd></div>
-          </dl>
-        </div>
-      </details>
+      </div>
     </div>
-  </div>
+  </main>
 
-  <footer class="wrap">
-    <div class="footer-row mono">
-      <span>MIT License · Cole McIntosh</span>
-      <nav aria-label="Footer">
-        <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
-        <a href="https://github.com/colesmcintosh/pdfmd/issues">Issues</a>
-        <a href="https://github.com/colesmcintosh/pdfmd/blob/main/VISION.md">Vision</a>
-      </nav>
-    </div>
-    <p class="footer-mark" aria-hidden="true">pdfmd</p>
+  <footer class="foot">
+    <span>MIT · Cole McIntosh</span>
+    <nav aria-label="Footer">
+      <a href="https://github.com/colesmcintosh/pdfmd/blob/main/VISION.md">Vision</a>
+      <a href="https://docs.rs/pdfmd">docs.rs</a>
+    </nav>
   </footer>
-</section>
-</main>
+</div>
 
 <script>
-  document.getElementById("copy-install").addEventListener("click", async (event) => {
-    const button = event.currentTarget;
-    const command = document.getElementById("install-cmd");
-    try {
-      await navigator.clipboard.writeText(command.textContent);
-      button.textContent = "Copied";
-    } catch {
-      const range = document.createRange();
-      range.selectNodeContents(command);
-      const selection = window.getSelection();
-      selection.removeAllRanges();
-      selection.addRange(range);
-      button.textContent = "Selected";
-    }
-    setTimeout(() => { button.textContent = "Copy"; }, 1600);
-  });
-
-  // A scan line reads the content stream; each text run it passes writes its Markdown block.
   (() => {
-    const lines = document.getElementById("doc-lines");
-    const scanline = document.getElementById("scanline");
-    const tokens = [...lines.querySelectorAll(".tok")];
-    const rows = [...document.getElementById("scanned").children];
-    const count = document.getElementById("scan-count");
-    const state = document.getElementById("scan-state");
-    const scanMs = 3200, holdMs = 3400, resetMs = 700;
-    const cycleMs = scanMs + holdMs + resetMs;
-    // Start inside the hold so the first frame shows the finished result.
-    const startOffsetMs = scanMs + 400;
-    let shown = -1;
-
-    function show(found, scanY) {
-      if (found !== shown) {
-        shown = found;
-        tokens.forEach(token => token.classList.toggle("on", Number(token.dataset.field) < found));
-        rows.forEach((row, index) => row.classList.toggle("on", index < found));
-        count.textContent = `${found} / ${rows.length} blocks`;
-        state.textContent = found === rows.length ? "written" : "reading";
-        state.dataset.state = found === rows.length ? "done" : "reading";
+    const copyBtn = document.getElementById("copy-install");
+    const cmd = document.getElementById("install-cmd");
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(cmd.textContent);
+        copyBtn.textContent = "Copied";
+      } catch {
+        const range = document.createRange();
+        range.selectNodeContents(cmd);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        copyBtn.textContent = "Selected";
       }
-      scanline.style.opacity = scanY === null ? "0" : "1";
-      if (scanY !== null) scanline.style.transform = `translateY(${scanY}px)`;
-    }
+      setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500);
+    });
 
-    function blocksAbove(scanY) {
-      return tokens.filter(token => token.offsetTop + token.offsetHeight / 2 <= scanY).length;
-    }
-
-    function frame(time) {
-      const t = (time + startOffsetMs) % cycleMs;
-      const height = lines.scrollHeight;
-      if (t < scanMs) {
-        const scanY = (t / scanMs) * height;
-        show(blocksAbove(scanY), scanY);
-      } else if (t < scanMs + holdMs) {
-        show(rows.length, null);
-      } else {
-        show(0, null);
+    const specimen = document.getElementById("specimen");
+    const pairs = [...specimen.querySelectorAll(".pair")];
+    const setActive = (id) => {
+      specimen.dataset.active = id === null ? "" : id;
+      for (const el of pairs) {
+        el.classList.toggle("is-active", id !== null && el.dataset.pair === id);
       }
-      requestAnimationFrame(frame);
+    };
+    for (const el of pairs) {
+      el.addEventListener("pointerenter", () => setActive(el.dataset.pair));
+      el.addEventListener("focus", () => setActive(el.dataset.pair));
+      el.addEventListener("pointerleave", () => setActive(null));
+      el.addEventListener("blur", () => setActive(null));
     }
 
-    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      requestAnimationFrame(frame);
-    }
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+    const selectTab = (next, focus = false) => {
+      for (const tab of tabs) {
+        const on = tab === next;
+        tab.setAttribute("aria-selected", String(on));
+        tab.tabIndex = on ? 0 : -1;
+      }
+      for (const panel of panels) {
+        const hide = panel.id !== next.getAttribute("aria-controls");
+        panel.hidden = hide;
+        panel.inert = hide;
+      }
+      if (focus) next.focus();
+    };
+    tabs.forEach((tab, index) => {
+      tab.addEventListener("click", () => selectTab(tab));
+      tab.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight") selectTab(tabs[(index + 1) % tabs.length], true);
+        if (e.key === "ArrowLeft") selectTab(tabs[(index - 1 + tabs.length) % tabs.length], true);
+      });
+    });
   })();
 </script>
 </body>
