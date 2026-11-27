@@ -99,8 +99,14 @@ case "$archive" in
     *.zip)
         if command -v zip >/dev/null 2>&1; then
             (cd "$stage" && zip -q -X "$dest" "$inner")
+        elif command -v 7z >/dev/null 2>&1; then
+            win_dest=$(cygpath -w "$dest" 2>/dev/null || printf '%s' "$dest")
+            (cd "$stage" && 7z a -bd -tzip "$win_dest" "$inner" >/dev/null)
+        elif command -v powershell.exe >/dev/null 2>&1; then
+            win_src=$(cygpath -w "${stage}/${inner}")
+            win_dest=$(cygpath -w "$dest")
+            powershell.exe -NoProfile -Command "Compress-Archive -Path '${win_src}' -DestinationPath '${win_dest}' -Force"
         else
-            # GitHub's Windows runners ship bsdtar, which writes zip for -a.
             tar -C "$stage" -a -cf "$dest" "$inner"
         fi
         if command -v zipinfo >/dev/null 2>&1; then

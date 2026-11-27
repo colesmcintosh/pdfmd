@@ -4,24 +4,35 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Not found · pdfmd</title>
-<meta name="theme-color" content="#E8E8E8">
+<meta name="theme-color" content="#FAFAFA" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0E1015" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="wrap topbar mono">
-  <a class="mark" href="./">pdfmd</a>
-  <nav aria-label="Project">
-    <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
-  </nav>
-</header>
-<main class="wrap missing">
-  <div class="section-head mono"><span>404</span><span class="dim">no xref entry</span></div>
-  <h1 class="headline">Not in the document.<br><span class="quiet">Nothing to inflate.</span></h1>
-  <p class="lead">The path you asked for doesn't exist. <a href="./"><u>Back to pdfmd</u></a>.</p>
-</main>
+<div class="shell">
+  <header class="topbar">
+    <a class="brand" href="./">
+      <span class="brand-mark" aria-hidden="true">#</span>
+      <span>pdfmd</span>
+    </a>
+    <nav aria-label="Project">
+      <a href="https://github.com/colesmcintosh/pdfmd">GitHub</a>
+    </nav>
+  </header>
+
+  <main class="stage missing">
+    <p class="code-tag">404 · no xref entry</p>
+    <h1>Page not found.</h1>
+    <p>The path you asked for doesn't exist. <a href="./">Return to pdfmd</a>.</p>
+  </main>
+
+  <footer class="foot">
+    <span>MIT · Cole McIntosh</span>
+  </footer>
+</div>
 </body>
 </html>
