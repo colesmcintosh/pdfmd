@@ -5,11 +5,12 @@ Development commands, layout, and review rules live in [AGENTS.md](AGENTS.md).
 keeps `cargo fmt`, `cargo clippy`, and `cargo test` green. The CI
 commands are in [AGENTS.md](AGENTS.md).
 
-`profile` and `opendataloader` are dev harnesses behind the
+`profile`, `opendataloader`, and `quality` are dev harnesses behind the
 `dev-harness` feature, so `cargo install` does not put them on `PATH`:
 
 ```sh
 cargo run --release --bin profile --features dev-harness
+cargo run --release --bin quality --features dev-harness -- audit tests/fixtures/sample.pdf
 ```
 
 ## Releasing

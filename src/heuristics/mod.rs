@@ -12,8 +12,8 @@ use crate::extract::structure::{Role, RoleMap};
 use crate::extract::IMAGE_MARK;
 
 use lines::{
-    format_list_item, heading_level, is_all_caps_heading, is_list_item, is_numbered_heading,
-    named_section, short_title_case, strip_heading_prefix,
+    format_list_item, heading_level, is_all_caps_heading, is_bullet_item, is_numbered_heading,
+    is_ordered_item, named_section, short_title_case, strip_heading_prefix,
 };
 
 mod columns;
@@ -186,28 +186,41 @@ fn format_column(
             .filter(|r| r.x < x1 && r.x + r.w > x0)
             .collect();
         if col_rects.len() >= 3 {
-            if let Some((table, bbox)) = tables::ruled_table(spans, &col_rects) {
-                let rest: Vec<&Span> = spans
+            let ruled = tables::ruled_tables(spans, &col_rects);
+            if !ruled.is_empty() {
+                let mut parts = Vec::new();
+                let mut outside: Vec<&Span> = spans
                     .iter()
                     .copied()
                     .filter(|s| {
                         s.kind == SpanKind::Image
-                            || s.x + s.width < bbox[0] - 1.0
-                            || s.x > bbox[2] + 1.0
-                            || s.y + s.height < bbox[1] - 1.0
-                            || s.y > bbox[3] + 1.0
+                            || ruled.iter().all(|(_, b)| {
+                                s.x + s.width < b[0] - 1.0
+                                    || s.x > b[2] + 1.0
+                                    || s.y + s.height < b[1] - 1.0
+                                    || s.y > b[3] + 1.0
+                            })
                     })
                     .collect();
-                if rest.is_empty() {
-                    return table;
+                for (table_md, bbox) in ruled {
+                    let (above, rest): (Vec<&Span>, Vec<&Span>) =
+                        outside.into_iter().partition(|s| s.y > bbox[3]);
+                    if !above.is_empty() {
+                        let md = format_column_text(&above, page_idx, roles, median);
+                        if !md.is_empty() {
+                            parts.push(md);
+                        }
+                    }
+                    parts.push(table_md);
+                    outside = rest;
                 }
-                let rest_md = format_column_text(&rest, page_idx, roles, median);
-                // Text above the table's top edge reads first.
-                return if rest.iter().any(|s| s.y > bbox[3]) {
-                    join_blocks([rest_md, table])
-                } else {
-                    join_blocks([table, rest_md])
-                };
+                if !outside.is_empty() {
+                    let md = format_column_text(&outside, page_idx, roles, median);
+                    if !md.is_empty() {
+                        parts.push(md);
+                    }
+                }
+                return join_blocks(parts);
             }
         }
     }
@@ -229,6 +242,9 @@ fn format_column_text(spans: &[&Span], page_idx: usize, roles: &RoleMap, median:
             continue;
         }
         let start = i;
+        let start_plain = plain_line(&lines[start]);
+        let start_bullet = is_bullet_item(&start_plain);
+        let start_ordered = is_ordered_item(&start_plain);
         i += 1;
         while i < lines.len() {
             let dy = (lines[i - 1].y - lines[i].y).abs();
@@ -246,6 +262,18 @@ fn format_column_text(spans: &[&Span], page_idx: usize, roles: &RoleMap, median:
                 break;
             }
             if is_bold_line(&lines[i - 1]) && !is_bold_line(&lines[i]) {
+                break;
+            }
+            let cur_plain = plain_line(&lines[i]);
+            if !is_bold_line(&lines[i - 1])
+                && is_bold_line(&lines[i])
+                && is_numbered_heading(&cur_plain)
+            {
+                break;
+            }
+            if (!start_bullet && is_bullet_item(&cur_plain))
+                || (!start_ordered && is_ordered_item(&cur_plain))
+            {
                 break;
             }
             // A quoted Markdown heading line stays on its own.
@@ -272,12 +300,23 @@ fn format_line_block(lines: &[VLine<'_>], page_idx: usize, roles: &RoleMap, medi
     if lines.iter().all(line_is_blank) {
         return image_block(lines);
     }
-    if lines.iter().all(|l| is_list_item(&plain_line(l))) {
-        return lines
+    let first_plain = plain_line(&lines[0]);
+    if is_bullet_item(&first_plain) {
+        return format_wrapped_list(lines, is_bullet_item);
+    }
+    if is_ordered_item(&first_plain) {
+        let ordered_count = lines
             .iter()
-            .map(|l| format_list_item(&plain_line(l)))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .filter(|l| is_ordered_item(&plain_line(l)))
+            .count();
+        if ordered_count >= 2
+            || (lines.len() == 1
+                && !is_bold_line(&lines[0])
+                && text_size(&lines[0]) < median * 1.15
+                && line_role(&lines[0], page_idx, roles).is_none())
+        {
+            return format_wrapped_list(lines, is_ordered_item);
+        }
     }
     if lines.len() >= 2 && lines.iter().all(is_mono_line) {
         let mut body = String::new();
@@ -290,13 +329,90 @@ fn format_line_block(lines: &[VLine<'_>], page_idx: usize, roles: &RoleMap, medi
         return format!("```\n{body}\n```");
     }
     if lines.len() == 1 {
-        let line = plain_line(&lines[0]);
-        if let Some(level) = heading_for_line(&lines[0], &line, page_idx, roles, median) {
-            return format!("{} {}", "#".repeat(level), strip_heading_prefix(&line));
+        if let Some(level) = heading_for_line(&lines[0], &first_plain, page_idx, roles, median) {
+            return format!(
+                "{} {}",
+                "#".repeat(level),
+                strip_heading_prefix(&first_plain)
+            );
         }
         return escape_leading_hash(style_line(&lines[0]));
     }
+    if (2..=3).contains(&lines.len()) {
+        let joined = join_plain_lines(lines);
+        if let Some(level) = wrapped_heading_level(lines, &joined, page_idx, roles, median) {
+            return format!("{} {}", "#".repeat(level), strip_heading_prefix(&joined));
+        }
+    }
     escape_leading_hash(join_paragraph(lines))
+}
+
+fn format_wrapped_list(lines: &[VLine<'_>], starts_item: fn(&str) -> bool) -> String {
+    let mut items: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while start < lines.len() {
+        let mut end = start + 1;
+        while end < lines.len() && !starts_item(&plain_line(&lines[end])) {
+            end += 1;
+        }
+        let chunk = &lines[start..end];
+        let styled = join_paragraph(chunk);
+        let formatted = if starts_item(&styled) {
+            format_list_item(&styled)
+        } else {
+            format_list_item(&join_plain_lines(chunk))
+        };
+        items.push(formatted);
+        start = end;
+    }
+    items.join("\n")
+}
+
+fn join_plain_lines(lines: &[VLine<'_>]) -> String {
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = plain_line(line);
+        if i == 0 {
+            out.push_str(&t);
+            continue;
+        }
+        if out.ends_with('-') && t.starts_with(char::is_lowercase) {
+            out.pop();
+            out.push_str(&t);
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push_str(&t);
+    }
+    out
+}
+
+fn wrapped_heading_level(
+    lines: &[VLine<'_>],
+    joined: &str,
+    page_idx: usize,
+    roles: &RoleMap,
+    median: f32,
+) -> Option<usize> {
+    if joined.len() > 120 || joined.ends_with('.') || joined.ends_with(',') || is_bold_label(joined)
+    {
+        return None;
+    }
+    if let Some(Role::Heading(n)) = line_role(&lines[0], page_idx, roles) {
+        return Some((n as usize).clamp(1, 6));
+    }
+    let size = text_size(&lines[0]);
+    if median > 0.1 && lines.iter().all(|l| text_size(l) >= median * 1.4) {
+        return Some(if size >= median * 1.8 { 1 } else { 2 });
+    }
+    let emphasized = lines.iter().all(is_bold_line)
+        || (median > 0.1 && lines.iter().all(|l| text_size(l) >= median * 1.15));
+    if emphasized && (is_numbered_heading(joined) || is_all_caps_heading(joined)) {
+        return heading_level(joined);
+    }
+    None
 }
 
 /// Body text that happens to open with `#` (`# of calls`, a quoted
@@ -1298,5 +1414,59 @@ mod tests {
             false,
         )]);
         assert_eq!(md, "**{question}**");
+    }
+
+    #[test]
+    fn wrapped_headings_cover_tagged_large_and_prose_followed_by_numbered_bold() {
+        // Tagged 2-line heading.
+        let mut h1 = sp("Tagged Title Line", 20.0, 700.0, 10.0);
+        h1.mcid = Some(4);
+        let mut h2 = sp("Continued Here", 20.0, 688.0, 10.0);
+        h2.mcid = Some(4);
+        let mut roles = RoleMap::new();
+        roles.insert((0, 4), Role::Heading(2));
+        let page = PageLayout {
+            text: String::new(),
+            spans: vec![h1, h2],
+            rects: Vec::new(),
+        };
+        assert_eq!(
+            format_pages(&[page], &roles)[0],
+            "## Tagged Title Line Continued Here"
+        );
+
+        // Large 2-line title followed by body prose and a tightly spaced bold numbered heading.
+        let md = page_of(vec![
+            sp("A Very Large Two-Line", 20.0, 760.0, 22.0),
+            sp("Document Banner", 20.0, 734.0, 22.0),
+            sp(
+                "Body paragraph line sits directly above a heading.",
+                20.0,
+                700.0,
+                10.0,
+            ),
+            styled(sp("2.1 Tight Section", 20.0, 688.0, 10.0), true, false),
+            sp("Section body text.", 20.0, 676.0, 10.0),
+        ]);
+        assert!(
+            md.starts_with("# A Very Large Two-Line Document Banner\n\n"),
+            "{md}"
+        );
+        assert!(md.contains("\n\n## Tight Section\n\n"), "{md}");
+    }
+
+    #[test]
+    fn wrapped_list_handles_bold_bullet_and_single_ordered_item() {
+        let mut text = sp("Bold bullet first line", 32.0, 700.0, 10.0);
+        text.space_before = true;
+        let md = page_of(vec![
+            styled(sp("\u{2022}", 20.0, 700.0, 10.0), true, false),
+            text,
+            sp("and wrapped second line", 32.0, 688.0, 10.0),
+        ]);
+        assert_eq!(md, "- Bold bullet first line and wrapped second line");
+
+        let single_ordered = page_of(vec![sp("1. standalone item", 20.0, 700.0, 10.0)]);
+        assert_eq!(single_ordered, "1. standalone item");
     }
 }

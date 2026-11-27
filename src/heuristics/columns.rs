@@ -60,7 +60,8 @@ pub(super) fn page_bands<'a>(spans: &[&'a Span]) -> (Vec<f32>, Vec<Band<'a>>) {
         .collect();
 
     // Consecutive non-wide lines are columns only when enough of them are
-    // prose; a stretch of short table cells stays full-width.
+    // prose; a stretch of short table cells sitting directly next to a
+    // full-width caption/heading stays full-width with it.
     let mut stretches: Vec<(bool, usize)> = Vec::new();
     let mut i = 0;
     while i < kinds.len() {
@@ -72,7 +73,32 @@ pub(super) fn page_bands<'a>(spans: &[&'a Span]) -> (Vec<f32>, Vec<Band<'a>>) {
             push_stretch(&mut stretches, false, i - start);
             continue;
         }
+        if kinds[i] == Kind::Neutral {
+            while i < kinds.len() && kinds[i] == Kind::Neutral {
+                i += 1;
+            }
+            let len = i - start;
+            let touches_wide = (start > 0 && kinds[start - 1] == Kind::Wide)
+                || (i < kinds.len() && kinds[i] == Kind::Wide);
+            if len >= 2 && touches_wide {
+                push_stretch(&mut stretches, false, len);
+                continue;
+            }
+            i = start;
+        }
         while i < kinds.len() && kinds[i] != Kind::Wide {
+            if kinds[i] == Kind::Neutral {
+                let n_start = i;
+                let mut n_end = i;
+                while n_end < kinds.len() && kinds[n_end] == Kind::Neutral {
+                    n_end += 1;
+                }
+                if n_end - n_start >= 2 && n_end < kinds.len() && kinds[n_end] == Kind::Wide {
+                    break;
+                }
+                i = n_end;
+                continue;
+            }
             i += 1;
         }
         let prose = kinds[start..i]
@@ -270,5 +296,54 @@ mod tests {
             })
             .collect();
         assert!(gutters(&lines).is_none());
+    }
+
+    #[test]
+    fn neutral_table_before_wide_caption_stays_full_width() {
+        let mk = |text: &str, x: f32, y: f32, width: f32| Span {
+            text: text.into(),
+            x,
+            y,
+            width,
+            height: 10.0,
+            font_size: 10.0,
+            bold: false,
+            italic: false,
+            mono: false,
+            kind: SpanKind::Text,
+            mcid: None,
+            space_before: false,
+        };
+        let mut owned = Vec::new();
+        for i in 0..5 {
+            let y = 700.0 - i as f32 * 14.0;
+            owned.push(mk("left prose line reads on", 72.0, y, 200.0));
+            owned.push(mk("right prose line reads on", 320.0, y, 200.0));
+        }
+        // Full-width table (neutral short cells) ABOVE a full-width caption.
+        for r in 0..3 {
+            let y = 600.0 - r as f32 * 14.0;
+            owned.push(mk("A", 72.0, y, 30.0));
+            owned.push(mk("B", 200.0, y, 30.0));
+            owned.push(mk("C", 340.0, y, 30.0));
+            owned.push(mk("D", 450.0, y, 30.0));
+        }
+        owned.push(mk(
+            "Table 1: caption below the table spans across the gutter",
+            72.0,
+            550.0,
+            420.0,
+        ));
+        for i in 0..5 {
+            let y = 510.0 - i as f32 * 14.0;
+            owned.push(mk("lower left prose line on", 72.0, y, 200.0));
+            owned.push(mk("lower right prose line on", 320.0, y, 200.0));
+        }
+        let refs: Vec<&Span> = owned.iter().collect();
+        let (_, bands) = page_bands(&refs);
+        assert_eq!(bands.len(), 3);
+        assert!(bands[0].split);
+        assert!(!bands[1].split);
+        assert!(bands[2].split);
     }
 }
