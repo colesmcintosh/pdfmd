@@ -82,8 +82,12 @@ pub(super) fn strip_heading_prefix(line: &str) -> String {
     }
 }
 
-pub(super) fn is_list_item(line: &str) -> bool {
-    match_bullet(line).is_some() || match_ordered_list(line).is_some()
+pub(super) fn is_bullet_item(line: &str) -> bool {
+    match_bullet(line).is_some()
+}
+
+pub(super) fn is_ordered_item(line: &str) -> bool {
+    match_ordered_list(line).is_some()
 }
 
 pub(super) fn format_list_item(line: &str) -> String {
@@ -153,9 +157,8 @@ fn match_bullet(line: &str) -> Option<usize> {
     let mut chars = line.chars();
     let first = chars.next()?;
     let bullet_len = match first {
-        '-' | '*' | '\u{2022}' | '\u{25E6}' | '\u{25AA}' | '\u{2023}' | '\u{2043}' => {
-            first.len_utf8()
-        }
+        '-' | '*' | '\u{2022}' | '\u{25E6}' | '\u{25AA}' | '\u{2023}' | '\u{2043}' | '\u{25CB}'
+        | '\u{25CF}' | '\u{25A0}' | '\u{25A1}' => first.len_utf8(),
         _ => return None,
     };
     let rest = &line[bullet_len..];
